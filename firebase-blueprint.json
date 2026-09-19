@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile with role-based access control",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "email": { "type": "string", "format": "email" },
+        "name": { "type": "string" },
+        "role": { "type": "string", "enum": ["owner", "admin", "employee", "sales", "designer", "client"] },
+        "assignedRole": { "type": "string" },
+        "department": { "type": "string" },
+        "designation": { "type": "string" },
+        "employeeId": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["email", "role"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Security audit logs for tracking login attempts, access blocks, and actions",
+      "type": "object",
+      "properties": {
+        "action": { "type": "string" },
+        "actor": { "type": "string" },
+        "target": { "type": "string" },
+        "details": { "type": "object" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["action", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles and RBAC role registry"
+    },
+    "/auditLogs/{logId}": {
+      "schema": "AuditLog",
+      "description": "Security audit and authorization access logs"
+    }
+  }
+}

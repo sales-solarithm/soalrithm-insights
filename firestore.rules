@@ -1,0 +1,29 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to verify if the requesting user has the 'owner' role
+    function isOwner() {
+      return request.auth != null && (
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner')
+      );
+    }
+
+    // Allow authenticated users to read users collection to verify their own role
+    match /users/{userId} {
+      allow read: if request.auth != null;
+      allow write: if isOwner();
+    }
+
+    // Audit logs allow recording access events and login attempts
+    match /auditLogs/{logId} {
+      allow create: if true;
+      allow read, update, delete: if isOwner();
+    }
+
+    // Default rule: owners have full access to management collections
+    match /{document=**} {
+      allow read, write: if isOwner();
+    }
+  }
+}

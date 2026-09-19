@@ -1,0 +1,8 @@
+{
+  "name": "Remix Solarithm Dashboard",
+  "description": "Master project manager dashboard",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
