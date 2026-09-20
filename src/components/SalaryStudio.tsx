@@ -152,6 +152,15 @@ export interface SalarySlipRecord {
   };
   deductions: DeductionsData;
   incentivesList: IncentiveRecord[];
+  // Phase 1 data: which N-1 month/FY this slip's incentive figures were
+  // pulled from, plus the three aggregated summary metrics.
+  incentiveSummary: {
+    cycleMonth: string;
+    cycleFY: string;
+    totalProjects: number;
+    totalKwp: number;
+    totalIncentive: number;
+  };
   companySnapshot: {
     name: string;
     address: string;
@@ -261,6 +270,55 @@ export const formatSafeDate = (dateVal: any, formatType: 'input' | 'display' | '
 /**
  * Checks if a project date falls into the specified Month and Financial Year (Indian FY: April - March)
  */
+/**
+ * Decrements a financial year string by one year, handling both the
+ * 2-digit ("2025-26") and 4-digit ("2025-2026") end-year formats, and a
+ * bare single-year string as a fallback. Used only for the April -> March
+ * boundary, where the month before April of an FY's start year belongs to
+ * the *previous* financial year, not the current one.
+ */
+const getPreviousFYString = (fyString: string): string => {
+  if (fyString.includes('-')) {
+    const parts = fyString.split('-');
+    const startYear = parseInt(parts[0], 10);
+    if (isNaN(startYear)) return fyString;
+    const prevStart = startYear - 1;
+    const prevEndFull = prevStart + 1;
+    const prevEndSuffix = parts[1].length === 2 ? String(prevEndFull).slice(-2) : String(prevEndFull);
+    return `${prevStart}-${prevEndSuffix}`;
+  }
+  const singleYear = parseInt(fyString, 10);
+  if (!isNaN(singleYear)) {
+    return String(singleYear - 1);
+  }
+  return fyString;
+};
+
+/**
+ * Resolves the N-1 incentive cycle period for a given pay-period month/FY:
+ * a September pay period processes August's completed-project incentive
+ * data, October processes September's, and so on. The one boundary case is
+ * April, whose preceding month (March) belongs to the previous financial
+ * year, not the current one -- e.g. pay period April 2025-26 processes
+ * March of FY 2024-25, not "March 2025-26" (which would actually be March
+ * 2026, a full year later).
+ */
+export const getIncentiveCyclePeriod = (
+  payPeriodMonth: string,
+  payPeriodFY: string
+): { month: string; fy: string } => {
+  const monthIdx = SALARY_MONTHS.findIndex((m) => m.toLowerCase() === payPeriodMonth.toLowerCase());
+  if (monthIdx === -1) {
+    return { month: payPeriodMonth, fy: payPeriodFY };
+  }
+
+  const prevMonthIdx = (monthIdx - 1 + 12) % 12;
+  const incentiveMonth = SALARY_MONTHS[prevMonthIdx];
+  const incentiveFY = monthIdx === 3 ? getPreviousFYString(payPeriodFY) : payPeriodFY;
+
+  return { month: incentiveMonth, fy: incentiveFY };
+};
+
 export const isProjectInMonthAndFY = (projectDate: Date | null, monthName: string, fyString: string): boolean => {
   if (!projectDate) return false;
   
@@ -882,14 +940,29 @@ export default function SalaryStudio({
   }, [masterEmployees, selectedEmpId]);
 
   // ── Auto-Fetch & Map Live Project Incentives from Central Projects Database ──
+  // Phase 1 (1-month incentive cycle offset): the pay period being generated
+  // (genMonth/genFY) always processes the PRECEDING calendar month's
+  // completed-project data -- e.g. a September pay period pulls August's
+  // completed projects, October pulls September's, and so on.
+  const incentiveCyclePeriod = useMemo(
+    () => getIncentiveCyclePeriod(genMonth, genFY),
+    [genMonth, genFY]
+  );
+
   const activeIncentives = useMemo<IncentiveRecord[]>(() => {
     if (!currentEmployee) return [];
 
-    // 1. Live query central projects database
+    // 1. Live query central projects database, using the N-1 offset period
     const matchedFromProjects: IncentiveRecord[] = [];
     if (Array.isArray(externalProjects) && externalProjects.length > 0) {
       externalProjects.forEach(p => {
-        const inc = getProjectIncentiveForEmployee(p, currentEmployee, genMonth, genFY, externalCommissionRules);
+        const inc = getProjectIncentiveForEmployee(
+          p,
+          currentEmployee,
+          incentiveCyclePeriod.month,
+          incentiveCyclePeriod.fy,
+          externalCommissionRules
+        );
         if (inc) {
           matchedFromProjects.push(inc);
         }
@@ -901,7 +974,10 @@ export default function SalaryStudio({
       return matchedFromProjects;
     }
 
-    // 2. Fallback to any custom saved incentives for backwards compatibility
+    // 2. Fallback to any custom saved incentives for backwards compatibility.
+    // These are manually-entered records with no "project completion date"
+    // concept, so they're matched against the pay period month itself
+    // rather than the N-1 offset used for live project data.
     return incentives.filter(inc => {
       const isEmpMatch = currentEmployee && (inc.empId === currentEmployee.empId || inc.empName.toLowerCase() === currentEmployee.name.toLowerCase());
       if (!isEmpMatch) return false;
@@ -911,11 +987,23 @@ export default function SalaryStudio({
       const incMonth = d.toLocaleString('default', { month: 'long' });
       return incMonth.toLowerCase() === genMonth.toLowerCase();
     });
-  }, [externalProjects, currentEmployee, genMonth, genFY, incentives, externalCommissionRules]);
+  }, [externalProjects, currentEmployee, genMonth, genFY, incentiveCyclePeriod, incentives, externalCommissionRules]);
 
   const totalIncentiveAmount = useMemo(() => {
     return activeIncentives.reduce((sum, inc) => sum + (Number(inc.amount) || 0), 0);
   }, [activeIncentives]);
+
+  // Fetch & Aggregate (Phase 1, point 2): the three summary metrics for the
+  // incentive cycle -- total matched projects, total kWp volume, and total
+  // incentive amount. totalIncentive === totalIncentiveAmount above; kept as
+  // a named alias so the "Incentive" earnings line and any future incentive
+  // summary block reference the exact same aggregated figure.
+  const totalProjects = activeIncentives.length;
+  const totalKwp = useMemo(
+    () => activeIncentives.reduce((sum, inc) => sum + (Number(inc.kw) || 0), 0),
+    [activeIncentives]
+  );
+  const totalIncentive = totalIncentiveAmount;
 
   // Attendance ratio calculations
   const attendanceRatio = useMemo(() => {
@@ -1008,6 +1096,19 @@ export default function SalaryStudio({
       earnings: { ...calculatedEarnings },
       deductions: { ...deductions },
       incentivesList: [...activeIncentives],
+      // Pay Item Mapping (Phase 1, point 3): the "Incentive" entry under
+      // calculatedEarnings.incentive already equals totalIncentiveAmount,
+      // which is derived from activeIncentives -- itself matched against
+      // incentiveCyclePeriod (the N-1 offset month/FY) rather than the pay
+      // period's own month/FY. This block just records that cycle + the
+      // aggregated metrics alongside the slip for later reference/audit.
+      incentiveSummary: {
+        cycleMonth: incentiveCyclePeriod.month,
+        cycleFY: incentiveCyclePeriod.fy,
+        totalProjects,
+        totalKwp,
+        totalIncentive
+      },
       companySnapshot: {
         name: companySettings.companyName || 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY',
         address: companySettings.address || 'Surat, Gujarat, India',
@@ -1067,6 +1168,27 @@ export default function SalaryStudio({
         }
       })
     );
+  };
+
+  // Resolves the incentive summary for display, falling back gracefully for
+  // any slip saved before incentiveSummary existed on the record (older
+  // history entries). The fallback derives the same three metrics from the
+  // slip's own incentivesList/earnings, and uses the slip's own month/FY as
+  // the period label -- which is accurate for those older records, since
+  // they were generated before the N-1 cycle offset existed and always used
+  // the pay period's own month.
+  const getIncentiveSummaryForSlip = (slip: SalarySlipRecord) => {
+    if (slip.incentiveSummary) {
+      return slip.incentiveSummary;
+    }
+    const list = slip.incentivesList || [];
+    return {
+      cycleMonth: slip.month,
+      cycleFY: slip.fy,
+      totalProjects: list.length,
+      totalKwp: list.reduce((sum, inc) => sum + (Number(inc.kw) || 0), 0),
+      totalIncentive: Number(slip.earnings?.incentive) || 0
+    };
   };
 
   // Save Salary Slip to History
@@ -1791,11 +1913,11 @@ export default function SalaryStudio({
                   <Trophy className="w-4 h-4 text-[#D4AF37]" />
                   <div>
                     <h3 className="text-xs font-bold text-white uppercase tracking-wider">
-                      Live Project Incentives ({genMonth} {genFY})
+                      Live Project Incentives ({incentiveCyclePeriod.month} {incentiveCyclePeriod.fy})
                     </h3>
                     <p className="text-[10px] text-gray-400 flex items-center gap-1 mt-0.5">
                       <Sparkles className="w-3 h-3 text-emerald-400" />
-                      Auto-mapped from Central Projects Database
+                      Auto-mapped from Central Projects Database · feeds the {genMonth} {genFY} pay period
                     </p>
                   </div>
                 </div>
@@ -1813,7 +1935,7 @@ export default function SalaryStudio({
                   <div className="py-6 px-4 text-center rounded-lg bg-[#181818] border border-[#2A2A2A]/60">
                     <AlertCircle className="w-6 h-6 text-gray-500 mx-auto mb-2 opacity-60" />
                     <p className="text-xs font-medium text-gray-300">
-                      No active project commissions found for <span className="text-[#D4AF37] font-semibold">{currentEmployee?.name}</span> in {genMonth} {genFY}.
+                      No active project commissions found for <span className="text-[#D4AF37] font-semibold">{currentEmployee?.name}</span> in {incentiveCyclePeriod.month} {incentiveCyclePeriod.fy}.
                     </p>
                     <p className="text-[11px] text-gray-500 mt-1 max-w-md mx-auto">
                       Any solar projects assigned to this employee (as Designer or Sales) in the Central Database during this billing period will automatically calculate into gross earnings.
@@ -2191,7 +2313,7 @@ export default function SalaryStudio({
             <div className="flex-1 overflow-y-auto p-6 bg-[#0E0E0E] flex justify-center">
               <div
                 id="salarySlipPrintContainer"
-                style={{ width: '794px', minHeight: '1123px' }}
+                style={{ width: '794px' }}
                 className="bg-white text-[#1A202C] font-sans relative shadow-2xl select-text"
               >
                 {/* ── 1. SLIP HEADER ── */}
@@ -2410,37 +2532,38 @@ export default function SalaryStudio({
                     </div>
                   </div>
 
-                  {/* Project-wise Incentive Breakdown Table (if any) */}
-                  {previewSlipData.incentivesList && previewSlipData.incentivesList.length > 0 && (
-                    <div className="border border-[#D4AF37]/50 rounded-lg overflow-hidden text-xs shadow-sm">
-                      <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #1B2A4A 100%)' }} className="text-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider flex items-center justify-between border-b border-[#D4AF37]">
-                        <span>Project-wise Incentive Breakdown</span>
-                        <span className="text-[#D4AF37] font-mono text-[9px]">SOLAR COMMISSIONS</span>
-                      </div>
-                      <table className="w-full text-left">
-                        <thead className="bg-gray-50 text-[10px] text-gray-500 uppercase border-b border-gray-200">
-                          <tr>
-                            <th className="py-1.5 px-3">Date</th>
-                            <th className="py-1.5 px-3">Project Name</th>
-                            <th className="py-1.5 px-3">Client</th>
-                            <th className="py-1.5 px-3 text-right">kWp</th>
-                            <th className="py-1.5 px-3 text-right">Incentive</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-gray-100">
-                          {previewSlipData.incentivesList.map((inc, i) => (
-                            <tr key={i}>
-                              <td className="py-1 px-3 text-gray-600">{inc.date}</td>
-                              <td className="py-1 px-3 font-semibold text-gray-900">{inc.project}</td>
-                              <td className="py-1 px-3 text-gray-600">{inc.client}</td>
-                              <td className="py-1 px-3 text-right font-mono">{inc.kw}</td>
-                              <td className="py-1 px-3 text-right font-mono font-bold text-emerald-700">₹{inc.amount.toLocaleString('en-IN')}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                  {/* Incentive Summary (compact, no client/project names) */}
+                  <div className="border border-[#D4AF37]/50 rounded-lg overflow-hidden text-xs shadow-sm">
+                    <div
+                      style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #1B2A4A 100%)' }}
+                      className="text-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider flex items-center justify-between border-b border-[#D4AF37]"
+                    >
+                      <span>Incentive Summary</span>
+                      <span className="text-[#D4AF37] font-mono text-[9px]">
+                        Performance Period: {getIncentiveSummaryForSlip(previewSlipData).cycleMonth} {getIncentiveSummaryForSlip(previewSlipData).cycleFY}
+                      </span>
                     </div>
-                  )}
+                    <div className="grid grid-cols-3 divide-x divide-gray-200 bg-white">
+                      <div className="py-3 px-3 text-center">
+                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Total Projects</div>
+                        <div className="text-base font-bold font-mono text-[#0F1C35] mt-0.5">
+                          {getIncentiveSummaryForSlip(previewSlipData).totalProjects} {getIncentiveSummaryForSlip(previewSlipData).totalProjects === 1 ? 'Project' : 'Projects'}
+                        </div>
+                      </div>
+                      <div className="py-3 px-3 text-center">
+                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Total System Size</div>
+                        <div className="text-base font-bold font-mono text-[#0F1C35] mt-0.5">
+                          {getIncentiveSummaryForSlip(previewSlipData).totalKwp.toFixed(2)} kWp
+                        </div>
+                      </div>
+                      <div className="py-3 px-3 text-center">
+                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Total Incentive Amount</div>
+                        <div className="text-base font-bold font-mono text-emerald-700 mt-0.5">
+                          ₹{getIncentiveSummaryForSlip(previewSlipData).totalIncentive.toLocaleString('en-IN')}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
 
                   {/* Net Salary Summary Box */}
                   <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 50%, #1B2A4A 100%)' }} className="border-2 border-[#D4AF37] shadow-xl text-white rounded-xl p-5 grid grid-cols-3 gap-4 items-center text-center">
