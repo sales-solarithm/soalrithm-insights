@@ -88,6 +88,25 @@ const DEPARTMENT_PRESETS = [
   'Human Resources & Admin'
 ];
 
+/**
+ * Formats an ID-like value (Aadhaar/UID number, bank account number) as a
+ * plain, full-precision text string -- never scientific notation. Guards
+ * against the common spreadsheet-import failure mode where a long
+ * numeric-looking ID gets parsed as a JS `number` upstream (by SheetJS, or
+ * by a prior write from an external tool): interpolating a raw number
+ * directly can render as "2.32522E+11" and, for very long values (16-18+
+ * digits), can silently lose trailing-digit precision to floating-point
+ * rounding. `toLocaleString('fullwide', { useGrouping: false })` always
+ * prints the full digit string, unlike `Number.prototype.toString()`.
+ */
+function safeIdString(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value.toLocaleString('fullwide', { useGrouping: false, maximumFractionDigits: 0 }) : '';
+  }
+  return String(value).trim();
+}
+
 const BANK_PRESETS = [
   'HDFC Bank',
   'State Bank of India',
@@ -196,19 +215,28 @@ export default function EmployeeDirectory({
       seenIds.add(id);
 
       const empId = u.employeeId || u.empId || `SOL-${(u.name || 'EMP').substring(0, 3).toUpperCase()}-${String(index + 1).padStart(3, '0')}`;
-      const name = u.name || u.displayName || u.employeeName || u.email?.split('@')[0] || 'Team Member';
+      // Name resolution: check every known "real name" field before ever
+      // falling back to something derived from the email address. An email
+      // prefix (e.g. "jayjalpa2002") is never a legal/registered name, so it
+      // is deliberately excluded from this chain.
+      const name = u.fullName || u.name || u.displayName || u.employeeName || u.legalName || 'Unnamed Employee';
       const department = u.department || u.role || 'Solar Design & Engineering';
       const designation = u.designation || u.role || 'Associate';
       const role = u.role || 'employee';
-      const basic = Number(u.basic || u.basicPay || u.baseSalary || 25000);
+      // Basic pay: 0 is a valid configured value and must never be
+      // silently replaced by a default. Only Number() is applied when a
+      // real value exists (not undefined/null/empty string); otherwise it
+      // is 0, exactly as an unconfigured value should read.
+      const rawBasic = u.basic ?? u.basicPay ?? u.baseSalary;
+      const basic = rawBasic !== undefined && rawBasic !== null && rawBasic !== '' ? Number(rawBasic) : 0;
       const bankName = u.bankName || u.bank || '';
-      const accountNumber = u.accountNumber || u.accNo || u.bankAccountNo || '';
+      const accountNumber = safeIdString(u.accountNumber || u.accNo || u.bankAccountNo || '');
       const ifscCode = u.ifscCode || u.ifsc || '';
       const dateOfJoining = u.dateOfJoining || u.doj || u.createdAt || '';
       const dateOfBirth = u.dateOfBirth || u.dob || '';
       const pan = u.panCardNumber || u.pan || '';
       const panCardNumber = pan;
-      const aadhaarCardNumber = u.aadhaarCardNumber || '';
+      const aadhaarCardNumber = safeIdString(u.aadhaarCardNumber || '');
       const houseAddress = u.houseAddress || '';
       const personalEmailAddress = u.personalEmailAddress || '';
 
@@ -350,14 +378,17 @@ export default function EmployeeDirectory({
       role: emp.role || 'employee',
       dateOfJoining: emp.dateOfJoining ? String(emp.dateOfJoining).split('T')[0] : '',
       dateOfBirth: emp.dateOfBirth ? String(emp.dateOfBirth).split('T')[0] : '',
-      basic: Number(emp.basic || emp.basicPay || 25000),
+      basic: (() => {
+        const rawBasic = emp.basic ?? emp.basicPay;
+        return rawBasic !== undefined && rawBasic !== null ? Number(rawBasic) : 0;
+      })(),
       bankName: isBankPreset ? (emp.bankName || 'HDFC Bank') : 'custom',
       customBankName: isBankPreset ? '' : (emp.bankName || ''),
-      accountNumber: emp.accountNumber || emp.accNo || '',
+      accountNumber: safeIdString(emp.accountNumber || emp.accNo || ''),
       ifscCode: emp.ifscCode || emp.ifsc || '',
       pan: emp.panCardNumber || emp.pan || '',
       panCardNumber: emp.panCardNumber || emp.pan || '',
-      aadhaarCardNumber: emp.aadhaarCardNumber || '',
+      aadhaarCardNumber: safeIdString(emp.aadhaarCardNumber || ''),
       houseAddress: emp.houseAddress || '',
       personalEmailAddress: emp.personalEmailAddress || '',
       uan: emp.uan || '',
@@ -694,16 +725,21 @@ export default function EmployeeDirectory({
           row['Date of Birth'] || row['DOB'] || row['Birth Date'] || ''
         );
 
-        const basicRaw = row['Basic Pay'] ?? row['Basic'] ?? row['Basic Salary'] ?? row['Base Pay'] ?? row['Basic Pay (₹)'] ?? 25000;
-        const basic = typeof basicRaw === 'number' ? basicRaw : parseFloat(String(basicRaw).replace(/[^0-9.]/g, '')) || 25000;
+        const basicRaw = row['Basic Pay'] ?? row['Basic'] ?? row['Basic Salary'] ?? row['Base Pay'] ?? row['Basic Pay (₹)'];
+        const basic =
+          typeof basicRaw === 'number'
+            ? basicRaw
+            : basicRaw !== undefined && basicRaw !== null && String(basicRaw).trim() !== ''
+              ? (parseFloat(String(basicRaw).replace(/[^0-9.]/g, '')) || 0)
+              : 0;
 
         const bankName = String(
           row['Bank Name'] || row['Bank'] || row['BankName'] || ''
         ).trim();
 
-        const accountNumber = String(
+        const accountNumber = safeIdString(
           row['Account Number'] || row['Account No'] || row['Acc No'] || row['AccountNumber'] || row['Bank Account Number'] || ''
-        ).trim();
+        );
 
         const ifscCode = String(
           row['IFSC'] || row['IFSC Code'] || row['Ifsc'] || row['IfscCode'] || ''
@@ -714,7 +750,7 @@ export default function EmployeeDirectory({
         ).trim();
 
         const pan = String(row['PAN'] || row['Pan'] || row['PAN Number'] || '').trim().toUpperCase();
-        const aadhaarCardNumber = String(row['Aadhaar'] || row['Aadhaar Card'] || row['Aadhaar Number'] || row['aadhaarCardNumber'] || '').trim();
+        const aadhaarCardNumber = safeIdString(row['Aadhaar'] || row['Aadhaar Card'] || row['Aadhaar Number'] || row['aadhaarCardNumber'] || '');
         const houseAddress = String(row['Address'] || row['House Address'] || row['Residential Address'] || row['houseAddress'] || '').trim();
         const personalEmailAddress = String(row['Personal Email'] || row['Personal Email Address'] || row['personalEmailAddress'] || '').trim().toLowerCase();
 
@@ -906,7 +942,7 @@ export default function EmployeeDirectory({
       'Date of Birth': e.dateOfBirth || '—',
       'Basic Pay (₹)': e.basic || 0,
       'Bank Name': e.bankName || '—',
-      'Account Number': e.accountNumber || '—',
+      'Account Number': safeIdString(e.accountNumber) || '—',
       'IFSC Code': e.ifscCode || '—',
       'Email': e.email || '—',
       'Mobile': e.mobile || '—',
@@ -1272,7 +1308,7 @@ export default function EmployeeDirectory({
 
                     {/* Account Number */}
                     <td className="py-3.5 px-3.5 font-mono text-gray-300">
-                      {emp.accountNumber || '—'}
+                      {safeIdString(emp.accountNumber) || '—'}
                     </td>
 
                     {/* IFSC */}

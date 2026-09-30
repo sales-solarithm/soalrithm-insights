@@ -5,6 +5,27 @@ import { User, signOut as fbSignOut, onAuthStateChanged } from 'firebase/auth';
 import { doc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { auth, db } from '../lib/firebase';
 import { COLLECTIONS } from '../config/schema';
+import { INACTIVITY_LOGOUT_MESSAGE, isSessionStale, clearStoredActivity } from '../lib/inactivity';
+
+/**
+ * Clears everything session-scoped that is safe to drop when a session ends:
+ * all of sessionStorage, and the shared last-activity marker.
+ *
+ * Deliberately does NOT call localStorage.clear(). This app keeps real
+ * business data in localStorage -- notably saved salary slips (which are not
+ * in Firestore), the slip-number counter, and any invoices not yet migrated
+ * to Firestore -- and wiping those on an idle timeout would destroy records.
+ */
+function clearSessionCaches(): void {
+  try {
+    if (typeof window !== 'undefined') {
+      window.sessionStorage.clear();
+      clearStoredActivity(window.localStorage);
+    }
+  } catch {
+    // storage unavailable -- nothing to clear
+  }
+}
 
 export type AuthStatus = 'unauthenticated' | 'loading' | 'unauthorized' | 'authorized';
 
@@ -27,8 +48,12 @@ interface OwnerAuthContextType {
   ownerProfile: OwnerProfile | null;
   detectedRole: string | null;
   authError: string | null;
+  /** Non-error informational message for the login screen (e.g. idle timeout). */
+  authNotice: string | null;
   isOwnerAuthorized: boolean;
   signOut: () => Promise<void>;
+  /** End the session because of inactivity: clear caches, sign out, show notice. */
+  expireSession: (message?: string) => Promise<void>;
   refreshAuth: () => Promise<void>;
   setAuthError: (err: string | null) => void;
   setAuthorizedOwner: (user: User | any, profile: OwnerProfile) => void;
@@ -58,22 +83,26 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number = 5000, errorMsg?
 }
 
 export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
-  // Directly authorized executive owner state - bypasses login gate
-  const [status, setStatus] = useState<AuthStatus>('authorized');
+  // Real gate: starts in 'loading' until Firebase's auth state is known, then
+  // becomes 'unauthenticated' (show login), 'unauthorized' (signed in but
+  // not an owner -- already signed back out by the time this is set), or
+  // 'authorized' (real owner, verified against Firestore).
+  const [status, setStatus] = useState<AuthStatus>('loading');
   const [authUser, setAuthUser] = useState<User | null>(null);
-  const [ownerProfile, setOwnerProfile] = useState<OwnerProfile | null>({
-    name: 'Executive Owner',
-    email: 'owner@solarithmdesign.com',
-    role: 'owner',
-    assignedRole: 'owner'
-  });
-  const [detectedRole, setDetectedRole] = useState<string | null>('owner');
+  const [ownerProfile, setOwnerProfile] = useState<OwnerProfile | null>(null);
+  const [detectedRole, setDetectedRole] = useState<string | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
 
   const isMountedRef = useRef(true);
 
+  const ACCESS_DENIED_MESSAGE = 'Access Restricted: Only authorized Executive Owners can access this console.';
+
   const forceShowLogin = useCallback(() => {
-    // No-op to prevent locking out the user
+    setStatus('unauthenticated');
+    setAuthUser(null);
+    setOwnerProfile(null);
+    setDetectedRole(null);
   }, []);
 
   const setAuthorizedOwner = useCallback((user: User | any, profile: OwnerProfile) => {
@@ -82,12 +111,20 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
     setDetectedRole('owner');
     setStatus('authorized');
     setAuthError(null);
+    setAuthNotice(null);
   }, []);
 
-  // Role verification method - invoked for session check or manual credential submission
+  // Role verification method - invoked on every auth-state change (including
+  // an existing session on page load) so a role change or revocation always
+  // takes effect, not just at the moment of a fresh login.
   const verifyAndAuthorizeUser = useCallback(async (user: User): Promise<boolean> => {
     if (!db) {
-      return true;
+      // No Firestore configured -- fail closed rather than silently granting access.
+      if (isMountedRef.current) {
+        setStatus('unauthorized');
+        setAuthError(ACCESS_DENIED_MESSAGE);
+      }
+      return false;
     }
 
     try {
@@ -133,38 +170,116 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
         }
       }
 
+      if (!isOwner) {
+        // Strictly deny: sign the user out immediately, never leave a
+        // non-owner session in an "authorized" or ambiguous state.
+        try {
+          await fbSignOut(auth);
+        } catch (signOutErr) {
+          console.warn('[OwnerAuth] Sign-out during denial failed:', signOutErr);
+        }
+        if (isMountedRef.current) {
+          setAuthUser(null);
+          setOwnerProfile(null);
+          setDetectedRole(foundRole || null);
+          setStatus('unauthorized');
+          setAuthError(ACCESS_DENIED_MESSAGE);
+        }
+        return false;
+      }
+
       if (isMountedRef.current) {
         setAuthUser(user);
-        if (matchedProfile) {
-          setOwnerProfile(matchedProfile);
-        }
+        setOwnerProfile(matchedProfile);
         setDetectedRole(foundRole || 'owner');
         setStatus('authorized');
+        setAuthError(null);
+        setAuthNotice(null);
       }
       return true;
     } catch (err) {
-      console.warn('[OwnerAuth] Verification warning:', err);
-      return true;
+      // Fail closed on an unexpected error -- never default to granting access.
+      console.warn('[OwnerAuth] Verification error:', err);
+      try {
+        await fbSignOut(auth);
+      } catch (signOutErr) {
+        // already in an error path -- nothing further to do
+      }
+      if (isMountedRef.current) {
+        setAuthUser(null);
+        setOwnerProfile(null);
+        setStatus('unauthorized');
+        setAuthError('Unable to verify access. Please try signing in again.');
+      }
+      return false;
     }
   }, []);
 
-  // Firebase auth state observer (updates current user without blocking console access)
+  // Inactivity expiry: same teardown as a manual sign-out, plus a notice so
+  // the login screen can explain why the user is there.
+  const expireSession = useCallback(async (message: string = INACTIVITY_LOGOUT_MESSAGE) => {
+    setAuthNotice(message);
+    clearSessionCaches();
+    try {
+      if (auth) {
+        await fbSignOut(auth);
+      }
+    } catch (err) {
+      console.error('Sign out error during session expiry:', err);
+    }
+    if (isMountedRef.current) {
+      setAuthUser(null);
+      setOwnerProfile(null);
+      setDetectedRole(null);
+      setAuthError(null);
+      setStatus('unauthenticated');
+    }
+  }, []);
+
+  // Firebase auth state observer -- this is what makes the gate apply on
+  // every page load, not just at the moment of a fresh login, so an
+  // existing browser session is always re-checked against the current
+  // Firestore role.
   useEffect(() => {
     isMountedRef.current = true;
 
     if (!auth) {
+      setStatus('unauthenticated');
       return;
     }
+
+    // The first callback of a page load is a *restored* persisted session
+    // (or none); later callbacks are fresh sign-ins. Only a restored session
+    // can be stale, so a tab closed for >15 minutes still needs a re-login,
+    // while a brand-new login is never rejected by an old timestamp.
+    let isInitialCallback = true;
 
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
       if (!isMountedRef.current) return;
 
+      const isRestoredSession = isInitialCallback;
+      isInitialCallback = false;
+
       if (user) {
+        if (
+          isRestoredSession &&
+          typeof window !== 'undefined' &&
+          isSessionStale(window.localStorage, Date.now())
+        ) {
+          await expireSession();
+          return;
+        }
         try {
           await verifyAndAuthorizeUser(user);
         } catch (err) {
           console.warn('[OwnerAuth] Session verification error:', err);
+          setStatus('unauthenticated');
         }
+      } else {
+        setAuthUser(null);
+        setOwnerProfile(null);
+        setDetectedRole(null);
+        setStatus('unauthenticated');
       }
     });
 
@@ -172,7 +287,7 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
       isMountedRef.current = false;
       unsubscribe();
     };
-  }, [verifyAndAuthorizeUser]);
+  }, [verifyAndAuthorizeUser, expireSession]);
 
   const signOut = useCallback(async () => {
     try {
@@ -182,7 +297,13 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       console.error('Sign out error:', err);
     }
+    clearSessionCaches();
     setAuthUser(null);
+    setOwnerProfile(null);
+    setDetectedRole(null);
+    setStatus('unauthenticated');
+    setAuthError(null);
+    setAuthNotice(null);
   }, []);
 
   const refreshAuth = useCallback(async () => {
@@ -192,7 +313,7 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [verifyAndAuthorizeUser]);
 
-  const isOwnerAuthorized = true;
+  const isOwnerAuthorized = status === 'authorized';
 
   return (
     <OwnerAuthContext.Provider
@@ -202,8 +323,10 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
         ownerProfile,
         detectedRole,
         authError,
+        authNotice,
         isOwnerAuthorized,
         signOut,
+        expireSession,
         refreshAuth,
         setAuthError,
         setAuthorizedOwner,

@@ -142,6 +142,12 @@
 .pv-info-row { display: flex; gap: 6px; margin-bottom: 1.5mm; font-size: 11px; }
 .pv-info-row .pv-label { min-width: 24mm; color: var(--muted); font-weight: 500; flex-shrink: 0; }
 .pv-info-row .pv-value { color: var(--text); }
+/* Billing address needs to wrap across several lines, so it gets its own
+   stacked block (label above, value below) instead of the label/value flex
+   row used for single-line fields like Company Name or GSTIN. */
+.pv-address-block { margin-bottom: 1.5mm; font-size: 11px; }
+.pv-address-block .pv-label { color: var(--muted); font-weight: 500; margin-bottom: 0.5mm; }
+.pv-address-block .pv-address-value { color: var(--text); line-height: 1.4; }
 .pv-summary-row { display: flex; gap: 4mm; margin-bottom: 2.5mm; }
 .pv-summary-stat { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: var(--rad); padding: 2mm 3mm; }
 .pv-summary-stat-label { font-size: 8.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }

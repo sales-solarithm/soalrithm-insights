@@ -337,13 +337,22 @@ export function renderMetaStrip(data: InvoiceData): string {
 
 export function renderClientProjectGrid(data: InvoiceData): string {
   const t = data.totals || { projectCount: 0, totalKW: 0 };
+  const rawAddress = data.client?.address || '';
+  // Preserve manually-entered line breaks (the Billing Address field is a
+  // textarea) and render as a proper multi-line block rather than the
+  // single-line flex row used for the other fields -- a full postal
+  // address needs to wrap onto its own lines, not run on beside its label.
+  const addressHtml = escapeHtml(rawAddress).replace(/\n/g, '<br/>') || '—';
   return `<div class="pv-info-grid">
     <div>
       <div class="pv-block-title">Client Details</div>
       <div class="pv-info-row"><span class="pv-label">Company Name</span><span class="pv-value">${escapeHtml(data.client?.name || '—')}</span></div>
-      <div class="pv-info-row"><span class="pv-label">Contact No.</span><span class="pv-value">${escapeHtml(data.client?.phone || '—')}</span></div>
       ${data.client?.gstin ? `<div class="pv-info-row"><span class="pv-label">GSTIN</span><span class="pv-value">${escapeHtml(data.client.gstin)}</span></div>` : ''}
-      <div class="pv-info-row"><span class="pv-label">Address</span><span class="pv-value">${escapeHtml(data.client?.address || '—')}</span></div>
+      <div class="pv-address-block">
+        <div class="pv-label">Billing Address</div>
+        <div class="pv-value pv-address-value">${addressHtml}</div>
+      </div>
+      <div class="pv-info-row"><span class="pv-label">Contact No.</span><span class="pv-value">${escapeHtml(data.client?.phone || '—')}</span></div>
     </div>
     <div>
       <div class="pv-block-title">Project Summary</div>

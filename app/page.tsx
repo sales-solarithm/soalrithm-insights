@@ -1,9 +1,12 @@
 'use client';
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { collection, onSnapshot, doc, updateDoc, getDoc, getDocs, query, where } from 'firebase/firestore';
+import { collection, onSnapshot, doc, updateDoc, deleteDoc, addDoc, getDoc, getDocs, query, where } from 'firebase/firestore';
 import { signOut } from 'firebase/auth';
 import { db, auth } from '@/src/lib/firebase';
 import { useOwnerAuth } from '@/src/context/OwnerAuthContext';
+import { useTheme } from '@/src/context/ThemeContext';
+import OwnerLogin from '@/src/components/OwnerLogin';
+import { useInactivityLogout } from '@/src/hooks/useInactivityLogout';
 import { 
   Users, 
   Briefcase, 
@@ -35,7 +38,11 @@ import {
   CreditCard,
   Banknote,
   LogOut,
-  ShieldCheck
+  ShieldCheck,
+  Sun,
+  Moon,
+  Trash2,
+  AlertTriangle
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -49,7 +56,7 @@ import {
   CartesianGrid,
   Legend
 } from 'recharts';
-import { COLLECTIONS, PROJECT_FIELDS, CLIENT_FIELDS, CLIENT_STATUS } from '@/src/config/schema';
+import { COLLECTIONS, PROJECT_FIELDS, CLIENT_FIELDS, CLIENT_STATUS, ProjectUpgradeRecord } from '@/src/config/schema';
 import { STORAGE_KEYS } from '@/src/lib/invoicePdfEngine';
 import BillingModule from '@/src/components/Billing';
 import CompanySettingsView from '@/src/components/CompanySettingsView';
@@ -136,28 +143,77 @@ const SCOPE_LABELS: Record<string, string> = {
   pvsyst: 'PVsyst',
 };
 
+/**
+ * Compares a project's state before and after an edit, and builds a
+ * ProjectUpgradeRecord if the scope, capacity, or cost actually changed.
+ * Returns null when nothing upgrade-relevant changed, so a routine save
+ * (e.g. fixing a typo in the project name) never creates a spurious
+ * history entry. `upgradeDate` is always "now" -- the moment the change was
+ * saved -- and is intentionally independent of the project's own
+ * createdAt/date fields, which this never touches.
+ */
+const buildUpgradeRecordIfChanged = (
+  originalProject: any,
+  editedProject: any,
+  reason?: string
+): ProjectUpgradeRecord | null => {
+  const previousScope = String(originalProject?.scopeOfWork || '');
+  const newScope = String(editedProject?.scopeOfWork || '');
+
+  const previousCapacity =
+    originalProject?.plantCapacity || originalProject?.systemCapacity || originalProject?.capacity || '';
+  const newCapacity =
+    editedProject?.plantCapacity || editedProject?.systemCapacity || editedProject?.capacity || '';
+
+  const previousCost = Number(originalProject?.calculatedCost) || 0;
+  const newCost = Number(editedProject?.calculatedCost) || 0;
+  const costDifferential = newCost - previousCost;
+
+  const scopeChanged = previousScope !== newScope;
+  const capacityChanged = String(previousCapacity) !== String(newCapacity);
+  const costChanged = costDifferential !== 0;
+
+  if (!scopeChanged && !capacityChanged && !costChanged) {
+    return null;
+  }
+
+  return {
+    upgradeId: `UPG_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    upgradeDate: new Date().toISOString(),
+    previousScope,
+    newScope,
+    previousCapacity,
+    newCapacity,
+    costDifferential,
+    reason,
+    invoicedInPeriod: null,
+    incentivePaidInSlip: null
+  };
+};
+
 const getProjectDate = (project: any): Date | null => {
   if (!project) return null;
+  // Priority: projectDate -> date -> createdAt. This function feeds nearly
+  // every date-sensitive calculation in the dashboard (the Projects table,
+  // revenue/expense periods, year dropdowns), so a retroactively-corrected
+  // project date now takes effect consistently everywhere, not just in one
+  // place -- matching the same fix already applied to Billing's own date
+  // matcher.
   return parseSafeDate(
-    project.createdAt || 
-    project.created_at || 
-    project.date || 
-    project.projectDate || 
-    project.dateCreated || 
-    project.updatedAt || 
-    project.updated_at ||
-    project.invDate
+    project.projectDate ||
+    project.date ||
+    project.createdAt
   );
 };
 
 export default function DashboardPage() {
+  const { theme, toggleTheme } = useTheme();
   const [activeTab, setActiveTab] = useState('Dashboard');
   const [projects, setProjects] = useState<any[]>([]);
   const [clients, setClients] = useState<any[]>([]);
   const [pricingRules, setPricingRules] = useState<any[]>([]);
   const [commissionRules, setCommissionRules] = useState<any[]>([]);
   const [users, setUsers] = useState<any[]>([]);
-  const [apps, setApps] = useState<any[]>([]);
   const [auditLogs, setAuditLogs] = useState<any[]>([]);
   const [proposals, setProposals] = useState<any[]>([]);
   const [invoices, setInvoices] = useState<any[]>([]);
@@ -165,9 +221,20 @@ export default function DashboardPage() {
   
   // Executive profile & session controls
   const { 
+    status: authStatus,
+    authError,
+    authNotice,
     ownerProfile, 
-    signOut: handleSignOut 
+    signOut: handleSignOut,
+    expireSession
   } = useOwnerAuth();
+
+  // 15-minute inactivity auto-logout. Lives here, at the root of the
+  // authenticated dashboard, and only runs while a verified owner is signed in.
+  useInactivityLogout({
+    enabled: authStatus === 'authorized',
+    onExpire: expireSession
+  });
   const executiveProfile = ownerProfile || {
     name: 'Executive Owner',
     email: 'owner@solarithmdesign.com',
@@ -177,6 +244,17 @@ export default function DashboardPage() {
   // Time-based filtering state
   const [selectedMonth, setSelectedMonth] = useState<string>('all');
   const [selectedYear, setSelectedYear] = useState<string>('all');
+  // Projects Directory: column-header filters, search, and pagination.
+  // These are scoped to this one table -- they don't affect the shared
+  // Month/Year timeline filters above, which other dashboard sections
+  // (revenue, expenses) also depend on.
+  const [projectClientFilter, setProjectClientFilter] = useState<string>('all');
+  const [projectScopeFilter, setProjectScopeFilter] = useState<string>('all');
+  const [projectStatusFilter, setProjectStatusFilter] = useState<string>('all');
+  const [projectDesignerFilter, setProjectDesignerFilter] = useState<string>('all');
+  const [projectSearchQuery, setProjectSearchQuery] = useState<string>('');
+  const [projectsDirectoryPage, setProjectsDirectoryPage] = useState<number>(1);
+  const PROJECTS_DIRECTORY_PAGE_SIZE = 15;
   const [expensePeriod, setExpensePeriod] = useState<'monthly' | 'quarterly' | 'yearly' | 'all'>('monthly');
 
   // Pricing Rules Filter States
@@ -188,15 +266,25 @@ export default function DashboardPage() {
   // Modal states
   const [isEditProjectModalOpen, setIsEditProjectModalOpen] = useState(false);
   const [editingProject, setEditingProject] = useState<any>(null);
+  const [projectPendingDeletion, setProjectPendingDeletion] = useState<any>(null);
+  const [isDeletingProject, setIsDeletingProject] = useState(false);
+  const [deleteProjectError, setDeleteProjectError] = useState<string | null>(null);
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
 
   useEffect(() => {
+    // Don't open any Firestore listeners until the user is a verified owner.
+    // Pre-login they'd just be rejected by the owner-only security rules,
+    // and since they'd never re-subscribe on their own, the dashboard would
+    // stay empty after signing in. This effect re-runs when authStatus
+    // changes, so listeners start right after a successful login and are
+    // torn down on sign-out.
+    if (authStatus !== 'authorized') return;
+
     let unsubscribeProjects: (() => void) | undefined;
     let unsubscribeClients: (() => void) | undefined;
     let unsubscribePricing: (() => void) | undefined;
     let unsubscribeUsers: (() => void) | undefined;
     let unsubscribeEmployees: (() => void) | undefined;
-    let unsubscribeApps: (() => void) | undefined;
     let unsubscribeProposals: (() => void) | undefined;
     let unsubscribeCommissions: (() => void) | undefined;
     let unsubscribeInvoices: (() => void) | undefined;
@@ -255,20 +343,54 @@ export default function DashboardPage() {
 
       const syncEmployeesAndUsers = () => {
         const map = new Map<string, any>();
+        // Secondary index: normalized employeeId -> the map key it's filed
+        // under. Lets a corporate `employees` record and a personal-account
+        // `users` record for the same person merge into one entry even when
+        // their emails differ (e.g. a personal Google sign-in vs. the
+        // official @solarithmdesign.com address), instead of creating an
+        // orphan duplicate with a placeholder name.
+        const employeeIdIndex = new Map<string, string>();
+
+        const registerEmployeeId = (record: any, mapKey: string) => {
+          const empIdRaw = record.employeeId || record.empId;
+          if (empIdRaw) {
+            const normalizedEmpId = String(empIdRaw).toLowerCase().trim();
+            if (normalizedEmpId && !employeeIdIndex.has(normalizedEmpId)) {
+              employeeIdIndex.set(normalizedEmpId, mapKey);
+            }
+          }
+        };
+
         // Process users store
         Object.values(usersMap).forEach(u => {
-          const key = (u.email || u.id || '').toLowerCase();
-          if (key) map.set(key, u);
-        });
-        // Merge primary employees directory records (highest authoritative KYC store)
-        Object.values(employeesMap).forEach(emp => {
-          const key = (emp.email || emp.id || '').toLowerCase();
+          // .trim() matters here: a trailing/leading space on one record's
+          // email (a common data-entry slip) would otherwise produce a
+          // different map key and silently create a duplicate profile.
+          const key = (u.email || u.id || '').toLowerCase().trim();
           if (key) {
-            const existing = map.get(key) || {};
-            map.set(key, { ...existing, ...emp });
-          } else {
-            map.set(emp.id, emp);
+            map.set(key, u);
+            registerEmployeeId(u, key);
           }
+        });
+        // Merge primary employees directory records (highest authoritative KYC store).
+        // Joined first by email, then falling back to employeeId.
+        Object.values(employeesMap).forEach(emp => {
+          const emailKey = (emp.email || '').toLowerCase().trim();
+          const empIdRaw = emp.employeeId || emp.empId;
+          const normalizedEmpId = empIdRaw ? String(empIdRaw).toLowerCase().trim() : '';
+
+          let targetKey: string = emailKey && map.has(emailKey) ? emailKey : '';
+          if (!targetKey && normalizedEmpId && employeeIdIndex.has(normalizedEmpId)) {
+            targetKey = employeeIdIndex.get(normalizedEmpId) as string;
+          }
+          if (!targetKey) {
+            targetKey = emailKey || (emp.id || '').toLowerCase().trim() || `emp_${normalizedEmpId || Math.random().toString(36).slice(2)}`;
+          }
+
+          const existing = map.get(targetKey) || {};
+          const merged = { ...existing, ...emp };
+          map.set(targetKey, merged);
+          registerEmployeeId(merged, targetKey);
         });
         setUsers(Array.from(map.values()));
       };
@@ -291,16 +413,6 @@ export default function DashboardPage() {
         syncEmployeesAndUsers();
       }, (err) => {
         console.warn("Firestore users listener error:", err);
-      });
-
-      unsubscribeApps = onSnapshot(collection(db, COLLECTIONS.REGISTERED_APPS), (snapshot) => {
-        const appsData = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data()
-        }));
-        setApps(appsData);
-      }, (err) => {
-        console.warn("Firestore registeredApps listener error:", err);
       });
 
       unsubscribeProposals = onSnapshot(collection(db, COLLECTIONS.PROPOSALS), (snapshot) => {
@@ -353,13 +465,12 @@ export default function DashboardPage() {
       if (unsubscribePricing) unsubscribePricing();
       if (unsubscribeUsers) unsubscribeUsers();
       if (unsubscribeEmployees) unsubscribeEmployees();
-      if (unsubscribeApps) unsubscribeApps();
       if (unsubscribeProposals) unsubscribeProposals();
       if (unsubscribeCommissions) unsubscribeCommissions();
       if (unsubscribeSalaryHistory) unsubscribeSalaryHistory();
       if (unsubscribeAuditLogs) unsubscribeAuditLogs();
     };
-  }, []);
+  }, [authStatus]);
 
   const financialProjects = useMemo(() => {
     return projects.map((project) => {
@@ -572,7 +683,7 @@ export default function DashboardPage() {
   const handleUpdateProject = async () => {
     if (!editingProject || !editingProject.id) return;
     const originalProject = projects.find(p => p.id === editingProject.id) || {};
-    
+
     const updatedData: any = {
       projectName: editingProject.projectName || '',
       clientName: editingProject.clientName || '',
@@ -585,11 +696,23 @@ export default function DashboardPage() {
       plantCapacity: editingProject.plantCapacity || editingProject.systemCapacity || editingProject.capacity || '',
       subService: editingProject.subService || '',
       pricingCategory: editingProject.pricingCategory || '',
-      createdAt: editingProject.createdAt || originalProject.createdAt,
+      // Crucial rule: the project's original entry date is never touched by
+      // an edit/upgrade, regardless of what the edit form happens to carry.
+      // This always writes back the pre-edit value, never editingProject's.
+      createdAt: originalProject.createdAt,
       calculatedCost: Number(editingProject.calculatedCost) || 0,
       designerCommission: Number(editingProject.designerCommission) || 0,
       salesCommission: Number(editingProject.salesCommission) || 0
     };
+
+    // Detect a real scope/capacity/cost change and append (never overwrite)
+    // an upgrade record -- this is what lets billing and payroll later
+    // identify "this is a modification, not the original entry" without
+    // ever touching createdAt/date.
+    const upgradeRecord = buildUpgradeRecordIfChanged(originalProject, editingProject);
+    if (upgradeRecord) {
+      updatedData.upgradeHistory = [...(originalProject.upgradeHistory || []), upgradeRecord];
+    }
 
     // Update local state immediately
     setProjects(prev => prev.map(p => p.id === editingProject.id ? { ...p, ...updatedData } : p));
@@ -605,6 +728,51 @@ export default function DashboardPage() {
     setEditingProject(null);
   };
 
+  // Permanently deletes a project from Firestore. Only removes the project
+  // document itself -- invoices and salary/incentive history that reference
+  // it by projectId are left alone, since those are historical financial
+  // records and shouldn't disappear just because the source project was
+  // deleted from the directory.
+  const handleConfirmDeleteProject = async () => {
+    if (!projectPendingDeletion?.id) return;
+    setIsDeletingProject(true);
+    setDeleteProjectError(null);
+
+    const { id: projectId, projectName } = projectPendingDeletion;
+
+    try {
+      await deleteDoc(doc(db, COLLECTIONS.PROJECTS, projectId));
+    } catch (error) {
+      console.error('Failed to delete project from Firestore:', error);
+      setDeleteProjectError('Could not delete this project. Please try again.');
+      setIsDeletingProject(false);
+      return;
+    }
+
+    // Local state update: financialProjects, filteredFinancialProjects, and
+    // every dashboard metric derived from `projects` are memoized off this
+    // array, so removing it here immediately reflects everywhere -- no
+    // manual refresh needed.
+    setProjects((prev) => prev.filter((p) => p.id !== projectId));
+
+    // Best-effort audit trail for an irreversible action. Never blocks the
+    // deletion itself if this write fails.
+    try {
+      await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
+        action: 'PROJECT_DELETED',
+        actor: executiveProfile?.email || 'owner',
+        target: projectId,
+        details: { projectName: projectName || 'Untitled' },
+        timestamp: new Date().toISOString()
+      });
+    } catch (logErr) {
+      console.warn('Audit log write for project deletion failed:', logErr);
+    }
+
+    setIsDeletingProject(false);
+    setProjectPendingDeletion(null);
+  };
+
   const stats = [
     { name: 'Billing', collection: 'invoices', icon: Receipt, count: invoices?.length || 0, color: 'text-[#D4AF37]' },
     { name: 'Salary Studio', collection: 'salary_slips', icon: Banknote, count: salaryHistory?.length || 0, color: 'text-[#D4AF37]' },
@@ -613,7 +781,6 @@ export default function DashboardPage() {
     { name: 'Pricing Rules', collection: COLLECTIONS.PRICING_RULES, icon: Tags, count: pricingRules?.length || 0, color: 'text-[#D4AF37]' },
     { name: 'Proposals', collection: COLLECTIONS.PROPOSALS, icon: FileText, count: proposals?.length || 0, color: 'text-[#D4AF37]' },
     { name: 'Employees', collection: COLLECTIONS.EMPLOYEES, icon: Users, count: users?.length || 0, color: 'text-[#D4AF37]' },
-    { name: 'Apps', collection: COLLECTIONS.REGISTERED_APPS, icon: LayoutGrid, count: apps?.length || 0, color: 'text-[#D4AF37]' },
   ];
 
   const availableDesigners = users.filter(u => String(u.department).toLowerCase() === 'designer' || String(u.role).toLowerCase() === 'designer');
@@ -801,6 +968,136 @@ export default function DashboardPage() {
       return true;
     });
   }, [financialProjects, selectedMonth, selectedYear]);
+
+  // Column-header filter option lists -- derived from the full project set
+  // (not the time-filtered one) so the available options stay stable
+  // regardless of which Month/Year is currently selected.
+  const projectClientOptions = useMemo(() => {
+    const set = new Set<string>();
+    financialProjects.forEach((p) => {
+      const name = p.clientName || p.matchedClient?.companyName;
+      if (name) set.add(name);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [financialProjects]);
+
+  const projectScopeOptions = useMemo(() => {
+    const set = new Set<string>();
+    financialProjects.forEach((p) => {
+      if (p.scopeOfWork) set.add(p.scopeOfWork);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [financialProjects]);
+
+  const projectStatusOptions = useMemo(() => {
+    const set = new Set<string>();
+    financialProjects.forEach((p) => {
+      if (p.status) set.add(p.status);
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [financialProjects]);
+
+  // Designer names across both the legacy single-designer field and every
+  // split-scope assignment, so filtering by a designer catches a project
+  // regardless of which assignment style it uses.
+  const projectDesignerOptions = useMemo(() => {
+    const set = new Set<string>();
+    financialProjects.forEach((p) => {
+      if (p.designerEmail) set.add(toTitleCase(getEmployeeName(p.designerEmail)));
+      if (p.assignedScopes && typeof p.assignedScopes === 'object') {
+        Object.values(p.assignedScopes).forEach((email: any) => {
+          if (email) set.add(toTitleCase(getEmployeeName(email)));
+        });
+      }
+    });
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [financialProjects, getEmployeeName]);
+
+  const projectHasDesignerName = (project: any, designerName: string): boolean => {
+    if (project.designerEmail && toTitleCase(getEmployeeName(project.designerEmail)) === designerName) {
+      return true;
+    }
+    if (project.assignedScopes && typeof project.assignedScopes === 'object') {
+      return Object.values(project.assignedScopes).some(
+        (email: any) => email && toTitleCase(getEmployeeName(email)) === designerName
+      );
+    }
+    return false;
+  };
+
+  // Final Projects Directory rows: time filter (above) -> column filters ->
+  // search -> sort newest-first by the same projectDate/date/createdAt
+  // priority used everywhere else.
+  const projectsDirectoryFilteredSorted = useMemo(() => {
+    const query = projectSearchQuery.trim().toLowerCase();
+    const rows = filteredFinancialProjects.filter((project) => {
+      if (projectClientFilter !== 'all') {
+        const clientName = project.clientName || project.matchedClient?.companyName || '';
+        if (clientName !== projectClientFilter) return false;
+      }
+      if (projectScopeFilter !== 'all' && project.scopeOfWork !== projectScopeFilter) {
+        return false;
+      }
+      if (projectStatusFilter !== 'all' && project.status !== projectStatusFilter) {
+        return false;
+      }
+      if (projectDesignerFilter !== 'all' && !projectHasDesignerName(project, projectDesignerFilter)) {
+        return false;
+      }
+      if (query) {
+        const haystack = [
+          project.projectName,
+          project.clientName || project.matchedClient?.companyName,
+          project.scopeOfWork,
+          project.subService
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        if (!haystack.includes(query)) return false;
+      }
+      return true;
+    });
+
+    return [...rows].sort((a, b) => {
+      const dA = getProjectDate(a);
+      const dB = getProjectDate(b);
+      if (!dA && !dB) return 0;
+      if (!dA) return 1; // undated projects sort to the bottom
+      if (!dB) return -1;
+      return dB.getTime() - dA.getTime(); // newest first
+    });
+  }, [
+    filteredFinancialProjects,
+    projectClientFilter,
+    projectScopeFilter,
+    projectStatusFilter,
+    projectDesignerFilter,
+    projectSearchQuery,
+    getEmployeeName
+  ]);
+
+  // Reset to page 1 whenever any active filter or search term changes, so
+  // the user is never left staring at an out-of-range empty page.
+  useEffect(() => {
+    setProjectsDirectoryPage(1);
+  }, [
+    selectedMonth,
+    selectedYear,
+    projectClientFilter,
+    projectScopeFilter,
+    projectStatusFilter,
+    projectDesignerFilter,
+    projectSearchQuery
+  ]);
+
+  const projectsDirectoryTotalPages = Math.max(1, Math.ceil(projectsDirectoryFilteredSorted.length / PROJECTS_DIRECTORY_PAGE_SIZE));
+  const projectsDirectoryPageSafe = Math.min(projectsDirectoryPage, projectsDirectoryTotalPages);
+  const projectsDirectoryPageRows = useMemo(() => {
+    const start = (projectsDirectoryPageSafe - 1) * PROJECTS_DIRECTORY_PAGE_SIZE;
+    return projectsDirectoryFilteredSorted.slice(start, start + PROJECTS_DIRECTORY_PAGE_SIZE);
+  }, [projectsDirectoryFilteredSorted, projectsDirectoryPageSafe]);
+
 
   // Enterprise Financial Metrics Engine
   // Map "Total Expenses" to Employee Project Commissions
@@ -1250,22 +1547,22 @@ export default function DashboardPage() {
     const selectedMonthLabel = MONTH_OPTIONS.find(m => m.value === selectedMonth)?.label || 'All Months';
     return (
       <div className="flex flex-wrap items-center gap-2.5">
-        <div className="flex items-center text-xs text-gray-400 font-medium">
+        <div className="flex items-center text-xs text-gray-500 dark:text-gray-400 font-medium">
           <Filter className="w-3.5 h-3.5 mr-1.5 text-[#D4AF37]" />
           <span>Timeline:</span>
         </div>
         
         {/* Month Dropdown */}
-        <div className="flex items-center space-x-1.5 bg-[#121212] border border-[#333333] hover:border-[#D4AF37]/50 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors">
+        <div className="flex items-center space-x-1.5 bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/50 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors">
           <Calendar className="w-3.5 h-3.5 text-[#D4AF37]" />
           <select
             id={`${idPrefix}-month-select`}
             value={selectedMonth}
             onChange={(e) => setSelectedMonth(e.target.value)}
-            className="bg-transparent text-xs text-gray-200 focus:outline-none cursor-pointer pr-1"
+            className="bg-transparent text-xs text-gray-700 dark:text-gray-200 focus:outline-none cursor-pointer pr-1"
           >
             {MONTH_OPTIONS.map((m) => (
-              <option key={m.value} value={m.value} className="bg-[#1E1E1E] text-gray-200">
+              <option key={m.value} value={m.value} className="bg-white dark:bg-[#1E1E1E] text-gray-700 dark:text-gray-200">
                 {m.label}
               </option>
             ))}
@@ -1273,17 +1570,17 @@ export default function DashboardPage() {
         </div>
 
         {/* Year Dropdown */}
-        <div className="flex items-center space-x-1.5 bg-[#121212] border border-[#333333] hover:border-[#D4AF37]/50 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors">
-          <span className="text-xs text-gray-400 font-medium">Yr:</span>
+        <div className="flex items-center space-x-1.5 bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/50 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors">
+          <span className="text-xs text-gray-500 dark:text-gray-400 font-medium">Yr:</span>
           <select
             id={`${idPrefix}-year-select`}
             value={selectedYear}
             onChange={(e) => setSelectedYear(e.target.value)}
-            className="bg-transparent text-xs text-gray-200 focus:outline-none cursor-pointer pr-1"
+            className="bg-transparent text-xs text-gray-700 dark:text-gray-200 focus:outline-none cursor-pointer pr-1"
           >
-            <option value="all" className="bg-[#1E1E1E] text-gray-200">All Years</option>
+            <option value="all" className="bg-white dark:bg-[#1E1E1E] text-gray-700 dark:text-gray-200">All Years</option>
             {availableYears.map((yr) => (
-              <option key={yr} value={String(yr)} className="bg-[#1E1E1E] text-gray-200">
+              <option key={yr} value={String(yr)} className="bg-white dark:bg-[#1E1E1E] text-gray-700 dark:text-gray-200">
                 {yr}
               </option>
             ))}
@@ -1298,7 +1595,7 @@ export default function DashboardPage() {
               setSelectedMonth('all');
               setSelectedYear('all');
             }}
-            className="flex items-center space-x-1 px-2 py-1.5 rounded-lg text-xs font-medium text-amber-400/90 hover:text-amber-300 hover:bg-[#2A2A2A] transition-colors border border-[#444]"
+            className="flex items-center space-x-1 px-2 py-1.5 rounded-lg text-xs font-medium text-amber-600 dark:text-amber-400/90 hover:text-amber-500 dark:hover:text-amber-300 hover:bg-gray-100 dark:hover:bg-[#2A2A2A] transition-colors border border-gray-300 dark:border-[#444]"
             title={`Showing: ${selectedMonthLabel} ${selectedYear !== 'all' ? selectedYear : ''}. Click to clear filter`}
           >
             <RotateCcw className="w-3 h-3" />
@@ -1309,18 +1606,59 @@ export default function DashboardPage() {
     );
   };
 
+  // When the session ends (manual sign-out, idle expiry, or a denied
+  // account), drop all in-memory dashboard data and UI state. This component
+  // stays mounted behind the login screen, so without this the previous
+  // session's projects, invoices, payroll and client data would remain in
+  // React state (inspectable via devtools) and a re-login would land in
+  // whatever tab or open edit modal was showing.
+  useEffect(() => {
+    if (authStatus !== 'unauthenticated' && authStatus !== 'unauthorized') return;
+    setProjects([]);
+    setClients([]);
+    setPricingRules([]);
+    setCommissionRules([]);
+    setUsers([]);
+    setAuditLogs([]);
+    setProposals([]);
+    setInvoices([]);
+    setSalaryHistory([]);
+    setEditingProject(null);
+    setIsEditProjectModalOpen(false);
+    setActiveTab('Dashboard');
+  }, [authStatus]);
+
+  // Auth gate. Every hook above has already run (hook order must never
+  // change between renders), so this is safe as an early return. Nothing
+  // below -- no tab, no route, no view -- renders unless the signed-in user
+  // has been verified against Firestore as an Executive Owner.
+  if (authStatus === 'loading') {
+    return (
+      <div className="min-h-screen bg-[#121212] flex items-center justify-center">
+        <div className="flex flex-col items-center gap-3">
+          <span className="h-8 w-8 border-2 border-[#D4AF37]/30 border-t-[#D4AF37] rounded-full animate-spin" />
+          <span className="text-xs text-gray-500 tracking-wider uppercase">Verifying session...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus !== 'authorized') {
+    return <OwnerLogin onSuccess={() => {}} externalError={authError} externalNotice={authNotice} />;
+  }
+
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-[#121212] text-white">
+    <div className="flex flex-col h-screen overflow-hidden bg-white dark:bg-[#121212] text-gray-900 dark:text-white transition-colors">
       {/* Global Header */}
-      <header className="py-3.5 flex items-center justify-between px-6 bg-[#1E1E1E] border-b border-[#333333] shrink-0 z-10">
+      <header className="py-3.5 flex items-center justify-between px-6 bg-white dark:bg-[#1E1E1E] border-b border-gray-200 dark:border-[#333333] shrink-0 z-10 transition-colors">
         {/* Header Lockup (Left Side) */}
         <div className="flex items-center space-x-3.5">
-          <div className="h-10 w-10 rounded-xl bg-[#252525] border border-[#333333] flex items-center justify-center shrink-0 shadow-sm">
+          <div className="h-10 w-10 rounded-xl bg-gray-100 dark:bg-[#252525] border border-gray-200 dark:border-[#333333] flex items-center justify-center shrink-0 shadow-sm">
             <LayoutGrid className="h-5 w-5 text-[#D4AF37]" />
           </div>
           <div className="flex flex-col hidden sm:flex">
-            <span className="text-xl font-bold text-white tracking-tight">Solarithm Insight</span>
-            <span className="text-xs text-gray-400">Executive Project & Financial Management Console</span>
+            <span className="text-xl font-bold text-gray-900 dark:text-white tracking-tight">Solarithm Insight</span>
+            <span className="text-xs text-gray-500 dark:text-gray-400">Executive Project & Financial Management Console</span>
           </div>
         </div>
 
@@ -1328,31 +1666,38 @@ export default function DashboardPage() {
         <div className="flex items-center space-x-4">
           <div className="hidden md:block relative w-64 lg:w-96 mr-4">
             <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-              <Search className="h-5 w-5 text-gray-500" />
+              <Search className="h-5 w-5 text-gray-400 dark:text-gray-500" />
             </div>
             <input
               type="text"
-              className="block w-full pl-10 pr-3 py-2 border border-[#333333] rounded-md leading-5 bg-[#121212] text-gray-300 placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-[#D4AF37] focus:border-[#D4AF37] sm:text-sm transition-colors"
+              className="block w-full pl-10 pr-3 py-2 border border-gray-300 dark:border-[#333333] rounded-md leading-5 bg-gray-50 dark:bg-[#121212] text-gray-700 dark:text-gray-300 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-[#D4AF37] focus:border-[#D4AF37] sm:text-sm transition-colors"
               placeholder="Search..."
             />
           </div>
+          <button
+            onClick={toggleTheme}
+            className="text-gray-500 dark:text-gray-400 hover:text-[#D4AF37] dark:hover:text-[#D4AF37] transition-colors"
+            title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+          >
+            {theme === 'dark' ? <Sun className="w-6 h-6" /> : <Moon className="w-6 h-6" />}
+          </button>
           <button 
             onClick={() => setActiveTab('Settings')}
-            className={`transition-colors ${activeTab === 'Settings' ? 'text-[#D4AF37]' : 'text-gray-400 hover:text-white'}`}
+            className={`transition-colors ${activeTab === 'Settings' ? 'text-[#D4AF37]' : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}`}
             title="Global Company Settings"
           >
             <Settings className="w-6 h-6" />
           </button>
-          <button className="text-gray-400 hover:text-white relative">
+          <button className="text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white relative">
             <Bell className="w-6 h-6" />
-            <span className="absolute top-0 right-0 block h-2 w-2 rounded-full bg-[#D4AF37] ring-2 ring-[#1E1E1E]"></span>
+            <span className="absolute top-0 right-0 block h-2 w-2 rounded-full bg-[#D4AF37] ring-2 ring-white dark:ring-[#1E1E1E]"></span>
           </button>
 
           {/* Authenticated Owner Profile & Sign Out */}
-          <div className="flex items-center gap-3 pl-2 border-l border-[#333333]">
+          <div className="flex items-center gap-3 pl-2 border-l border-gray-200 dark:border-[#333333]">
             <div className="hidden lg:flex flex-col text-right">
               <div className="flex items-center justify-end gap-1.5">
-                <span className="text-xs font-semibold text-white">
+                <span className="text-xs font-semibold text-gray-900 dark:text-white">
                   {executiveProfile?.name || executiveProfile?.email?.split('@')[0] || 'Owner'}
                 </span>
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30 uppercase tracking-wider flex items-center gap-1">
@@ -1360,7 +1705,7 @@ export default function DashboardPage() {
                   Owner
                 </span>
               </div>
-              <span className="text-[11px] text-gray-400 truncate max-w-[160px]">
+              <span className="text-[11px] text-gray-500 dark:text-gray-400 truncate max-w-[160px]">
                 {executiveProfile?.email || 'owner@solarithmdesign.com'}
               </span>
             </div>
@@ -1376,7 +1721,7 @@ export default function DashboardPage() {
 
             <button
               onClick={handleSignOut}
-              className="p-1.5 rounded-lg text-gray-400 hover:text-red-400 hover:bg-[#252525] transition-colors cursor-pointer"
+              className="p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-gray-100 dark:hover:bg-[#252525] transition-colors cursor-pointer"
               title="Sign Out of Master Dashboard"
             >
               <LogOut className="w-5 h-5" />
@@ -1387,7 +1732,7 @@ export default function DashboardPage() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
-        <aside className="w-64 bg-[#1E1E1E] border-r border-[#333333] hidden md:flex flex-col">
+        <aside className="w-64 bg-white dark:bg-[#1E1E1E] border-r border-gray-200 dark:border-[#333333] hidden md:flex flex-col transition-colors">
           <nav className="flex-1 overflow-y-auto py-4">
           <ul className="space-y-1.5 px-3">
             <li>
@@ -1396,8 +1741,8 @@ export default function DashboardPage() {
                 onClick={(e) => { e.preventDefault(); setActiveTab('Dashboard'); }}
                 className={`flex items-center px-3 py-2.5 rounded-lg font-medium transition-colors ${
                   activeTab === 'Dashboard' 
-                    ? 'bg-[#252525] text-white border-l-2 border-[#D4AF37] shadow-sm' 
-                    : 'text-gray-400 hover:bg-[#252525]/60 hover:text-white'
+                    ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37] shadow-sm' 
+                    : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100/60 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
                 }`}
               >
                 <LayoutGrid className="w-5 h-5 mr-3 text-[#D4AF37]" />
@@ -1411,8 +1756,8 @@ export default function DashboardPage() {
                   onClick={(e) => { e.preventDefault(); setActiveTab(item.name); }}
                   className={`flex items-center px-3 py-2.5 rounded-lg font-medium transition-colors ${
                     activeTab === item.name 
-                      ? 'bg-[#252525] text-white border-l-2 border-[#D4AF37] shadow-sm' 
-                      : 'text-gray-400 hover:bg-[#252525]/60 hover:text-white'
+                      ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37] shadow-sm' 
+                      : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100/60 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
                   }`}
                 >
                   <item.icon className={`w-5 h-5 mr-3 ${activeTab === item.name ? 'text-[#D4AF37]' : ''}`} />
@@ -1422,13 +1767,13 @@ export default function DashboardPage() {
             ))}
           </ul>
         </nav>
-        <div className="p-4 border-t border-[#333333]">
+        <div className="p-4 border-t border-gray-200 dark:border-[#333333]">
           <button 
             onClick={() => setActiveTab('Settings')}
             className={`flex items-center w-full px-3 py-2.5 rounded-lg font-medium transition-colors ${
               activeTab === 'Settings' 
-                ? 'bg-[#252525] text-white border-l-2 border-[#D4AF37]' 
-                : 'text-gray-400 hover:bg-[#252525]/60 hover:text-white'
+                ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37]' 
+                : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100/60 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
             }`}
           >
             <Settings className={`w-5 h-5 mr-3 ${activeTab === 'Settings' ? 'text-[#D4AF37]' : ''}`} />
@@ -1445,8 +1790,8 @@ export default function DashboardPage() {
             <div className="w-full space-y-8">
               <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
                 <div>
-                  <h2 className="text-2xl font-bold mb-1">Master Overview</h2>
-                  <p className="text-gray-400">Financial health, cash flow projections, and project operations summary.</p>
+                  <h2 className="text-2xl font-bold mb-1 text-gray-900 dark:text-white">Master Overview</h2>
+                  <p className="text-gray-500 dark:text-gray-400">Financial health, cash flow projections, and project operations summary.</p>
                 </div>
                 {renderTimeFilterControls('dashboard-header')}
               </div>
@@ -2003,16 +2348,16 @@ export default function DashboardPage() {
             const getClientFullAddress = (client: any): string => {
               if (!client) return '—';
 
+              if (client.billingAddress) {
+                const formatted = formatAddressToString(client.billingAddress);
+                if (formatted) return formatted;
+              }
               if (client.fullAddress) {
                 const formatted = formatAddressToString(client.fullAddress);
                 if (formatted) return formatted;
               }
               if (client.address) {
                 const formatted = formatAddressToString(client.address);
-                if (formatted) return formatted;
-              }
-              if (client.billingAddress) {
-                const formatted = formatAddressToString(client.billingAddress);
                 if (formatted) return formatted;
               }
               if (client.streetAddress) {
@@ -2411,64 +2756,157 @@ export default function DashboardPage() {
           {activeTab === 'Projects' && (() => {
             return (
               <div className="w-full space-y-8">
-                <div className="bg-[#1E1E1E] rounded-xl shadow-2xl p-6 overflow-x-auto border border-[#333333]">
-                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
+                <div className="bg-white dark:bg-[#1E1E1E] rounded-xl shadow-2xl p-6 overflow-x-auto border border-gray-200 dark:border-[#333333] transition-colors">
+                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-4">
                     <div className="flex items-center space-x-3">
-                      <h3 className="text-lg font-medium">Projects Directory</h3>
-                      <span className="text-xs bg-[#121212] border border-[#333333] px-2.5 py-0.5 rounded-full text-gray-400 font-mono">
-                        {filteredFinancialProjects.length} of {financialProjects.length} projects
+                      <h3 className="text-lg font-medium text-gray-900 dark:text-white">Projects Directory</h3>
+                      <span className="text-xs bg-gray-100 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] px-2.5 py-0.5 rounded-full text-gray-500 dark:text-gray-400 font-mono">
+                        {projectsDirectoryFilteredSorted.length} of {financialProjects.length} projects
                       </span>
                     </div>
                     {renderTimeFilterControls('projects-directory')}
                   </div>
+
+                  <div className="flex items-center gap-2 mb-6">
+                    <div className="flex items-center flex-1 max-w-xs bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/50 focus-within:border-[#D4AF37] rounded-lg px-2.5 py-1.5 transition-colors">
+                      <Search className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 mr-1.5 flex-shrink-0" />
+                      <input
+                        type="text"
+                        value={projectSearchQuery}
+                        onChange={(e) => setProjectSearchQuery(e.target.value)}
+                        placeholder="Search project, client, scope..."
+                        className="bg-transparent text-xs text-gray-700 dark:text-gray-200 focus:outline-none w-full placeholder:text-gray-400 dark:placeholder:text-gray-500"
+                      />
+                    </div>
+                    {(projectClientFilter !== 'all' || projectScopeFilter !== 'all' || projectStatusFilter !== 'all' || projectDesignerFilter !== 'all' || projectSearchQuery.trim() !== '') && (
+                      <button
+                        onClick={() => {
+                          setProjectClientFilter('all');
+                          setProjectScopeFilter('all');
+                          setProjectStatusFilter('all');
+                          setProjectDesignerFilter('all');
+                          setProjectSearchQuery('');
+                        }}
+                        className="flex items-center space-x-1 px-2 py-1.5 rounded-lg text-xs font-medium text-amber-600 dark:text-amber-400/90 hover:text-amber-500 dark:hover:text-amber-300 hover:bg-gray-100 dark:hover:bg-[#2A2A2A] transition-colors border border-gray-300 dark:border-[#444]"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>Clear Column Filters</span>
+                      </button>
+                    )}
+                  </div>
                   
                   {financialProjects.length === 0 ? (
-                    <div className="text-center py-10 border border-dashed border-[#333333] rounded-lg">
-                      <FolderKanban className="mx-auto h-12 w-12 text-gray-500 mb-4" />
-                      <h4 className="text-lg font-medium text-gray-300">No active projects found</h4>
-                      <p className="text-gray-500 mt-1">Populate your Firebase connection to see real projects.</p>
+                    <div className="text-center py-10 border border-dashed border-gray-300 dark:border-[#333333] rounded-lg">
+                      <FolderKanban className="mx-auto h-12 w-12 text-gray-400 dark:text-gray-500 mb-4" />
+                      <h4 className="text-lg font-medium text-gray-700 dark:text-gray-300">No active projects found</h4>
+                      <p className="text-gray-500 dark:text-gray-500 mt-1">Populate your Firebase connection to see real projects.</p>
                     </div>
-                  ) : filteredFinancialProjects.length === 0 ? (
-                    <div className="text-center py-10 border border-dashed border-[#333333] rounded-lg">
+                  ) : projectsDirectoryFilteredSorted.length === 0 ? (
+                    <div className="text-center py-10 border border-dashed border-gray-300 dark:border-[#333333] rounded-lg">
                       <Calendar className="mx-auto h-12 w-12 text-[#D4AF37]/50 mb-4" />
-                      <h4 className="text-lg font-medium text-gray-300">No projects match the selected time filter</h4>
+                      <h4 className="text-lg font-medium text-gray-700 dark:text-gray-300">No projects match the selected filters</h4>
                       <p className="text-gray-500 mt-1">
-                        No project records found for the chosen month/year.
+                        No project records found for the chosen month/year/column filters or search.
                       </p>
                       <button
                         onClick={() => {
                           setSelectedMonth('all');
                           setSelectedYear('all');
+                          setProjectClientFilter('all');
+                          setProjectScopeFilter('all');
+                          setProjectStatusFilter('all');
+                          setProjectDesignerFilter('all');
+                          setProjectSearchQuery('');
                         }}
                         className="mt-4 inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#D4AF37] text-black hover:bg-[#c49f2c] transition-colors shadow-sm"
                       >
                         <RotateCcw className="w-3.5 h-3.5" />
-                        <span>Reset Time Filters</span>
+                        <span>Reset All Filters</span>
                       </button>
                     </div>
                   ) : (
                     <table className="w-full text-left whitespace-nowrap">
                       <thead>
-                        <tr className="text-gray-400 text-sm uppercase border-b border-[#333333]">
+                        <tr className="text-gray-500 dark:text-gray-400 text-sm uppercase border-b border-gray-200 dark:border-[#333333]">
                           <th className="pb-3 px-4 font-semibold">Project Name</th>
-                          <th className="pb-3 px-4 font-semibold">Client</th>
+                          <th className="pb-3 px-4 font-semibold">
+                            <div className="flex items-center gap-1">
+                              <span>Client</span>
+                              <select
+                                value={projectClientFilter}
+                                onChange={(e) => setProjectClientFilter(e.target.value)}
+                                onClick={(e) => e.stopPropagation()}
+                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectClientFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
+                              >
+                                <option value="all">All</option>
+                                {projectClientOptions.map((c) => (
+                                  <option key={c} value={c}>{c}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </th>
                           <th className="pb-3 px-4 font-semibold">Capacity</th>
                           <th className="pb-3 px-4 font-semibold">Date</th>
-                          <th className="pb-3 px-4 font-semibold">Scope</th>
+                          <th className="pb-3 px-4 font-semibold">
+                            <div className="flex items-center gap-1">
+                              <span>Scope</span>
+                              <select
+                                value={projectScopeFilter}
+                                onChange={(e) => setProjectScopeFilter(e.target.value)}
+                                onClick={(e) => e.stopPropagation()}
+                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectScopeFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
+                              >
+                                <option value="all">All</option>
+                                {projectScopeOptions.map((s) => (
+                                  <option key={s} value={s}>{toTitleCase(s)}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </th>
                           <th className="pb-3 px-4 font-semibold">Sub-Service</th>
-                          <th className="pb-3 px-4 font-semibold">Designer(s)</th>
+                          <th className="pb-3 px-4 font-semibold">
+                            <div className="flex items-center gap-1">
+                              <span>Designer(s)</span>
+                              <select
+                                value={projectDesignerFilter}
+                                onChange={(e) => setProjectDesignerFilter(e.target.value)}
+                                onClick={(e) => e.stopPropagation()}
+                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectDesignerFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
+                              >
+                                <option value="all">All</option>
+                                {projectDesignerOptions.map((d) => (
+                                  <option key={d} value={d}>{d}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </th>
                           <th className="pb-3 px-4 font-semibold">Sales Person</th>
                           <th className="pb-3 px-4 font-semibold text-right">Cost</th>
                           <th className="pb-3 px-4 font-semibold text-right">Des. Comm</th>
                           <th className="pb-3 px-4 font-semibold text-right">Sales Comm</th>
                           <th className="pb-3 px-4 font-semibold text-right">Balance</th>
-                          <th className="pb-3 px-4 font-semibold text-center">Status</th>
+                          <th className="pb-3 px-4 font-semibold text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              <span>Status</span>
+                              <select
+                                value={projectStatusFilter}
+                                onChange={(e) => setProjectStatusFilter(e.target.value)}
+                                onClick={(e) => e.stopPropagation()}
+                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectStatusFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
+                              >
+                                <option value="all">All</option>
+                                {projectStatusOptions.map((s) => (
+                                  <option key={s} value={s}>{toTitleCase(s)}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </th>
                           <th className="pb-3 px-4 font-semibold text-center">Payment Status</th>
                           <th className="pb-3 px-4 font-semibold text-right">Actions</th>
                         </tr>
                       </thead>
-                      <tbody className="divide-y divide-[#333333]">
-                        {filteredFinancialProjects.map((project) => {
+                      <tbody className="divide-y divide-gray-200 dark:divide-[#333333]">
+                        {projectsDirectoryPageRows.map((project) => {
                           const d = getProjectDate(project);
                           const dateText = d ? `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}` : 'N/A';
 
@@ -2481,24 +2919,24 @@ export default function DashboardPage() {
                           const paymentInfo = getProjectPaymentStatus(project);
 
                           return (
-                            <tr key={project.id} className="hover:bg-[#252525]/50 transition-colors">
-                              <td className="py-4 px-4 font-medium text-white">
+                            <tr key={project.id} className="hover:bg-gray-50 dark:hover:bg-[#252525]/50 transition-colors">
+                              <td className="py-4 px-4 font-medium text-gray-900 dark:text-white">
                                 {toTitleCase(project.projectName || 'Untitled')}
                               </td>
-                              <td className="py-4 px-4 text-gray-200">{toTitleCase(clientName)}</td>
-                              <td className="py-4 px-4 text-gray-200">
+                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(clientName)}</td>
+                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">
                                 {project.plantCapacity ? `${project.plantCapacity} ${project.capacityUnit || 'KW'}` : 'N/A'}
                               </td>
-                              <td className="py-4 px-4 text-gray-200">{dateText}</td>
-                              <td className="py-4 px-4 text-gray-200">{toTitleCase(project.scopeOfWork || 'N/A')}</td>
-                              <td className="py-4 px-4 text-gray-200">{toTitleCase(project.subService || 'N/A')}</td>
-                              <td className="py-4 px-4 text-gray-200">
+                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{dateText}</td>
+                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(project.scopeOfWork || 'N/A')}</td>
+                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(project.subService || 'N/A')}</td>
+                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">
                                 {project.assignedScopes && Object.keys(project.assignedScopes).length > 0 ? (
                                   <span className="text-xs" title={getScopeDesignerSummary(project)}>
                                     {getScopeDesignerSummary(project).split(' | ').map((line, i) => (
                                       <span key={i} className="block whitespace-nowrap">
                                         <span className="text-[#D4AF37]">{line.split(':')[0]}:</span>
-                                        <span className="text-gray-200">{line.split(':').slice(1).join(':')}</span>
+                                        <span className="text-gray-700 dark:text-gray-200">{line.split(':').slice(1).join(':')}</span>
                                       </span>
                                     ))}
                                   </span>
@@ -2506,17 +2944,17 @@ export default function DashboardPage() {
                                   getScopeDesignerSummary(project)
                                 )}
                               </td>
-                              <td className="py-4 px-4 text-gray-200">{toTitleCase(getEmployeeName(project.salesPersonEmail || project.matchedClient?.salesPersonEmail))}</td>
-                              <td className="py-4 px-4 text-right text-gray-200 font-mono">
+                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(getEmployeeName(project.salesPersonEmail || project.matchedClient?.salesPersonEmail))}</td>
+                              <td className="py-4 px-4 text-right text-gray-700 dark:text-gray-200 font-mono">
                                 {formatCurrency(cost)}
                               </td>
-                              <td className="py-4 px-4 text-right text-gray-200 font-mono">
+                              <td className="py-4 px-4 text-right text-gray-700 dark:text-gray-200 font-mono">
                                 {formatCurrency(desComm)}
                               </td>
-                              <td className="py-4 px-4 text-right text-gray-200 font-mono">
+                              <td className="py-4 px-4 text-right text-gray-700 dark:text-gray-200 font-mono">
                                 {formatCurrency(salesComm)}
                               </td>
-                              <td className="py-4 px-4 text-right font-mono font-medium text-white">
+                              <td className="py-4 px-4 text-right font-mono font-medium text-gray-900 dark:text-white">
                                 {formatCurrency(balance)}
                               </td>
                               <td className="py-4 px-4 flex justify-center">
@@ -2528,21 +2966,63 @@ export default function DashboardPage() {
                                 </div>
                               </td>
                               <td className="py-4 px-4 text-right">
-                                <button 
-                                  onClick={() => {
-                                    setEditingProject(project);
-                                    setIsEditProjectModalOpen(true);
-                                  }}
-                                  className="text-[#D4AF37] hover:text-[#f2c94c] transition-colors font-medium text-sm"
-                                >
-                                  Edit
-                                </button>
+                                <div className="flex items-center justify-end gap-3">
+                                  <button 
+                                    onClick={() => {
+                                      setEditingProject(project);
+                                      setIsEditProjectModalOpen(true);
+                                    }}
+                                    className="text-[#D4AF37] hover:text-[#f2c94c] transition-colors font-medium text-sm"
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    onClick={() => {
+                                      setDeleteProjectError(null);
+                                      setProjectPendingDeletion(project);
+                                    }}
+                                    title="Permanently delete this project"
+                                    className="text-gray-400 hover:text-red-500 dark:text-gray-500 dark:hover:text-red-400 transition-colors"
+                                  >
+                                    <Trash2 className="w-4 h-4" />
+                                  </button>
+                                </div>
                               </td>
                             </tr>
                           );
                         })}
                       </tbody>
                     </table>
+                  )}
+
+                  {projectsDirectoryFilteredSorted.length > 0 && (
+                    <div className="flex flex-col sm:flex-row items-center justify-between gap-3 mt-5 pt-4 border-t border-gray-200 dark:border-[#333333] text-xs">
+                      <div className="text-gray-500 dark:text-gray-400">
+                        Showing <span className="text-gray-800 dark:text-gray-200 font-semibold">{(projectsDirectoryPageSafe - 1) * PROJECTS_DIRECTORY_PAGE_SIZE + 1}
+                        </span>–<span className="text-gray-800 dark:text-gray-200 font-semibold">
+                          {Math.min(projectsDirectoryPageSafe * PROJECTS_DIRECTORY_PAGE_SIZE, projectsDirectoryFilteredSorted.length)}
+                        </span> of <span className="text-gray-800 dark:text-gray-200 font-semibold">{projectsDirectoryFilteredSorted.length}</span> projects
+                      </div>
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => setProjectsDirectoryPage((p) => Math.max(1, p - 1))}
+                          disabled={projectsDirectoryPageSafe <= 1}
+                          className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-[#333333] text-gray-600 dark:text-gray-300 hover:border-[#D4AF37]/50 hover:text-[#D4AF37] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-gray-300 dark:disabled:hover:border-[#333333] disabled:hover:text-gray-600 dark:disabled:hover:text-gray-300 transition-colors font-medium"
+                        >
+                          Previous
+                        </button>
+                        <span className="text-gray-500 dark:text-gray-400 font-mono">
+                          Page <span className="text-[#D4AF37] font-semibold">{projectsDirectoryPageSafe}</span> of {projectsDirectoryTotalPages}
+                        </span>
+                        <button
+                          onClick={() => setProjectsDirectoryPage((p) => Math.min(projectsDirectoryTotalPages, p + 1))}
+                          disabled={projectsDirectoryPageSafe >= projectsDirectoryTotalPages}
+                          className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-[#333333] text-gray-600 dark:text-gray-300 hover:border-[#D4AF37]/50 hover:text-[#D4AF37] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-gray-300 dark:disabled:hover:border-[#333333] disabled:hover:text-gray-600 dark:disabled:hover:text-gray-300 transition-colors font-medium"
+                        >
+                          Next
+                        </button>
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>
@@ -2563,29 +3043,21 @@ export default function DashboardPage() {
                       <p className="text-gray-500 mt-1">Populate your Firebase connection to see real proposals.</p>
                     </div>
                   ) : (
-                    <table className="w-full text-left whitespace-nowrap">
+                    <table className="w-full text-left whitespace-nowrap table-fixed">
                       <thead>
                         <tr className="text-gray-400 text-sm uppercase border-b border-[#333333]">
-                          <th className="pb-3 px-4 font-semibold">Proposal Number</th>
-                          <th className="pb-3 px-4 font-semibold">Client / Company Name</th>
-                          <th className="pb-3 px-4 font-semibold">Date Created</th>
-                          <th className="pb-3 px-4 font-semibold text-right">Total Value</th>
-                          <th className="pb-3 px-4 font-semibold">Status</th>
+                          <th className="pb-3 px-4 font-semibold w-1/4">Proposal Number</th>
+                          <th className="pb-3 px-4 font-semibold w-1/4">Pricing Category / Tier</th>
+                          <th className="pb-3 px-4 font-semibold w-1/4">Date Created</th>
+                          <th className="pb-3 px-4 font-semibold w-1/4">Status</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-[#333333]">
                         {proposals.map((prop) => {
-                          const matchedClient = clients.find(c => c.id === prop.clientId);
-                          const clientDisplayName = matchedClient 
-                            ? (matchedClient.companyName || matchedClient.clientName || matchedClient.name)
-                            : (prop.clientName || prop.companyName || 'Unknown Client');
-
                           const dateVal = prop.createdAt || prop.dateCreated || prop.date;
                           const dateText = formatSafeDate(dateVal) || 'N/A';
 
-                          const formatCurrency = (val: number) =>
-                            new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(val);
-                          const amount = Number(prop.proposalAmount || prop.totalValue || prop.calculatedCost || prop.amount || prop.cost || 0);
+                          const pricingTierDisplay = toTitleCase(prop.pricingCategory || prop.pricingTier || prop.tier || 'N/A');
 
                           const statusStr = (prop.status || 'pending').toLowerCase();
                           let badgeColors = 'text-gray-400 bg-gray-500/10 border-gray-500/20';
@@ -2599,17 +3071,14 @@ export default function DashboardPage() {
 
                           return (
                             <tr key={prop.id} className="hover:bg-[#2A2A2A] transition-colors">
-                              <td className="py-4 px-4 font-medium text-[#D4AF37]">
+                              <td className="py-4 px-4 font-medium text-[#D4AF37] w-1/4">
                                 {prop.proposalNumber || prop.id || 'N/A'}
                               </td>
-                              <td className="py-4 px-4 text-gray-200">
-                                {toTitleCase(clientDisplayName)}
+                              <td className="py-4 px-4 text-gray-200 w-1/4">
+                                {pricingTierDisplay}
                               </td>
-                              <td className="py-4 px-4 text-gray-200">{dateText}</td>
-                              <td className="py-4 px-4 text-right text-gray-200 font-mono">
-                                {formatCurrency(amount)}
-                              </td>
-                              <td className="py-4 px-4">
+                              <td className="py-4 px-4 text-gray-200 w-1/4">{dateText}</td>
+                              <td className="py-4 px-4 w-1/4">
                                 <span className={`px-2.5 py-1 rounded text-xs font-medium border ${badgeColors}`}>
                                   {toTitleCase(prop.status || 'Pending')}
                                 </span>
@@ -2643,84 +3112,6 @@ export default function DashboardPage() {
               commissionRules={commissionRules}
               onNavigateToGlobalSettings={() => setActiveTab('Settings')}
             />
-          )}
-          {activeTab === 'Apps' && (
-            <div className="w-full space-y-8">
-              <div className="bg-[#1E1E1E] rounded-xl shadow-2xl p-6 overflow-x-auto border border-[#333333]">
-                <div className="flex justify-between items-center mb-6">
-                  <h3 className="text-lg font-medium">Registered Applications</h3>
-                </div>
-                
-                {apps.length === 0 ? (
-                  <div className="text-center py-10 border border-dashed border-[#333333] rounded-lg">
-                    <LayoutGrid className="mx-auto h-12 w-12 text-gray-500 mb-4" />
-                    <h4 className="text-lg font-medium text-gray-300">No applications found</h4>
-                    <p className="text-gray-500 mt-1">Populate your Firebase connection to see registered apps.</p>
-                  </div>
-                ) : (
-                  <table className="w-full text-left whitespace-nowrap">
-                    <thead>
-                      <tr className="text-gray-400 text-sm uppercase border-b border-[#333333]">
-                        <th className="pb-3 px-4 font-semibold">App Name</th>
-                        <th className="pb-3 px-4 font-semibold">Category</th>
-                        <th className="pb-3 px-4 font-semibold">Description</th>
-                        <th className="pb-3 px-4 font-semibold">Application URL</th>
-                        <th className="pb-3 px-4 font-semibold">Status</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-[#333333]">
-                      {apps.map((app) => {
-                        const appName = app.name || app.appName || 'Untitled App';
-                        const appCategory = app.category || 'General';
-                        const appDesc = app.description || 'Solarithm Ecosystem Satellite';
-                        const appUrl = app.url || app.appUrl;
-                        const isActive = app.active !== undefined ? Boolean(app.active) : (app.status === 'active' || app.isActive);
-                        const status = isActive ? 'active' : 'inactive';
-                        
-                        return (
-                          <tr key={app.id} className="hover:bg-[#2A2A2A] transition-colors">
-                            <td className="py-4 px-4 font-medium text-gray-200">
-                              {appName}
-                            </td>
-                            <td className="py-4 px-4 text-xs text-gray-300">
-                              <span className="px-2 py-0.5 rounded bg-[#2A2A2A] border border-[#444] text-gray-300 font-mono">
-                                {appCategory}
-                              </span>
-                            </td>
-                            <td className="py-4 px-4 text-xs text-gray-400 max-w-xs truncate">
-                              {appDesc}
-                            </td>
-                            <td className="py-4 px-4">
-                              {appUrl ? (
-                                <a 
-                                  href={appUrl} 
-                                  target="_blank" 
-                                  rel="noopener noreferrer" 
-                                  className="text-[#D4AF37] hover:underline font-medium text-xs font-mono"
-                                >
-                                  {appUrl}
-                                </a>
-                              ) : (
-                                <span className="text-gray-500 text-xs">N/A</span>
-                              )}
-                            </td>
-                            <td className="py-4 px-4">
-                              <span className={`px-2.5 py-1 rounded text-xs font-medium border capitalize ${
-                                status.toLowerCase() === 'active' 
-                                  ? 'text-green-500 bg-green-500/10 border-green-500/20' 
-                                  : 'text-gray-400 bg-gray-500/10 border-gray-500/20'
-                              }`}>
-                                {status}
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-            </div>
           )}
           {activeTab === 'Settings' && (
             <CompanySettingsView onNavigateToBilling={() => setActiveTab('Billing')} />
@@ -2929,6 +3320,61 @@ export default function DashboardPage() {
                 className="px-4 py-2 rounded-lg bg-[#D4AF37] hover:bg-[#c49f2c] text-black transition-colors font-semibold text-sm shadow-md shadow-[#D4AF37]/20"
               >
                 Save Changes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Project Confirmation Modal */}
+      {projectPendingDeletion && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
+          <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
+            <div className="px-6 py-5">
+              <div className="flex items-start gap-3">
+                <div className="p-2 rounded-full bg-red-500/10 border border-red-500/30 shrink-0">
+                  <AlertTriangle className="w-5 h-5 text-red-500" />
+                </div>
+                <div className="flex-1">
+                  <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-1.5">
+                    Delete Project
+                  </h3>
+                  <p className="text-sm text-gray-600 dark:text-gray-300 leading-relaxed">
+                    Are you sure you want to permanently delete project{' '}
+                    <span className="font-semibold text-gray-900 dark:text-white">
+                      {toTitleCase(projectPendingDeletion.projectName || 'Untitled')}
+                    </span>
+                    ? This action will completely remove it from the central database.
+                  </p>
+                </div>
+              </div>
+
+              {deleteProjectError && (
+                <div className="mt-4 p-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-500 dark:text-red-400 text-xs">
+                  {deleteProjectError}
+                </div>
+              )}
+            </div>
+            <div className="px-6 py-4 bg-gray-50 dark:bg-[#181818] border-t border-gray-200 dark:border-[#333333] flex justify-end gap-3">
+              <button
+                onClick={() => {
+                  setProjectPendingDeletion(null);
+                  setDeleteProjectError(null);
+                }}
+                disabled={isDeletingProject}
+                className="px-4 py-2 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#2A2A2A] transition-colors font-medium text-sm disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleConfirmDeleteProject}
+                disabled={isDeletingProject}
+                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white transition-colors font-semibold text-sm shadow-md shadow-red-600/20 disabled:opacity-50 flex items-center gap-2"
+              >
+                {isDeletingProject && (
+                  <span className="h-3.5 w-3.5 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                )}
+                {isDeletingProject ? 'Deleting...' : 'Delete Permanently'}
               </button>
             </div>
           </div>

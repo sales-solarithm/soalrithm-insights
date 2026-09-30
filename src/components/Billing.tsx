@@ -331,7 +331,12 @@ export default function BillingModule({
 
   // Helper to extract YYYY-MM from a project date safely
   const getProjectYearMonth = (proj: any): string | null => {
-    const rawDate = proj.createdAt || proj.date || proj.projectDate || proj.updatedAt || proj.startDate;
+    // Priority: projectDate -> date -> createdAt. A project's original
+    // createdAt must never outrank a deliberately-set projectDate/date --
+    // otherwise retroactively correcting a project's date (e.g. for an
+    // older, backdated entry) would silently have no effect on which
+    // month's Billing line items it shows up in.
+    const rawDate = proj.projectDate || proj.date || proj.createdAt;
     if (!rawDate) return null;
 
     // Handle Firestore Timestamp object (with seconds or toDate)
@@ -540,13 +545,16 @@ export default function BillingModule({
     const phone = found.phone || found.contact || found.phoneNumber || '';
     const gstin = found.gstin || found.gstNumber || found.gst || '';
 
-    // Defensive Serialization: convert structured object address to comma-separated string
+    // Defensive Serialization: convert structured object address to comma-separated string.
+    // billingAddress takes priority over the generic address field, since a
+    // client may have a separate site/project address that shouldn't be
+    // used for invoicing.
     const formattedAddress =
-      typeof found.address === 'object' && found.address !== null
-        ? Object.values(found.address).filter(Boolean).join(', ')
-        : typeof found.billingAddress === 'object' && found.billingAddress !== null
-          ? Object.values(found.billingAddress).filter(Boolean).join(', ')
-          : found.address || found.billingAddress || (found.city ? (found.state ? `${found.city}, ${found.state}` : found.city) : '') || '';
+      typeof found.billingAddress === 'object' && found.billingAddress !== null
+        ? Object.values(found.billingAddress).filter(Boolean).join(', ')
+        : typeof found.address === 'object' && found.address !== null
+          ? Object.values(found.address).filter(Boolean).join(', ')
+          : found.billingAddress || found.address || (found.city ? (found.state ? `${found.city}, ${found.state}` : found.city) : '') || '';
 
     const quotNo = found.proposalNumber || found.quotFormat || found.quotationNo || currentInvoice.quotNo || '';
 

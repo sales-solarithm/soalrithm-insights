@@ -35,7 +35,6 @@ import {
 import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
-import QRCode from 'qrcode';
 import { useCompanySettings, CompanySettings, defaultCompanySettings } from '@/src/lib/useCompanySettings';
 import { doc, updateDoc } from 'firebase/firestore';
 import { db } from '@/src/lib/firebase';
@@ -72,10 +71,6 @@ export interface EmployeeRecord {
   email: string;
   mobile: string;
   basic: number;
-  hra: number;
-  conv: number;
-  med: number;
-  spl: number;
   othAllow: number;
   active: boolean;
 }
@@ -136,13 +131,21 @@ export interface SalarySlipRecord {
   totalDed: number;
   net: number;
   generated: string;
+  // Mandatory payment settlement details, captured at generation time.
+  paymentMode: string;
+  transactionId: string;
+  paymentDate: string;
+  // Snapshot of the employee's bank details at the time this slip was
+  // generated (mirrors companySnapshot below) -- so a historical slip keeps
+  // showing what was actually paid-to, even if the employee's bank details
+  // change later. Account number is pre-masked at snapshot time.
+  employeeBankSnapshot: {
+    bankName: string;
+    maskedAccountNumber: string;
+  };
   attendance: AttendanceData;
   earnings: {
     basic: number;
-    hra: number;
-    conv: number;
-    med: number;
-    spl: number;
     othAllow: number;
     incentive: number;
     ot: number;
@@ -190,6 +193,18 @@ interface SalaryStudioProps {
 }
 
 // Number to Words Converter for Indian Currency Format
+/**
+ * Masks a bank account number for display, keeping only the last 4 digits
+ * visible (e.g. "1234567890" -> "••••••7890"). Returns 'N/A' for an empty
+ * or missing value rather than an empty mask.
+ */
+export function maskAccountNumber(accountNumber: string | undefined | null): string {
+  const clean = String(accountNumber || '').trim();
+  if (!clean) return 'N/A';
+  if (clean.length <= 4) return clean;
+  return '•'.repeat(clean.length - 4) + clean.slice(-4);
+}
+
 export function numberToWordsINR(num: number): string {
   num = Math.round(num);
   if (num === 0) return 'Zero Rupees';
@@ -356,11 +371,21 @@ export const isProjectInMonthAndFY = (projectDate: Date | null, monthName: strin
  * "Pre-Design+PVsyst", "predesign,pvsyst" or "pvsyst & preDesign" all resolve
  * to the same canonical string, regardless of casing, separator, or order.
  */
+/**
+ * Reduces a single scope name to a bare alphanumeric token, so "Pre-Design",
+ * "pre design", "PreDesign" and the internal camelCase key "preDesign" all
+ * collapse to the same canonical form ("predesign"). This is applied per
+ * scope, after splitting a multi-scope combo apart -- it must not run on
+ * the whole combo string, or a genuine separator between two different
+ * scopes (e.g. the space in "Pre-Design PVsyst") would be silently deleted
+ * and wrongly merge them into one token.
+ */
+const normalizeScopeToken = (raw: string): string => String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
 const normalizeComboKey = (raw: string): string =>
   String(raw || '')
-    .toLowerCase()
     .split(/[+,&/]/)
-    .map((s) => s.trim())
+    .map((s) => normalizeScopeToken(s))
     .filter(Boolean)
     .sort()
     .join('+');
@@ -569,12 +594,16 @@ export const getProjectIncentiveForEmployee = (
 
   if (isSplitScopeDesigner) {
     const scopeLabel = (comboResult!.scopeKeys || []).join(' + ') || 'Assigned Scope';
+    // A silent ₹0 here is indistinguishable from "genuinely priced at zero" --
+    // make the two cases visibly different so a missing/mismatched rate card
+    // entry doesn't read as a calculation bug.
+    const matchNote = comboResult!.matched ? '' : ' — No commission rule found for this scope';
     if (isSales) {
       amount = desComm + salesComm;
-      roleLabel = `Designer (${scopeLabel}) & Sales Commission`;
+      roleLabel = `Designer (${scopeLabel}) & Sales Commission${matchNote}`;
     } else {
       amount = desComm;
-      roleLabel = `Designer Commission (${scopeLabel})`;
+      roleLabel = `Designer Commission (${scopeLabel})${matchNote}`;
     }
   } else if (isDesigner && isSales) {
     amount = desComm + salesComm;
@@ -679,7 +708,9 @@ export default function SalaryStudio({
         const uEmail = (u.email || '').toLowerCase().trim();
         const uId = (u.empId || u.employeeId || u.id || '').toLowerCase().trim();
         const cleanId = u.id || `EMP_${idx + 1}`;
-        const basicAmt = Number(u.basic || u.basicPay || u.baseSalary || 25000);
+        // Basic pay: 0 is a valid configured value, never silently replaced.
+        const rawBasicAmt = u.basic ?? u.basicPay ?? u.baseSalary;
+        const basicAmt = rawBasicAmt !== undefined && rawBasicAmt !== null && rawBasicAmt !== '' ? Number(rawBasicAmt) : 0;
         const bankName = u.bankName || u.bank || 'HDFC Bank';
         const accNo = u.accountNumber || u.accNo || u.bankAccountNo || '';
         const ifsc = u.ifscCode || u.ifsc || '';
@@ -689,7 +720,8 @@ export default function SalaryStudio({
         list.push({
           id: cleanId,
           empId: u.empId || u.employeeId || `SOL-${(u.name || 'EMP').substring(0, 3).toUpperCase()}-${String(idx + 1).padStart(3, '0')}`,
-          name: u.name || u.displayName || u.employeeName || u.email?.split('@')[0] || 'Team Member',
+          // Real name fields only -- never an email-address prefix.
+          name: u.fullName || u.name || u.displayName || u.employeeName || u.legalName || 'Unnamed Employee',
           designation: u.designation || u.role || 'Associate',
           department: u.department || 'Solar Design & Engineering',
           doj: String(doj).split('T')[0],
@@ -707,10 +739,6 @@ export default function SalaryStudio({
           email: u.email || '',
           mobile: u.mobile || u.phone || '',
           basic: basicAmt,
-          hra: Number(u.hra || Math.round(basicAmt * 0.4)),
-          conv: Number(u.conv || 1600),
-          med: Number(u.med || 500),
-          spl: Number(u.spl || 1250),
           othAllow: Number(u.othAllow || 0),
           active: u.active !== false && u.status !== 'inactive'
         });
@@ -915,6 +943,35 @@ export default function SalaryStudio({
     };
   });
 
+  // Mandatory payment settlement details -- must be filled before a slip
+  // can be previewed or saved/archived. paymentDate defaults to the Pay
+  // Settlement Date at the time this draft was first created; it is a
+  // one-time default, not a live binding, so a manually-entered payment
+  // date is never silently overwritten if Pay Settlement Date is changed
+  // afterward.
+  const [paymentDetails, setPaymentDetails] = useState<{ paymentMode: string; transactionId: string; paymentDate: string }>(() => {
+    if (typeof window !== 'undefined') {
+      const raw = localStorage.getItem(SALARY_STORAGE_KEYS.draft);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          if (parsed.paymentDetails) return parsed.paymentDetails;
+        } catch (e) {}
+      }
+    }
+    return {
+      paymentMode: '',
+      transactionId: '',
+      paymentDate: genPayDate
+    };
+  });
+
+  const isPaymentDetailsComplete = Boolean(
+    paymentDetails.paymentMode.trim() &&
+    paymentDetails.transactionId.trim() &&
+    paymentDetails.paymentDate.trim()
+  );
+
   // Save draft on every change
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -925,11 +982,12 @@ export default function SalaryStudio({
         genPayDate,
         attendance,
         additionalEarnings,
-        deductions
+        deductions,
+        paymentDetails
       };
       localStorage.setItem(SALARY_STORAGE_KEYS.draft, JSON.stringify(draft));
     }
-  }, [selectedEmpId, genMonth, genFY, genPayDate, attendance, additionalEarnings, deductions]);
+  }, [selectedEmpId, genMonth, genFY, genPayDate, attendance, additionalEarnings, deductions, paymentDetails]);
 
   // Selected Employee Lookup
   const currentEmployee = useMemo<EmployeeRecord | null>(() => {
@@ -1015,10 +1073,6 @@ export default function SalaryStudio({
   // Calculated Earnings Components
   const calculatedEarnings = useMemo(() => {
     const basic = Math.round(((currentEmployee?.basic || 0)) * attendanceRatio);
-    const hra = Math.round(((currentEmployee?.hra || 0)) * attendanceRatio);
-    const conv = Math.round(((currentEmployee?.conv || 0)) * attendanceRatio);
-    const med = Math.round(((currentEmployee?.med || 0)) * attendanceRatio);
-    const spl = Math.round(((currentEmployee?.spl || 0)) * attendanceRatio);
     const othAllow = Math.round(((currentEmployee?.othAllow || 0)) * attendanceRatio);
 
     const totalDays = attendance.totalDays || 26;
@@ -1029,14 +1083,15 @@ export default function SalaryStudio({
     const reimb = Number(additionalEarnings.reimbursement) || 0;
     const otherEarn = Number(additionalEarnings.otherAllowance) || 0;
 
-    const gross = basic + hra + conv + med + spl + othAllow + totalIncentiveAmount + otPay + bonus + reimb + otherEarn;
+    // Gross Earnings = Basic Salary + Project Incentives + Bonus +
+    // Reimbursements + Other Earnings (+ Overtime Pay, a real attendance-
+    // driven figure, and othAllow, which is a genuine but currently-unset
+    // per-employee field -- neither is a fabricated allowance like the
+    // removed HRA/Conveyance/Medical/Special amounts were).
+    const gross = basic + othAllow + totalIncentiveAmount + otPay + bonus + reimb + otherEarn;
 
     return {
       basic,
-      hra,
-      conv,
-      med,
-      spl,
       othAllow,
       incentive: totalIncentiveAmount,
       ot: otPay,
@@ -1092,6 +1147,13 @@ export default function SalaryStudio({
       totalDed: totalDeductions,
       net: netSalaryPayable,
       generated: new Date().toISOString(),
+      paymentMode: paymentDetails.paymentMode,
+      transactionId: paymentDetails.transactionId,
+      paymentDate: paymentDetails.paymentDate,
+      employeeBankSnapshot: {
+        bankName: currentEmployee?.bankName || 'N/A',
+        maskedAccountNumber: maskAccountNumber(currentEmployee?.accNo || currentEmployee?.accountNumber)
+      },
       attendance: { ...attendance },
       earnings: { ...calculatedEarnings },
       deductions: { ...deductions },
@@ -1191,10 +1253,25 @@ export default function SalaryStudio({
     };
   };
 
+  // Resolves payment settlement details for display, falling back gracefully
+  // for any slip saved before these fields existed (older history entries)
+  // rather than crashing on undefined.
+  const getPaymentSummaryForSlip = (slip: SalarySlipRecord) => ({
+    paymentMode: slip.paymentMode || 'N/A',
+    transactionId: slip.transactionId || 'N/A',
+    paymentDate: slip.paymentDate || 'N/A',
+    bankName: slip.employeeBankSnapshot?.bankName || 'N/A',
+    maskedAccountNumber: slip.employeeBankSnapshot?.maskedAccountNumber || 'N/A'
+  });
+
   // Save Salary Slip to History
   const handleSaveSlipToHistory = async () => {
     if (!currentEmployee) {
       showToast('Please select or create an employee first.', 'error');
+      return;
+    }
+    if (!isPaymentDetailsComplete) {
+      showToast('Payment Mode, Transaction ID, and Payment Date are all required before saving a slip.', 'error');
       return;
     }
     const existingIndex = history.findIndex(
@@ -1229,33 +1306,21 @@ export default function SalaryStudio({
       showToast('Please select an employee first.', 'error');
       return;
     }
+    // The validation gate only applies to generating a fresh preview from
+    // the live form -- viewing an already-saved historical slip (customSlip
+    // provided, from the History tab) is always allowed regardless of
+    // whether it predates this field or not.
+    if (!customSlip && !isPaymentDetailsComplete) {
+      showToast('Payment Mode, Transaction ID, and Payment Date are all required before previewing a slip.', 'error');
+      return;
+    }
     const slip = customSlip || buildSalarySlipRecord(history.find(h => currentEmployee && h.empEmpId === currentEmployee.empId && h.month === genMonth && h.fy === genFY)?.slipNo);
     setPreviewSlipData(slip);
     setIsPreviewModalOpen(true);
   };
 
-  // QR Code canvas rendering inside slip preview modal
-  const qrCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  useEffect(() => {
-    if (isPreviewModalOpen && previewSlipData && qrCanvasRef.current) {
-      const verificationPayload = JSON.stringify({
-        slipNo: previewSlipData.slipNo,
-        empId: previewSlipData.empEmpId,
-        name: previewSlipData.empName,
-        month: previewSlipData.month,
-        fy: previewSlipData.fy,
-        net: previewSlipData.net,
-        co: previewSlipData.companySnapshot.name
-      });
-      QRCode.toCanvas(qrCanvasRef.current, verificationPayload, {
-        width: 76,
-        margin: 1,
-        color: { dark: '#121212', light: '#FFFFFF' }
-      }, (err) => {
-        if (err) console.error('QR generation error', err);
-      });
-    }
-  }, [isPreviewModalOpen, previewSlipData]);
+  // QR code verification block removed from the slip -- see Slip
+  // Verification Footer below, now just Company Seal + Authorized Signatory.
 
   // Export PDF from DOM
   const [isPdfExporting, setIsPdfExporting] = useState(false);
@@ -1999,22 +2064,6 @@ export default function SalaryStudio({
                   <span>Basic Salary</span>
                   <span className="font-mono text-white">₹{calculatedEarnings.basic.toLocaleString('en-IN')}</span>
                 </div>
-                <div className="flex justify-between py-1 text-gray-300">
-                  <span>HRA</span>
-                  <span className="font-mono text-white">₹{calculatedEarnings.hra.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="flex justify-between py-1 text-gray-300">
-                  <span>Conveyance Allowance</span>
-                  <span className="font-mono text-white">₹{calculatedEarnings.conv.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="flex justify-between py-1 text-gray-300">
-                  <span>Medical Allowance</span>
-                  <span className="font-mono text-white">₹{calculatedEarnings.med.toLocaleString('en-IN')}</span>
-                </div>
-                <div className="flex justify-between py-1 text-gray-300">
-                  <span>Special Allowance</span>
-                  <span className="font-mono text-white">₹{calculatedEarnings.spl.toLocaleString('en-IN')}</span>
-                </div>
                 {calculatedEarnings.incentive > 0 && (
                   <div className="flex justify-between py-1 text-emerald-400 font-semibold">
                     <span>Project Incentives</span>
@@ -2102,17 +2151,65 @@ export default function SalaryStudio({
                   </div>
                 </div>
 
+                {/* Payment Details (mandatory before preview/save) */}
+                <div className="p-4 rounded-xl bg-[#1A1A1A] border border-[#2A2A2A] mt-4 space-y-3">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-[#D4AF37] flex items-center justify-between">
+                    <span>Payment Details</span>
+                    {!isPaymentDetailsComplete && (
+                      <span className="text-rose-400 normal-case tracking-normal font-semibold">Required before saving</span>
+                    )}
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Payment Mode / Done Via</label>
+                    <select
+                      value={paymentDetails.paymentMode}
+                      onChange={e => setPaymentDetails({ ...paymentDetails, paymentMode: e.target.value })}
+                      className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:border-[#D4AF37] focus:outline-none"
+                    >
+                      <option value="">Select payment mode...</option>
+                      <option value="Bank Transfer">Bank Transfer</option>
+                      <option value="NEFT">NEFT</option>
+                      <option value="RTGS">RTGS</option>
+                      <option value="IMPS">IMPS</option>
+                      <option value="UPI">UPI</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Transaction ID / Payment Reference ID</label>
+                    <input
+                      type="text"
+                      value={paymentDetails.transactionId}
+                      onChange={e => setPaymentDetails({ ...paymentDetails, transactionId: e.target.value })}
+                      placeholder="e.g. UTR / Reference number"
+                      className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:border-[#D4AF37] focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Payment Date</label>
+                    <input
+                      type="date"
+                      value={paymentDetails.paymentDate}
+                      onChange={e => setPaymentDetails({ ...paymentDetails, paymentDate: e.target.value })}
+                      className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:border-[#D4AF37] focus:outline-none"
+                    />
+                  </div>
+                </div>
+
                 <div className="grid grid-cols-2 gap-3 pt-4">
                   <button
                     onClick={() => handlePreviewSlip()}
-                    className="py-2.5 px-3 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] text-black font-bold text-xs flex items-center justify-center space-x-1.5 shadow-md shadow-[#D4AF37]/20 transition-all"
+                    disabled={!isPaymentDetailsComplete}
+                    title={!isPaymentDetailsComplete ? 'Fill in all Payment Details fields first' : undefined}
+                    className="py-2.5 px-3 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] disabled:bg-[#4A4530] disabled:text-gray-500 disabled:cursor-not-allowed disabled:hover:bg-[#4A4530] text-black font-bold text-xs flex items-center justify-center space-x-1.5 shadow-md shadow-[#D4AF37]/20 transition-all"
                   >
                     <Eye className="w-4 h-4" />
                     <span>Preview Slip</span>
                   </button>
                   <button
                     onClick={handleSaveSlipToHistory}
-                    className="py-2.5 px-3 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] text-white font-semibold text-xs flex items-center justify-center space-x-1.5 border border-[#3A3A3A] transition-all"
+                    disabled={!isPaymentDetailsComplete}
+                    title={!isPaymentDetailsComplete ? 'Fill in all Payment Details fields first' : undefined}
+                    className="py-2.5 px-3 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-[#2A2A2A] text-white font-semibold text-xs flex items-center justify-center space-x-1.5 border border-[#3A3A3A] transition-all"
                   >
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                     <span>Save &amp; Archive</span>
@@ -2478,21 +2575,11 @@ export default function SalaryStudio({
                         <table className="w-full text-left">
                           <tbody className="divide-y divide-gray-100">
                             <tr><td className="py-1.5 px-3">Basic Salary</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.basic.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">House Rent Allowance (HRA)</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.hra.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">Conveyance Allowance</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.conv.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">Medical Allowance</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.med.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">Special Allowance</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.spl.toLocaleString('en-IN')}</td></tr>
                             {previewSlipData.earnings.incentive > 0 && (
                               <tr className="bg-amber-50/60 text-amber-900 font-semibold"><td className="py-1.5 px-3">Project Incentives</td><td className="py-1.5 px-3 text-right font-mono text-emerald-700">₹{previewSlipData.earnings.incentive.toLocaleString('en-IN')}</td></tr>
                             )}
-                            {previewSlipData.earnings.ot > 0 && (
-                              <tr><td className="py-1.5 px-3">Overtime Pay</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.ot.toLocaleString('en-IN')}</td></tr>
-                            )}
-                            {previewSlipData.earnings.bonus > 0 && (
-                              <tr><td className="py-1.5 px-3">Bonus</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.bonus.toLocaleString('en-IN')}</td></tr>
-                            )}
-                            {previewSlipData.earnings.reimbursement > 0 && (
-                              <tr><td className="py-1.5 px-3">Reimbursement</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.reimbursement.toLocaleString('en-IN')}</td></tr>
+                            {(previewSlipData.gross - previewSlipData.earnings.basic - previewSlipData.earnings.incentive) > 0 && (
+                              <tr><td className="py-1.5 px-3">Additional Earnings</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{(previewSlipData.gross - previewSlipData.earnings.basic - previewSlipData.earnings.incentive).toLocaleString('en-IN')}</td></tr>
                             )}
                           </tbody>
                           <tfoot>
@@ -2587,15 +2674,38 @@ export default function SalaryStudio({
                     <div className="font-bold text-[#0F1C35] italic mt-0.5">{numberToWordsINR(previewSlipData.net)}</div>
                   </div>
 
-                  {/* Slip Verification Footer */}
-                  <div className="pt-4 border-t-2 border-gray-200 grid grid-cols-3 gap-6 text-center text-xs items-end">
-                    <div>
-                      <div className="flex justify-center mb-1">
-                        <canvas ref={qrCanvasRef} className="rounded border border-gray-200" />
-                      </div>
-                      <div className="text-[9px] font-semibold text-gray-500 uppercase tracking-wider">Scan to Verify</div>
+                  {/* Payment Settlement Summary */}
+                  <div className="border border-[#D4AF37]/50 rounded-lg overflow-hidden text-xs shadow-sm">
+                    <div
+                      style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #1B2A4A 100%)' }}
+                      className="text-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider border-b border-[#D4AF37]"
+                    >
+                      Payment Settlement Summary
                     </div>
+                    <div className="grid grid-cols-2 divide-x divide-y divide-gray-200 bg-white">
+                      <div className="py-2.5 px-3">
+                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Payment Mode</div>
+                        <div className="font-semibold text-gray-900 mt-0.5">{getPaymentSummaryForSlip(previewSlipData).paymentMode}</div>
+                      </div>
+                      <div className="py-2.5 px-3">
+                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Transaction / Reference ID</div>
+                        <div className="font-semibold text-gray-900 mt-0.5 font-mono">{getPaymentSummaryForSlip(previewSlipData).transactionId}</div>
+                      </div>
+                      <div className="py-2.5 px-3">
+                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Payment Date</div>
+                        <div className="font-semibold text-gray-900 mt-0.5">{getPaymentSummaryForSlip(previewSlipData).paymentDate}</div>
+                      </div>
+                      <div className="py-2.5 px-3">
+                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Bank &amp; Account No.</div>
+                        <div className="font-semibold text-gray-900 mt-0.5">
+                          {getPaymentSummaryForSlip(previewSlipData).bankName} · <span className="font-mono">{getPaymentSummaryForSlip(previewSlipData).maskedAccountNumber}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
 
+                  {/* Slip Verification Footer */}
+                  <div className="pt-4 border-t-2 border-gray-200 grid grid-cols-2 gap-6 text-center text-xs items-end">
                     <div>
                       <div className="h-16 flex items-center justify-center font-serif text-[#0F1C35] border border-dashed border-[#D4AF37]/60 rounded-md bg-[#FAF7F0] italic text-xs">
                         [ Official Stamp ]

@@ -7,10 +7,9 @@ import {
   Eye, 
   EyeOff, 
   AlertCircle, 
-  CheckCircle2, 
-  KeyRound, 
   ArrowRight,
-  LayoutGrid
+  LayoutGrid,
+  Clock
 } from 'lucide-react';
 import { 
   signInWithEmailAndPassword, 
@@ -23,11 +22,10 @@ import {
   getDocs, 
   doc, 
   getDoc, 
-  addDoc, 
-  serverTimestamp 
+  addDoc 
 } from 'firebase/firestore';
 import { auth, db } from '@/src/lib/firebase';
-import { COLLECTIONS, APPROVAL_TYPES, APPROVAL_STATUS } from '@/src/config/schema';
+import { COLLECTIONS } from '@/src/config/schema';
 import { useOwnerAuth } from '@/src/context/OwnerAuthContext';
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number = 5000): Promise<T> {
@@ -50,9 +48,11 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number = 5000): Promise<
 interface OwnerLoginProps {
   onSuccess: (userProfile: any) => void;
   externalError?: string | null;
+  /** Informational (non-error) message, e.g. "session expired due to inactivity". */
+  externalNotice?: string | null;
 }
 
-export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps) {
+export default function OwnerLogin({ onSuccess, externalError, externalNotice }: OwnerLoginProps) {
   const { setAuthorizedOwner } = useOwnerAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -67,101 +67,6 @@ export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps
       setError(externalError);
     }
   }
-  
-  // Forgot password request modal
-  const [showResetModal, setShowResetModal] = useState(false);
-  const [resetEmail, setResetEmail] = useState('');
-  const [resetLoading, setResetLoading] = useState(false);
-  const [resetStatus, setResetStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
-
-  // Emergency isolation diagnostic state
-  const [diagnosticLogs, setDiagnosticLogs] = useState<string[]>([]);
-  const [diagnosticRunning, setDiagnosticRunning] = useState(false);
-
-  const runAuthDiagnostic = async () => {
-    setDiagnosticRunning(true);
-    const logs: string[] = [];
-    const log = (msg: string) => {
-      logs.push(`[${new Date().toISOString().substring(11, 19)}] ${msg}`);
-      setDiagnosticLogs([...logs]);
-    };
-
-    log('--- STARTING EMERGENCY AUTH DIAGNOSTIC ---');
-
-    // Step A: Verify Firebase Auth instance
-    try {
-      log(`Step A: Checking Firebase Auth instance...`);
-      const authExists = !!auth;
-      const configExists = !!(auth as any)?.config;
-      const currentUser = auth?.currentUser?.email || 'none';
-      const appName = auth?.app?.name || 'none';
-      log(`Step A result: auth exists=${authExists}, config exists=${configExists}, app=${appName}, currentUser=${currentUser}`);
-      if (!authExists) {
-        log(`Step A ERROR: auth instance is null/undefined!`);
-        setDiagnosticRunning(false);
-        return;
-      }
-    } catch (stepAErr: any) {
-      log(`Step A EXCEPTION: ${stepAErr?.message || String(stepAErr)}`);
-    }
-
-    // Step B: Attempt direct signInWithEmailAndPassword with 5s Promise.race
-    let signedInUser: any = null;
-    try {
-      const emailToTest = email.trim();
-      log(`Step B: Attempting signInWithEmailAndPassword with email="${emailToTest}", passwordLength=${password.length}...`);
-      if (!emailToTest || !password) {
-        log(`Step B WARNING: Email or password input is empty! Please enter your credentials in the input fields first.`);
-      }
-
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Promise.race: Timed out after 5000ms')), 5000)
-      );
-
-      const authPromise = signInWithEmailAndPassword(auth, emailToTest, password);
-      const res: any = await Promise.race([authPromise, timeoutPromise]);
-
-      signedInUser = res?.user;
-      log(`Step B SUCCESS: Authenticated successfully! Result: user.uid=${signedInUser?.uid}, email=${signedInUser?.email}`);
-    } catch (stepBErr: any) {
-      const code = stepBErr?.code || 'NO_CODE';
-      const msg = stepBErr?.message || String(stepBErr);
-      log(`Step B FAILED: code="${code}", message="${msg}"`);
-    }
-
-    // Step C: If auth succeeds, test direct getDoc on users collection
-    if (signedInUser) {
-      try {
-        log(`Step C: Testing direct getDoc(doc(db, 'users', '${signedInUser.uid}'))...`);
-        if (!db) {
-          log(`Step C ERROR: db instance is null!`);
-        } else {
-          const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Promise.race: Firestore getDoc timed out after 5000ms')), 5000)
-          );
-          const docRef = doc(db, COLLECTIONS.USERS, signedInUser.uid);
-          const snap: any = await Promise.race([getDoc(docRef), timeoutPromise]);
-
-          if (snap.exists()) {
-            const data = snap.data();
-            log(`Step C SUCCESS: Document exists! data=${JSON.stringify(data)}`);
-            log(`Step C ROLE CHECK: role="${data?.role}" (isOwner=${(data?.role || '').toLowerCase() === 'owner'})`);
-          } else {
-            log(`Step C RESULT: Document does not exist for uid=${signedInUser.uid}`);
-          }
-        }
-      } catch (stepCErr: any) {
-        const code = stepCErr?.code || 'NO_CODE';
-        const msg = stepCErr?.message || String(stepCErr);
-        log(`Step C FAILED: code="${code}", message="${msg}"`);
-      }
-    } else {
-      log(`Step C: Skipped because Step B did not yield an authenticated user.`);
-    }
-
-    log('--- DIAGNOSTIC COMPLETE ---');
-    setDiagnosticRunning(false);
-  };
 
   const handleLogin = async (e?: React.FormEvent | React.MouseEvent) => {
     if (e && typeof e.preventDefault === 'function') {
@@ -241,10 +146,7 @@ export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps
         if (auth) {
           await signOut(auth).catch(() => {});
         }
-        const denialReason = detectedUserRole
-          ? `Access Denied: Account has role "${detectedUserRole}". Owner clearance is strictly required.`
-          : `Access Denied: Your account role is not "owner". Access to Solarithm Insight is restricted to verified owners.`;
-        setError(denialReason);
+        setError('Access Restricted: Only authorized Executive Owners can access this console.');
         setLoading(false);
         return;
       }
@@ -303,55 +205,6 @@ export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps
     }
   };
 
-  const handlePasswordResetRequest = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!resetEmail.trim()) {
-      setResetStatus({ type: 'error', message: 'Please enter your corporate email address.' });
-      return;
-    }
-
-    setResetLoading(true);
-    setResetStatus(null);
-
-    try {
-      await addDoc(collection(db, COLLECTIONS.APPROVALS), {
-        type: APPROVAL_TYPES.PASSWORD_RESET_REQUEST,
-        requestedEmail: resetEmail.trim(),
-        email: resetEmail.trim(),
-        status: APPROVAL_STATUS.PENDING,
-        appName: 'Solarithm Insight',
-        appId: 'solarithm-insight',
-        reason: 'Password reset requested via Owner Login Screen',
-        timestamp: serverTimestamp(),
-        createdAt: new Date().toISOString()
-      });
-
-      try {
-        await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
-          action: 'PASSWORD_RESET_REQUESTED',
-          actor: resetEmail.trim(),
-          target: resetEmail.trim(),
-          details: { source: 'Owner Login Portal' },
-          timestamp: new Date().toISOString()
-        });
-      } catch (logErr) {
-        console.warn('Audit log write error:', logErr);
-      }
-
-      setResetStatus({
-        type: 'success',
-        message: 'Password reset request submitted to the Master Approvals pipeline. An administrator will verify and approve your request.'
-      });
-    } catch (err: any) {
-      console.error('Password reset request error:', err);
-      setResetStatus({
-        type: 'error',
-        message: 'Unable to submit reset request. Please contact your system administrator.'
-      });
-    } finally {
-      setResetLoading(false);
-    }
-  };
 
   return (
     <div className="min-h-screen bg-[#121212] flex flex-col justify-center items-center px-4 sm:px-6 lg:px-8 relative overflow-hidden font-sans">
@@ -377,42 +230,6 @@ export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps
             <ShieldCheck className="w-3.5 h-3.5 text-[#D4AF37]" />
             Owner Authentication Required
           </div>
-        </div>
-
-        {/* Emergency Diagnostic Bypass */}
-        <div className="mb-4">
-          <button
-            type="button"
-            onClick={runAuthDiagnostic}
-            disabled={diagnosticRunning}
-            className="w-full bg-red-600 hover:bg-red-700 active:bg-red-800 text-white p-2 mb-2 rounded text-xs font-mono font-bold tracking-wider uppercase transition-colors cursor-pointer disabled:opacity-50"
-          >
-            {diagnosticRunning ? 'RUNNING AUTH DIAGNOSTIC...' : 'RUN AUTH DIAGNOSTIC'}
-          </button>
-
-          {diagnosticLogs.length > 0 && (
-            <div className="p-3 rounded-lg bg-black/80 border border-red-500/40 font-mono text-[11px] leading-relaxed text-left text-gray-200 max-h-60 overflow-y-auto space-y-1 select-text">
-              <div className="text-red-400 font-bold border-b border-gray-800 pb-1 mb-1">
-                Diagnostic Console Output:
-              </div>
-              {diagnosticLogs.map((item, idx) => (
-                <div
-                  key={idx}
-                  className={`break-words whitespace-pre-wrap ${
-                    item.includes('SUCCESS')
-                      ? 'text-emerald-400'
-                      : item.includes('FAILED') || item.includes('ERROR') || item.includes('EXCEPTION')
-                      ? 'text-red-400 font-semibold'
-                      : item.includes('WARNING')
-                      ? 'text-amber-400'
-                      : 'text-gray-300'
-                  }`}
-                >
-                  {item}
-                </div>
-              ))}
-            </div>
-          )}
         </div>
 
         {/* Login Form */}
@@ -446,18 +263,6 @@ export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps
               <label htmlFor="owner-password-input" className="block text-xs font-medium text-gray-300 uppercase tracking-wider">
                 Password
               </label>
-              <button
-                id="owner-forgot-password-btn"
-                type="button"
-                onClick={() => {
-                  setResetEmail(email);
-                  setResetStatus(null);
-                  setShowResetModal(true);
-                }}
-                className="text-xs text-[#D4AF37] hover:text-[#f2c94c] transition-colors cursor-pointer"
-              >
-                Forgot password?
-              </button>
             </div>
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-500">
@@ -486,6 +291,18 @@ export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps
               </button>
             </div>
           </div>
+
+          {/* Informational notice (e.g. idle timeout) -- amber, not an error */}
+          {externalNotice && !error && (
+            <div
+              id="owner-auth-notice-banner"
+              className="p-3.5 rounded-xl bg-amber-950/40 border border-amber-500/50 text-amber-300 text-xs flex items-start gap-2.5 animate-in fade-in"
+              role="status"
+            >
+              <Clock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div className="flex-1 leading-relaxed text-amber-200 font-medium">{externalNotice}</div>
+            </div>
+          )}
 
           {/* Firebase Authentication Error Display directly above the submit button */}
           {error && (
@@ -529,83 +346,6 @@ export default function OwnerLogin({ onSuccess, externalError }: OwnerLoginProps
           </p>
         </div>
       </div>
-
-      {/* Password Reset Modal */}
-      {showResetModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
-          <div className="w-full max-w-md bg-[#1E1E1E] border border-[#333333] rounded-2xl p-6 shadow-2xl relative">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="p-2.5 bg-[#D4AF37]/10 border border-[#D4AF37]/20 rounded-xl text-[#D4AF37]">
-                <KeyRound className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-base font-semibold text-white">Reset Password Request</h3>
-                <p className="text-xs text-gray-400">Submits an approval request to the Master Approvals pipeline</p>
-              </div>
-            </div>
-
-            {resetStatus && (
-              <div className={`mb-4 p-3 rounded-xl text-xs flex items-start gap-2.5 ${
-                resetStatus.type === 'success' 
-                  ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300' 
-                  : 'bg-red-500/10 border border-red-500/30 text-red-300'
-              }`}>
-                {resetStatus.type === 'success' ? (
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                ) : (
-                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-                )}
-                <div className="flex-1">{resetStatus.message}</div>
-              </div>
-            )}
-
-            {!resetStatus || resetStatus.type !== 'success' ? (
-              <form onSubmit={handlePasswordResetRequest} className="space-y-4">
-                <div>
-                  <label className="block text-xs font-medium text-gray-300 mb-1">
-                    Corporate Email Address
-                  </label>
-                  <input
-                    type="email"
-                    required
-                    value={resetEmail}
-                    onChange={(e) => setResetEmail(e.target.value)}
-                    placeholder="alex@solarithmdesign.com"
-                    className="w-full px-3.5 py-2.5 bg-[#121212] border border-[#333333] rounded-xl text-sm text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#D4AF37]/40 focus:border-[#D4AF37]"
-                  />
-                </div>
-
-                <div className="flex items-center justify-end gap-2.5 pt-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowResetModal(false)}
-                    className="px-4 py-2 rounded-xl text-xs font-medium text-gray-400 hover:text-white hover:bg-[#252525] transition-colors"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={resetLoading}
-                    className="px-4 py-2 rounded-xl text-xs font-medium bg-[#D4AF37] hover:bg-[#c49f2c] text-black font-semibold transition-colors disabled:opacity-50"
-                  >
-                    {resetLoading ? 'Submitting...' : 'Submit Request'}
-                  </button>
-                </div>
-              </form>
-            ) : (
-              <div className="pt-2 flex justify-end">
-                <button
-                  type="button"
-                  onClick={() => setShowResetModal(false)}
-                  className="px-4 py-2 rounded-xl text-xs font-medium bg-[#D4AF37] hover:bg-[#c49f2c] text-black font-semibold transition-colors"
-                >
-                  Close
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
