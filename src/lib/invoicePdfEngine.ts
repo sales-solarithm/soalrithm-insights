@@ -6,6 +6,7 @@ import {
   getInitialCompanySettings,
   COMPANY_STORAGE_KEYS
 } from './useCompanySettings';
+import { safeStringIdentifier, isZeroOrPositive } from './projectUtils';
 
 /* ════════════════════════════════════════════════════════════
    1. CONSTANTS & DEFAULTS
@@ -39,9 +40,9 @@ export const SCOPE_OPTIONS = [
 export interface InvoiceBank {
   name: string;
   acc: string;
-  accName: string;
+  accName?: string;
   ifsc: string;
-  upi: string;
+  upi?: string;
   branch?: string;
 }
 
@@ -85,9 +86,6 @@ export interface InvoiceRow {
   kw: number;
   charge: number;
   _sr?: number;
-  // Traces this line item back to its source project, so the invoice
-  // generator can detect a project that's already been billed elsewhere
-  // (e.g. a scope upgrade) instead of re-billing its full baseline cost.
   projectId?: string;
 }
 
@@ -98,9 +96,35 @@ export interface InvoiceTotals {
   sgst: number;
   cgst: number;
   igst: number;
+  sgstAmount?: number;
+  cgstAmount?: number;
+  igstAmount?: number;
   totalGST: number;
   advance: number;
   payable: number;
+  tds?: number;
+  tdsAmount?: number;
+}
+
+export const CANONICAL_INVOICE_STATUS = {
+  PAID: 'PAID',
+  PARTIALLY_PAID: 'PARTIALLY_PAID',
+  PENDING: 'PENDING',
+  CANCELLED: 'CANCELLED'
+} as const;
+
+export type CanonicalInvoiceStatus = typeof CANONICAL_INVOICE_STATUS[keyof typeof CANONICAL_INVOICE_STATUS];
+
+/**
+ * Normalizes any raw invoice status string strictly to canonical uppercase set.
+ */
+export function canonicalInvoiceStatus(status: unknown): CanonicalInvoiceStatus {
+  if (typeof status !== 'string') return CANONICAL_INVOICE_STATUS.PENDING;
+  const clean = status.trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (clean === 'PAID' || clean === 'SETTLED' || clean === 'FULL') return CANONICAL_INVOICE_STATUS.PAID;
+  if (clean === 'PARTIALLY_PAID' || clean === 'PARTIAL' || clean === 'PARTIALLYPAID') return CANONICAL_INVOICE_STATUS.PARTIALLY_PAID;
+  if (clean === 'CANCELLED' || clean === 'CANCELED' || clean === 'REFUNDED') return CANONICAL_INVOICE_STATUS.CANCELLED;
+  return CANONICAL_INVOICE_STATUS.PENDING;
 }
 
 export interface InvoiceData {
@@ -110,7 +134,7 @@ export interface InvoiceData {
   invDate: string;
   invDue: string;
   quotNo: string;
-  status: 'draft' | 'sent' | 'partially paid' | 'paid' | string;
+  status: CanonicalInvoiceStatus | string;
   amountReceived?: number;
   clientId: string | null;
   client: InvoiceClient;
@@ -152,15 +176,25 @@ export function defaultSettings(): InvoiceSettings {
 }
 
 /* ════════════════════════════════════════════════════════════
-   2. FORMATTING & HELPER UTILITIES
+   2. FORMATTING & PRECISION UTILITIES (Mandate 2 & DAT-01)
    ════════════════════════════════════════════════════════════ */
+
+/**
+ * Standard monetary rounding using currency epsilon precision.
+ * Prevents floating-point rounding drift across taxable, tax, and net payable amounts.
+ */
+export function roundCurrency(val: number): number {
+  return Math.round((val + Number.EPSILON) * 100) / 100;
+}
+
 export function safeNum(v: any): number {
   const n = parseFloat(v);
   return isNaN(n) || !isFinite(n) ? 0 : n;
 }
 
 export function fmtINR(n: number | string): string {
-  return '₹' + safeNum(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const rounded = roundCurrency(safeNum(n));
+  return '₹' + rounded.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 export function fmtNum(n: number | string, dp = 2): string {
@@ -215,6 +249,162 @@ export function generateNextInvoiceNumber(current: string): string {
   return prefix + next;
 }
 
+export interface ClientGSTRule {
+  isGujarat: boolean;
+  stateCode: string;
+  stateName: string;
+  cgst: number;
+  sgst: number;
+  igst: number;
+  ruleLabel: string;
+}
+
+/**
+ * Directive 4: Location-Based GST Rule Engine
+ * 1. Checks GSTIN first two digits (State Code 24 = Gujarat -> CGST 9% + SGST 9%, IGST 0%)
+ * 2. Checks billing state / address (Gujarat -> CGST 9% + SGST 9%, Outside Gujarat -> IGST 18%)
+ */
+export function determineClientGSTRule(client: any): ClientGSTRule {
+  if (!client) {
+    return {
+      isGujarat: true,
+      stateCode: '24',
+      stateName: 'Gujarat',
+      cgst: 9,
+      sgst: 9,
+      igst: 0,
+      ruleLabel: 'Gujarat (State Code 24) • Intra-State (CGST 9% + SGST 9%)'
+    };
+  }
+
+  // 1. Check GSTIN first two digits
+  const rawGstin = String(client.gstin || client.gstNumber || client.gst || '').trim();
+  const gstinMatch = rawGstin.match(/^(\d{2})/);
+  if (gstinMatch) {
+    const code = gstinMatch[1];
+    if (code === '24') {
+      return {
+        isGujarat: true,
+        stateCode: '24',
+        stateName: 'Gujarat',
+        cgst: 9,
+        sgst: 9,
+        igst: 0,
+        ruleLabel: 'Gujarat (State Code 24) • Intra-State (CGST 9% + SGST 9%)'
+      };
+    } else {
+      return {
+        isGujarat: false,
+        stateCode: code,
+        stateName: `State Code ${code}`,
+        cgst: 0,
+        sgst: 0,
+        igst: 18,
+        ruleLabel: `Out-of-State (State Code ${code}) • Inter-State (IGST 18%)`
+      };
+    }
+  }
+
+  // 2. Check billing state or address fields
+  const stateCandidate = String(
+    client.state ||
+    client.billingState ||
+    (typeof client.billingAddress === 'object' && client.billingAddress?.state) ||
+    (typeof client.address === 'object' && client.address?.state) ||
+    ''
+  ).trim().toLowerCase();
+
+  if (stateCandidate) {
+    if (stateCandidate.includes('gujarat') || stateCandidate === 'gj' || stateCandidate.includes('guj')) {
+      return {
+        isGujarat: true,
+        stateCode: '24',
+        stateName: 'Gujarat',
+        cgst: 9,
+        sgst: 9,
+        igst: 0,
+        ruleLabel: 'Gujarat (State Code 24) • Intra-State (CGST 9% + SGST 9%)'
+      };
+    } else {
+      const formattedState = stateCandidate.charAt(0).toUpperCase() + stateCandidate.slice(1);
+      return {
+        isGujarat: false,
+        stateCode: 'OS',
+        stateName: formattedState,
+        cgst: 0,
+        sgst: 0,
+        igst: 18,
+        ruleLabel: `${formattedState} • Inter-State (IGST 18%)`
+      };
+    }
+  }
+
+  // 3. Fallback: scan address string
+  const fullAddress = String(
+    (typeof client.billingAddress === 'string' && client.billingAddress) ||
+    (typeof client.address === 'string' && client.address) ||
+    (typeof client.billingAddress === 'object' && client.billingAddress !== null ? Object.values(client.billingAddress).join(' ') : '') ||
+    (typeof client.address === 'object' && client.address !== null ? Object.values(client.address).join(' ') : '') ||
+    ''
+  ).toLowerCase();
+
+  if (
+    fullAddress.includes('gujarat') ||
+    fullAddress.includes('ahmedabad') ||
+    fullAddress.includes('surat') ||
+    fullAddress.includes('vadodara') ||
+    fullAddress.includes('rajkot') ||
+    fullAddress.includes('gandhinagar') ||
+    fullAddress.includes('bhavnagar') ||
+    fullAddress.includes('jamnagar')
+  ) {
+    return {
+      isGujarat: true,
+      stateCode: '24',
+      stateName: 'Gujarat',
+      cgst: 9,
+      sgst: 9,
+      igst: 0,
+      ruleLabel: 'Gujarat (State Code 24) • Intra-State (CGST 9% + SGST 9%)'
+    };
+  }
+
+  const otherStates = [
+    'maharashtra', 'mumbai', 'pune', 'rajasthan', 'jaipur', 'delhi',
+    'karnataka', 'bengaluru', 'bangalore', 'tamil nadu', 'chennai',
+    'telangana', 'hyderabad', 'uttar pradesh', 'madhya pradesh',
+    'haryana', 'punjab', 'kerala', 'west bengal', 'kolkata'
+  ];
+  const matchedOther = otherStates.find((s) => fullAddress.includes(s));
+  if (matchedOther) {
+    const formatted = matchedOther.charAt(0).toUpperCase() + matchedOther.slice(1);
+    return {
+      isGujarat: false,
+      stateCode: 'OS',
+      stateName: formatted,
+      cgst: 0,
+      sgst: 0,
+      igst: 18,
+      ruleLabel: `${formatted} • Inter-State (IGST 18%)`
+    };
+  }
+
+  // Default to Gujarat (Solarithm base location)
+  return {
+    isGujarat: true,
+    stateCode: '24',
+    stateName: 'Gujarat',
+    cgst: 9,
+    sgst: 9,
+    igst: 0,
+    ruleLabel: 'Gujarat (State Code 24) • Intra-State (CGST 9% + SGST 9%)'
+  };
+}
+
+/**
+ * Calculates invoice totals with precision currency rounding across all components.
+ * Preserves explicit ₹0 advance and ₹0 charges without fallback dropping.
+ */
 export function calculateInvoiceTotals(
   rows: InvoiceRow[],
   sgstPct: number,
@@ -227,19 +417,29 @@ export function calculateInvoiceTotals(
   let projectCount = 0;
 
   rows.forEach((row) => {
-    subtotal += safeNum(row.charge);
-    totalKW += safeNum(row.kw);
-    if (safeNum(row.kw) > 0 || safeNum(row.charge) > 0 || (row.desc && row.desc.trim())) {
+    const charge = isZeroOrPositive(row.charge) ? Number(row.charge) : safeNum(row.charge);
+    const kw = isZeroOrPositive(row.kw) ? Number(row.kw) : safeNum(row.kw);
+    subtotal += charge;
+    totalKW += kw;
+    if (kw > 0 || charge > 0 || (row.desc && row.desc.trim())) {
       projectCount++;
     }
   });
 
-  const sgst = safeNum(sgstPct);
-  const cgst = safeNum(cgstPct);
-  const igst = safeNum(igstPct);
-  const totalGST = (subtotal * (sgst + cgst + igst)) / 100;
-  const advance = safeNum(advanceAmt);
-  const payable = Math.max(0, subtotal + totalGST - advance);
+  subtotal = roundCurrency(subtotal);
+  totalKW = roundCurrency(totalKW);
+
+  const sgst = isZeroOrPositive(sgstPct) ? Number(sgstPct) : safeNum(sgstPct);
+  const cgst = isZeroOrPositive(cgstPct) ? Number(cgstPct) : safeNum(cgstPct);
+  const igst = isZeroOrPositive(igstPct) ? Number(igstPct) : safeNum(igstPct);
+
+  const sgstAmount = roundCurrency((subtotal * sgst) / 100);
+  const cgstAmount = roundCurrency((subtotal * cgst) / 100);
+  const igstAmount = roundCurrency((subtotal * igst) / 100);
+  const totalGST = roundCurrency(sgstAmount + cgstAmount + igstAmount);
+
+  const advance = isZeroOrPositive(advanceAmt) ? Number(advanceAmt) : 0;
+  const payable = roundCurrency(Math.max(0, subtotal + totalGST - advance));
 
   return {
     subtotal,
@@ -248,6 +448,9 @@ export function calculateInvoiceTotals(
     sgst,
     cgst,
     igst,
+    sgstAmount,
+    cgstAmount,
+    igstAmount,
     totalGST,
     advance,
     payable
@@ -298,17 +501,21 @@ export function renderHeaderBand(
     ? `<img class="pv-logo" src="${company.logo}" alt="Company logo">`
     : logoFallbackSVG();
 
+  const gstinStr = safeStringIdentifier(company.gstin);
+  const panStr = safeStringIdentifier((company as any).pan || (company as any).panNumber);
+
   return `<div class="pv-header-band">
     <div class="pv-company-area">
       ${logoHtml}
       <div class="pv-company-info">
         <div class="pv-company-name">${escapeHtml(company.companyName)}</div>
         ${company.tagline ? `<div class="pv-company-tagline">${escapeHtml(company.tagline)}</div>` : ''}
-        ${company.gstin ? `<div class="pv-company-gstin">GSTIN : ${escapeHtml(company.gstin)}</div>` : ''}
+        ${gstinStr ? `<div class="pv-company-gstin">GSTIN : ${escapeHtml(gstinStr)}</div>` : ''}
+        ${panStr ? `<div class="pv-company-gstin">PAN : ${escapeHtml(panStr)}</div>` : ''}
       </div>
     </div>
     <div class="pv-contact-block">
-      ${company.phone ? `<div class="pv-contact-line">${iconPhone()}<span>${escapeHtml(company.phone)}</span></div>` : ''}
+      ${company.phone ? `<div class="pv-contact-line">${iconPhone()}<span>${escapeHtml(safeStringIdentifier(company.phone))}</span></div>` : ''}
       ${company.email ? `<div class="pv-contact-line">${iconMail()}<span>${escapeHtml(company.email)}</span></div>` : ''}
       ${company.address ? `<div class="pv-contact-line">${iconPin()}<span>${escapeHtml(company.address)}</span></div>` : ''}
     </div>
@@ -338,21 +545,22 @@ export function renderMetaStrip(data: InvoiceData): string {
 export function renderClientProjectGrid(data: InvoiceData): string {
   const t = data.totals || { projectCount: 0, totalKW: 0 };
   const rawAddress = data.client?.address || '';
-  // Preserve manually-entered line breaks (the Billing Address field is a
-  // textarea) and render as a proper multi-line block rather than the
-  // single-line flex row used for the other fields -- a full postal
-  // address needs to wrap onto its own lines, not run on beside its label.
   const addressHtml = escapeHtml(rawAddress).replace(/\n/g, '<br/>') || '—';
+  const clientGstin = safeStringIdentifier(data.client?.gstin);
+  const clientPan = safeStringIdentifier((data.client as any)?.pan);
+  const clientPhone = safeStringIdentifier(data.client?.phone);
+
   return `<div class="pv-info-grid">
     <div>
       <div class="pv-block-title">Client Details</div>
       <div class="pv-info-row"><span class="pv-label">Company Name</span><span class="pv-value">${escapeHtml(data.client?.name || '—')}</span></div>
-      ${data.client?.gstin ? `<div class="pv-info-row"><span class="pv-label">GSTIN</span><span class="pv-value">${escapeHtml(data.client.gstin)}</span></div>` : ''}
+      ${clientGstin ? `<div class="pv-info-row"><span class="pv-label">GSTIN</span><span class="pv-value">${escapeHtml(clientGstin)}</span></div>` : ''}
+      ${clientPan ? `<div class="pv-info-row"><span class="pv-label">PAN</span><span class="pv-value">${escapeHtml(clientPan)}</span></div>` : ''}
       <div class="pv-address-block">
         <div class="pv-label">Billing Address</div>
         <div class="pv-value pv-address-value">${addressHtml}</div>
       </div>
-      <div class="pv-info-row"><span class="pv-label">Contact No.</span><span class="pv-value">${escapeHtml(data.client?.phone || '—')}</span></div>
+      <div class="pv-info-row"><span class="pv-label">Contact No.</span><span class="pv-value">${escapeHtml(clientPhone || '—')}</span></div>
     </div>
     <div>
       <div class="pv-block-title">Project Summary</div>
@@ -411,17 +619,20 @@ export function renderBottomSection(
   const fallbackBank = company.bank || settings.bank || {};
   const bank = {
     name: data.bank?.name || fallbackBank.name,
-    acc: data.bank?.acc || fallbackBank.acc,
+    acc: safeStringIdentifier(data.bank?.acc || fallbackBank.acc),
     accName: data.bank?.accName || fallbackBank.accName,
-    ifsc: data.bank?.ifsc || fallbackBank.ifsc,
+    ifsc: safeStringIdentifier(data.bank?.ifsc || fallbackBank.ifsc),
     upi: data.bank?.upi || fallbackBank.upi,
     branch: data.bank?.branch || fallbackBank.branch
   };
   const companyName = company.companyName || settings.companyName;
-  const subtotal = t.subtotal || 0;
-  const sgstAmt = (subtotal * (t.sgst || 0)) / 100;
-  const cgstAmt = (subtotal * (t.cgst || 0)) / 100;
-  const igstAmt = (subtotal * (t.igst || 0)) / 100;
+  const subtotal = roundCurrency(t.subtotal || 0);
+  const sgstAmt = roundCurrency(t.sgstAmount ?? ((subtotal * (t.sgst || 0)) / 100));
+  const cgstAmt = roundCurrency(t.cgstAmount ?? ((subtotal * (t.cgst || 0)) / 100));
+  const igstAmt = roundCurrency(t.igstAmount ?? ((subtotal * (t.igst || 0)) / 100));
+  const totalGSTAmt = roundCurrency(t.totalGST ?? (sgstAmt + cgstAmt + igstAmt));
+  const advanceAmt = roundCurrency(t.advance || 0);
+  const payableAmt = roundCurrency(t.payable || 0);
 
   return `<div class="pv-bottom-wrap">
     <div class="pv-bottom-grid">
@@ -438,14 +649,22 @@ export function renderBottomSection(
         <div class="pv-block-title">Tax &amp; Totals</div>
         <table class="pv-totals-table">
           <tr><td>Subtotal</td><td>${fmtINR(subtotal)}</td></tr>
-          <tr><td>SGST (${fmtNum(t.sgst || 0, 1)}%)</td><td>${fmtINR(sgstAmt)}</td></tr>
-          <tr><td>CGST (${fmtNum(t.cgst || 0, 1)}%)</td><td>${fmtINR(cgstAmt)}</td></tr>
-          <tr><td>IGST (${fmtNum(t.igst || 0, 1)}%)</td><td>${fmtINR(igstAmt)}</td></tr>
-          <tr><td>Total GST (₹)</td><td>${fmtINR(t.totalGST || 0)}</td></tr>
+          ${(t.cgst > 0 || t.sgst > 0) ? `
+            <tr><td>CGST (${fmtNum(t.cgst || 0, 1)}%)</td><td>${fmtINR(cgstAmt)}</td></tr>
+            <tr><td>SGST (${fmtNum(t.sgst || 0, 1)}%)</td><td>${fmtINR(sgstAmt)}</td></tr>
+          ` : ''}
+          ${t.igst > 0 ? `
+            <tr><td>IGST (${fmtNum(t.igst || 0, 1)}%)</td><td>${fmtINR(igstAmt)}</td></tr>
+          ` : ''}
+          ${(t.cgst === 0 && t.sgst === 0 && t.igst === 0) ? `
+            <tr><td>Total GST (0%)</td><td>${fmtINR(0)}</td></tr>
+          ` : `
+            <tr><td>Total GST (₹)</td><td>${fmtINR(totalGSTAmt)}</td></tr>
+          `}
           <tr><td colspan="2"><div class="pv-totals-divider"></div></td></tr>
-          <tr><td>Advance Payment</td><td>${fmtINR(t.advance || 0)}</td></tr>
+          <tr><td>Advance Payment</td><td>${fmtINR(advanceAmt)}</td></tr>
         </table>
-        <div class="pv-grand-total"><div class="gl">Payable Amount</div><div class="ga">${fmtINR(t.payable || 0)}</div></div>
+        <div class="pv-grand-total"><div class="gl">Payable Amount</div><div class="ga">${fmtINR(payableAmt)}</div></div>
       </div>
     </div>
     <div class="pv-terms-sig-grid">

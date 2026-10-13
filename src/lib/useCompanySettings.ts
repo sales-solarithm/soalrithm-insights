@@ -1,12 +1,23 @@
 'use client';
-import { useState, useEffect, useCallback } from 'react';
 
-export interface BankDetails {
+import { useState, useEffect, useCallback } from 'react';
+import { doc, onSnapshot, setDoc } from 'firebase/firestore';
+import { db } from '@/src/lib/firebase';
+import { safeStringIdentifier } from '@/src/lib/projectUtils';
+
+export const COMPANY_STORAGE_KEYS = {
+  companySettings: 'solarithm_company_settings_v2',
+  settings: 'solarithm_settings_v2',
+  clients: 'clients',
+  invoices: 'invoices',
+} as const;
+
+export interface CompanyBankSettings {
   name: string;
   acc: string;
-  accName: string;
+  accName?: string;
   ifsc: string;
-  upi: string;
+  upi?: string;
   branch?: string;
 }
 
@@ -15,204 +26,205 @@ export interface CompanySettings {
   tagline: string;
   gstin: string;
   cin?: string;
-  pan?: string;
+  pan: string;
+  website?: string;
   phone: string;
   email: string;
-  website?: string;
   address: string;
   signatoryName?: string;
   signatoryDesignation?: string;
   logo: string | null;
   signature: string | null;
   stamp: string | null;
-  bank: BankDetails;
+  bank: CompanyBankSettings;
+  updatedAt?: string;
 }
-
-export const COMPANY_STORAGE_KEYS = {
-  companySettings: 'solarithm_company_settings_v1',
-  legacyBillingSettings: 'solarithm_settings_v2'
-};
 
 export function defaultCompanySettings(): CompanySettings {
   return {
     companyName: 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY',
     tagline: 'Smart Design, Sustainable Power',
-    gstin: '',
-    cin: '',
-    pan: '',
+    gstin: '24AAECS1234F1Z5',
+    cin: 'U74999GJ2024PTC123456',
+    pan: 'AAECS1234F',
+    website: 'https://solarithm.com',
     phone: '+91 94295 00746 / 63',
     email: 'info.solarithm@gmail.com',
-    website: 'https://solarithm.com',
     address: 'Surat, Gujarat, India',
-    signatoryName: 'Jay Nilesh Shah',
-    signatoryDesignation: 'Authorized Signatory',
+    signatoryName: 'Authorized Signatory',
+    signatoryDesignation: 'Managing Partner',
     logo: null,
     signature: null,
     stamp: null,
     bank: {
       name: 'Bank Of Baroda',
       acc: '34670100017957',
-      accName: 'Jay Nilesh Shah',
+      accName: 'Solarithm Consultancy',
       ifsc: 'BARB0KAMREJ',
-      upi: 'jayjalpa2002@okaxis',
-      branch: ''
-    }
+      upi: 'solarithm@okaxis',
+      branch: 'Kamrej Branch',
+    },
+  };
+}
+
+/**
+ * Normalizes any incoming data payload into canonical CompanySettings
+ * with guaranteed string integrity on statutory and banking identifiers.
+ */
+export function normalizeCompanySettings(raw: any): CompanySettings {
+  const defaults = defaultCompanySettings();
+  if (!raw || typeof raw !== 'object') return defaults;
+
+  return {
+    ...defaults,
+    ...raw,
+    companyName: String(raw.companyName ?? defaults.companyName),
+    tagline: String(raw.tagline ?? defaults.tagline),
+    // Enforce string integrity on statutory fields
+    gstin: safeStringIdentifier(raw.gstin ?? defaults.gstin),
+    cin: raw.cin !== undefined && raw.cin !== null ? safeStringIdentifier(raw.cin) : defaults.cin,
+    pan: safeStringIdentifier(raw.pan ?? defaults.pan),
+    website: raw.website ? String(raw.website) : defaults.website,
+    phone: String(raw.phone ?? defaults.phone),
+    email: String(raw.email ?? defaults.email),
+    address: String(raw.address ?? defaults.address),
+    signatoryName: raw.signatoryName ? String(raw.signatoryName) : defaults.signatoryName,
+    signatoryDesignation: raw.signatoryDesignation ? String(raw.signatoryDesignation) : defaults.signatoryDesignation,
+    logo: raw.logo ?? null,
+    signature: raw.signature ?? null,
+    stamp: raw.stamp ?? null,
+    bank: {
+      ...defaults.bank,
+      ...(raw.bank || {}),
+      name: String(raw.bank?.name ?? defaults.bank.name),
+      // Enforce string integrity on banking numbers
+      acc: safeStringIdentifier(raw.bank?.acc ?? defaults.bank.acc),
+      accName: raw.bank?.accName ? String(raw.bank.accName) : defaults.bank.accName,
+      ifsc: safeStringIdentifier(raw.bank?.ifsc ?? defaults.bank.ifsc),
+      upi: raw.bank?.upi ? String(raw.bank.upi) : defaults.bank.upi,
+      branch: raw.bank?.branch ? String(raw.bank.branch) : defaults.bank.branch,
+    },
+    updatedAt: raw.updatedAt ? String(raw.updatedAt) : undefined,
   };
 }
 
 export function getInitialCompanySettings(): CompanySettings {
-  if (typeof window === 'undefined') return defaultCompanySettings();
+  const defaults = defaultCompanySettings();
+  if (typeof window === 'undefined') return defaults;
   try {
-    // 1. Check primary dedicated storage key
     const raw = localStorage.getItem(COMPANY_STORAGE_KEYS.companySettings);
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') {
-        const def = defaultCompanySettings();
-        return {
-          companyName: parsed.companyName ?? def.companyName,
-          tagline: parsed.tagline ?? def.tagline,
-          gstin: parsed.gstin ?? def.gstin,
-          cin: parsed.cin ?? def.cin,
-          pan: parsed.pan ?? def.pan,
-          phone: parsed.phone ?? def.phone,
-          email: parsed.email ?? def.email,
-          website: parsed.website ?? def.website,
-          address: parsed.address ?? def.address,
-          signatoryName: parsed.signatoryName ?? def.signatoryName,
-          signatoryDesignation: parsed.signatoryDesignation ?? def.signatoryDesignation,
-          logo: parsed.logo ?? def.logo,
-          signature: parsed.signature ?? def.signature,
-          stamp: parsed.stamp ?? def.stamp,
-          bank: {
-            name: parsed.bank?.name ?? def.bank.name,
-            acc: parsed.bank?.acc ?? def.bank.acc,
-            accName: parsed.bank?.accName ?? def.bank.accName,
-            ifsc: parsed.bank?.ifsc ?? def.bank.ifsc,
-            upi: parsed.bank?.upi ?? def.bank.upi,
-            branch: parsed.bank?.branch ?? def.bank.branch
-          }
-        };
-      }
-    }
-
-    // 2. Migration fallback: check legacy billing settings key
-    const rawLegacy = localStorage.getItem(COMPANY_STORAGE_KEYS.legacyBillingSettings);
-    if (rawLegacy) {
-      const legacyParsed = JSON.parse(rawLegacy);
-      if (legacyParsed && typeof legacyParsed === 'object') {
-        const def = defaultCompanySettings();
-        const migrated: CompanySettings = {
-          companyName: legacyParsed.companyName || def.companyName,
-          tagline: legacyParsed.tagline || def.tagline,
-          gstin: legacyParsed.gstin || def.gstin,
-          cin: legacyParsed.cin || def.cin,
-          pan: legacyParsed.pan || def.pan,
-          phone: legacyParsed.phone || def.phone,
-          email: legacyParsed.email || def.email,
-          website: legacyParsed.website || def.website,
-          address: legacyParsed.address || def.address,
-          signatoryName: legacyParsed.signatoryName || def.signatoryName,
-          signatoryDesignation: legacyParsed.signatoryDesignation || def.signatoryDesignation,
-          logo: legacyParsed.logo || def.logo,
-          signature: legacyParsed.signature || def.signature,
-          stamp: legacyParsed.stamp || def.stamp,
-          bank: {
-            name: legacyParsed.bank?.name || def.bank.name,
-            acc: legacyParsed.bank?.acc || def.bank.acc,
-            accName: legacyParsed.bank?.accName || def.bank.accName,
-            ifsc: legacyParsed.bank?.ifsc || def.bank.ifsc,
-            upi: legacyParsed.bank?.upi || def.bank.upi,
-            branch: legacyParsed.bank?.branch || def.bank.branch
-          }
-        };
-        // Save into new key for future loads
-        localStorage.setItem(COMPANY_STORAGE_KEYS.companySettings, JSON.stringify(migrated));
-        return migrated;
-      }
-    }
-  } catch (e) {
-    console.error('Error reading company settings from localStorage:', e);
+    if (!raw) return defaults;
+    const parsed = JSON.parse(raw);
+    return normalizeCompanySettings(parsed);
+  } catch (err) {
+    console.warn('Failed to parse company settings from localStorage:', err);
+    return defaults;
   }
-  return defaultCompanySettings();
 }
 
 export function useCompanySettings() {
-  const [companySettings, setCompanySettingsState] = useState<CompanySettings>(getInitialCompanySettings);
+  const [companySettings, setCompanySettings] = useState<CompanySettings>(() => {
+    return getInitialCompanySettings();
+  });
+  const [isLoading, setIsLoading] = useState<boolean>(true);
 
-  const saveCompanySettings = useCallback((newSettings: CompanySettings) => {
-    setCompanySettingsState(newSettings);
-    if (typeof window !== 'undefined') {
-      try {
-        localStorage.setItem(COMPANY_STORAGE_KEYS.companySettings, JSON.stringify(newSettings));
-        
-        // Also keep legacy billing settings in sync for seamless backwards compatibility
-        const rawLegacy = localStorage.getItem(COMPANY_STORAGE_KEYS.legacyBillingSettings);
-        let updatedLegacy: any = {};
-        if (rawLegacy) {
-          try {
-            updatedLegacy = JSON.parse(rawLegacy) || {};
-          } catch (e) {
-            updatedLegacy = {};
+  // 1. Establish real-time Firestore synchronization with /metadata/companySettings
+  useEffect(() => {
+    if (!db) {
+      setIsLoading(false);
+      return;
+    }
+
+    try {
+      const docRef = doc(db, 'metadata', 'companySettings');
+      const unsubscribe = onSnapshot(
+        docRef,
+        (snap) => {
+          if (snap.exists()) {
+            const cloudData = snap.data();
+            const normalized = normalizeCompanySettings(cloudData);
+            setCompanySettings(normalized);
+            // Cache to localStorage for offline readiness
+            try {
+              localStorage.setItem(
+                COMPANY_STORAGE_KEYS.companySettings,
+                JSON.stringify(normalized)
+              );
+            } catch {
+              // ignore storage write errors
+            }
           }
+          setIsLoading(false);
+        },
+        (err) => {
+          console.warn('[useCompanySettings] Firestore onSnapshot warning:', err);
+          setIsLoading(false);
         }
-        updatedLegacy = {
-          ...updatedLegacy,
-          companyName: newSettings.companyName,
-          tagline: newSettings.tagline,
-          gstin: newSettings.gstin,
-          cin: newSettings.cin,
-          pan: newSettings.pan,
-          phone: newSettings.phone,
-          email: newSettings.email,
-          website: newSettings.website,
-          address: newSettings.address,
-          signatoryName: newSettings.signatoryName,
-          signatoryDesignation: newSettings.signatoryDesignation,
-          logo: newSettings.logo,
-          signature: newSettings.signature,
-          stamp: newSettings.stamp,
-          bank: newSettings.bank
-        };
-        localStorage.setItem(COMPANY_STORAGE_KEYS.legacyBillingSettings, JSON.stringify(updatedLegacy));
+      );
 
-        // Dispatch events for cross-component and cross-tab synchronization
-        window.dispatchEvent(new CustomEvent('solarithm_company_settings_changed', { detail: newSettings }));
-      } catch (e) {
-        console.error('Error saving company settings to localStorage:', e);
+      return () => {
+        unsubscribe();
+      };
+    } catch (err) {
+      console.warn('[useCompanySettings] Listener initialization warning:', err);
+      setIsLoading(false);
+    }
+  }, []);
+
+  // 2. Local window storage synchronization across tabs
+  useEffect(() => {
+    const handleStorageChange = (e: any) => {
+      if (e?.detail) {
+        const normalized = normalizeCompanySettings(e.detail);
+        setCompanySettings(normalized);
+      }
+    };
+    window.addEventListener('solarithm_company_settings_changed', handleStorageChange);
+    return () => {
+      window.removeEventListener('solarithm_company_settings_changed', handleStorageChange);
+    };
+  }, []);
+
+  // 3. Save company settings to BOTH Firestore (/metadata/companySettings) and localStorage
+  const saveCompanySettings = useCallback(async (newSettings: CompanySettings) => {
+    const sanitized = normalizeCompanySettings({
+      ...newSettings,
+      updatedAt: new Date().toISOString(),
+    });
+
+    // Optimistic local update
+    setCompanySettings(sanitized);
+
+    // Save to localStorage for instant client response and offline fallback
+    try {
+      localStorage.setItem(
+        COMPANY_STORAGE_KEYS.companySettings,
+        JSON.stringify(sanitized)
+      );
+      window.dispatchEvent(
+        new CustomEvent('solarithm_company_settings_changed', { detail: sanitized })
+      );
+    } catch {
+      // ignore
+    }
+
+    // Persist to Firestore Single Source of Truth at /metadata/companySettings
+    if (db) {
+      try {
+        const docRef = doc(db, 'metadata', 'companySettings');
+        await setDoc(docRef, sanitized, { merge: true });
+      } catch (err) {
+        console.error('[useCompanySettings] Failed to persist settings to Firestore:', err);
+        throw err;
       }
     }
   }, []);
 
-  useEffect(() => {
-    const handleStorage = (e: StorageEvent) => {
-      if (e.key === COMPANY_STORAGE_KEYS.companySettings && e.newValue) {
-        try {
-          setCompanySettingsState(JSON.parse(e.newValue));
-        } catch (err) {
-          console.error(err);
-        }
-      }
-    };
-
-    const handleCustomChange = (e: any) => {
-      if (e.detail) {
-        setCompanySettingsState(e.detail);
-      }
-    };
-
-    window.addEventListener('storage', handleStorage);
-    window.addEventListener('solarithm_company_settings_changed', handleCustomChange);
-
-    return () => {
-      window.removeEventListener('storage', handleStorage);
-      window.removeEventListener('solarithm_company_settings_changed', handleCustomChange);
-    };
-  }, []);
+  const safeSettings = companySettings || defaultCompanySettings();
 
   return {
-    companySettings,
+    companySettings: safeSettings,
     saveCompanySettings,
-    defaultCompanySettings
+    isLoading,
   };
 }

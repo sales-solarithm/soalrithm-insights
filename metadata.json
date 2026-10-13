@@ -1,8 +1,6 @@
 {
-  "name": "Remix Solarithm Dashboard",
-  "description": "Master project manager dashboard",
+  "name": "Solarithm Insight",
+  "description": "Executive Project & Financial Management Console",
   "requestFramePermissions": [],
-  "majorCapabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

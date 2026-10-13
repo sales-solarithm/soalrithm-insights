@@ -11,7 +11,7 @@ export default function Clients() {
   const [error, setError] = useState('');
 
   useEffect(() => {
-    let unsubscribeClients: () => void;
+    let unsubscribeClients: (() => void) | undefined;
 
     try {
       unsubscribeClients = onSnapshot(
@@ -29,9 +29,9 @@ export default function Clients() {
             };
           });
 
-          // STRICTLY filter only approved clients
+          // Filter only approved clients
           const approvedClients = clientsData.filter(
-            (client) => client.status === CLIENT_STATUS.APPROVED || client.status === 'approved'
+            (client) => client.status === CLIENT_STATUS.APPROVED || String(client.status).toLowerCase() === 'approved'
           );
 
           setClients(approvedClients);
@@ -58,47 +58,47 @@ export default function Clients() {
 
   if (loading) {
     return (
-      <div className="flex flex-col items-center justify-center py-12 bg-[#121212] text-[#D4AF37]">
+      <div className="flex flex-col items-center justify-center py-12 bg-white dark:bg-[#121212] text-[#D4AF37] transition-colors">
         <Loader2 className="w-8 h-8 animate-spin mb-4" />
-        <p className="text-sm font-medium">Loading Approved Clients...</p>
+        <p className="text-sm font-medium text-gray-700 dark:text-gray-300">Loading Approved Clients...</p>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="flex flex-col items-center justify-center py-12 bg-[#121212]">
-        <div className="bg-red-950/30 border border-red-500/50 p-6 rounded-xl text-center">
-          <AlertTriangle className="w-8 h-8 text-red-500 mx-auto mb-3" />
-          <p className="text-red-200 text-sm">{error}</p>
+      <div className="flex flex-col items-center justify-center py-12 bg-white dark:bg-[#121212] transition-colors">
+        <div className="bg-rose-50 dark:bg-red-950/30 border border-rose-300 dark:border-red-500/50 p-6 rounded-xl text-center">
+          <AlertTriangle className="w-8 h-8 text-rose-500 mx-auto mb-3" />
+          <p className="text-rose-700 dark:text-red-200 text-sm">{error}</p>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="bg-[#1E1E1E] rounded-xl shadow-2xl overflow-hidden border border-[#333333] mt-8">
-      <div className="px-6 py-5 border-b border-[#333333] flex items-center space-x-3 bg-[#121212]/50">
-        <div className="p-2 bg-[#2A2A2A] rounded-lg">
+    <div className="bg-white dark:bg-[#1E1E1E] rounded-xl shadow-sm overflow-hidden border border-gray-200 dark:border-[#333333] mt-8 transition-colors">
+      <div className="px-6 py-5 border-b border-gray-200 dark:border-[#333333] flex items-center space-x-3 bg-gray-50/60 dark:bg-[#121212]/50">
+        <div className="p-2 bg-gray-100 dark:bg-[#2A2A2A] rounded-lg">
           <Briefcase className="w-5 h-5 text-[#D4AF37]" />
         </div>
         <div>
-          <h3 className="text-lg font-medium text-white">Approved Clients</h3>
-          <p className="text-xs text-gray-500 mt-0.5">Read-only directory of verified and active clients.</p>
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Approved Clients</h3>
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">Read-only directory of verified and active clients.</p>
         </div>
       </div>
 
       {clients.length === 0 ? (
         <div className="text-center py-12">
-          <Briefcase className="mx-auto h-10 w-10 text-gray-500 mb-3" />
-          <h4 className="text-base font-medium text-gray-300">No approved clients found</h4>
+          <Briefcase className="mx-auto h-10 w-10 text-gray-400 dark:text-gray-500 mb-3" />
+          <h4 className="text-base font-semibold text-gray-700 dark:text-gray-300">No approved clients found</h4>
           <p className="text-sm text-gray-500 mt-1">Clients must be approved to appear in this directory.</p>
         </div>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-left whitespace-nowrap">
-            <thead className="bg-[#121212]/50 border-b border-[#333333]">
-              <tr className="text-gray-400 text-xs uppercase tracking-wider">
+            <thead className="bg-gray-50 dark:bg-[#121212]/50 border-b border-gray-200 dark:border-[#333333]">
+              <tr className="text-gray-500 dark:text-gray-400 text-xs uppercase tracking-wider">
                 <th className="py-4 px-6 font-semibold">Company Name</th>
                 <th className="py-4 px-6 font-semibold">Contact Person</th>
                 <th className="py-4 px-6 font-semibold">City</th>
@@ -106,25 +106,25 @@ export default function Clients() {
                 <th className="py-4 px-6 font-semibold">Status</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-[#333333]">
+            <tbody className="divide-y divide-gray-100 dark:divide-[#333333]">
               {clients.map((client) => (
-                <tr key={client.id} className="hover:bg-[#2A2A2A] transition-colors">
+                <tr key={client.id} className="hover:bg-gray-50 dark:hover:bg-[#2A2A2A] transition-colors">
                   <td className="py-4 px-6">
-                    <span className="font-medium text-[#D4AF37]">
+                    <span className="font-semibold text-[#D4AF37]">
                       {client.companyName}
                     </span>
                   </td>
-                  <td className="py-4 px-6 text-gray-200">
+                  <td className="py-4 px-6 text-gray-800 dark:text-gray-200">
                     {client.contactPerson}
                   </td>
-                  <td className="py-4 px-6 text-gray-200">
+                  <td className="py-4 px-6 text-gray-700 dark:text-gray-300">
                     {client.city}
                   </td>
-                  <td className="py-4 px-6 text-gray-200">
+                  <td className="py-4 px-6 text-gray-700 dark:text-gray-300">
                     {client.salesPersonEmail}
                   </td>
                   <td className="py-4 px-6">
-                    <span className="text-green-500 bg-green-500/10 px-2.5 py-1 rounded text-xs font-medium border border-green-500/20">
+                    <span className="text-emerald-700 dark:text-green-500 bg-emerald-50 dark:bg-green-500/10 px-2.5 py-1 rounded text-xs font-semibold border border-emerald-200 dark:border-green-500/20">
                       Approved
                     </span>
                   </td>

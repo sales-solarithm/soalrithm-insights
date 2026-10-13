@@ -18,7 +18,8 @@ export const COLLECTIONS = {
 } as const;
 
 export const APPROVAL_TYPES = {
-  PASSWORD_RESET_REQUEST: 'PASSWORD_RESET_REQUEST'
+  PASSWORD_RESET_REQUEST: 'PASSWORD_RESET_REQUEST',
+  PASSWORD_RESET: 'PASSWORD_RESET_REQUEST'
 } as const;
 
 export const APPROVAL_STATUS = {
@@ -61,7 +62,75 @@ export const REGISTERED_APP_FIELDS = {
 export const CLIENT_STATUS = { PENDING: 'pending_approval', APPROVED: 'approved', REJECTED: 'rejected' } as const;
 export const PROJECT_STATUS = { NOT_STARTED: 'not_started', IN_PROGRESS: 'in_progress', REQUIRED_DATA_PENDING: 'required_data_pending', IN_REVISION: 'in_revision', IN_VERIFICATION: 'in_verification', DELAYED: 'delayed', COMPLETED: 'completed' } as const;
 export const CLIENT_FIELDS = { COMPANY_NAME: 'companyName', CONTACT_PERSON: 'contactPerson', EMAIL: 'email', PHONE: 'phone', CITY: 'city', GSTIN: 'gstin', PRICING_CATEGORY: 'pricingCategory', SALES_PERSON_EMAIL: 'salesPersonEmail', PROPOSAL_NUMBER: 'proposalNumber', STATUS: 'status', CREATED_AT: 'createdAt' } as const;
-export const PROJECT_FIELDS = { PROJECT_NUMBER: 'projectNumber', PROJECT_NAME: 'projectName', CLIENT_ID: 'clientId', CLIENT_NAME: 'clientName', SCOPE_OF_WORK: 'scopeOfWork', SUB_SERVICE: 'subService', PLANT_CAPACITY: 'plantCapacity', CAPACITY_UNIT: 'capacityUnit', LOCATION: 'location', DESIGNER_EMAIL: 'designerEmail', PRICING_CATEGORY: 'pricingCategory', STATUS: 'status', CREATED_AT: 'createdAt', UPDATED_AT: 'updatedAt', UPGRADE_HISTORY: 'upgradeHistory' } as const;
+export const PROJECT_FIELDS = {
+  PROJECT_NUMBER: 'projectNumber',
+  SR_NUMBER: 'srNumber',
+  PROJECT_NAME: 'projectName',
+  CLIENT_ID: 'clientId',
+  CLIENT_NAME: 'clientName',
+  SCOPE_OF_WORK: 'scopeOfWork',
+  SUB_SERVICE: 'subService',
+  PLANT_CAPACITY: 'plantCapacity',
+  CAPACITY_UNIT: 'capacityUnit',
+  LOCATION: 'location',
+  DESIGNER_EMAIL: 'designerEmail',
+  DESIGNER_NAME: 'designerName',
+  SALES_PERSON_EMAIL: 'salesPersonEmail',
+  SALES_PERSON: 'salesPerson',
+  SALES_PERSON_NAME: 'salesPersonName',
+  PRICING_CATEGORY: 'pricingCategory',
+  STATUS: 'status',
+  DATE: 'date',
+  PROJECT_DATE: 'projectDate',
+  CREATED_AT: 'createdAt',
+  UPDATED_AT: 'updatedAt',
+  UPGRADE_HISTORY: 'upgradeHistory',
+  ASSIGNED_SCOPES: 'assignedScopes',
+  MODULES: 'modules',
+  PAYMENT_STATUS: 'paymentStatus'
+} as const;
+
+export interface CanonicalModulePhase {
+  phaseKey: string;
+  phaseName: string;
+  status: 'not_started' | 'in_progress' | 'in_revision' | 'completed';
+  assignedDesignerEmail: string;
+  assignedDesignerName?: string;
+  startedAt?: string | null;
+  completedAt?: string | null;
+}
+
+export interface CanonicalProjectDocument {
+  id?: string;
+  projectNumber: string;
+  srNumber: string;
+  projectName: string;
+  clientId: string;
+  clientName: string;
+  projectDate: string;
+  date: string;
+  createdAt: any;
+  updatedAt?: any;
+  scopeOfWork: string;
+  subService?: string;
+  plantCapacity: number | null;
+  capacityUnit: 'KW' | 'MW';
+  location: string;
+  assignedScopes?: Record<string, string | undefined>;
+  modules?: CanonicalModulePhase[];
+  status: 'not_started' | 'in_progress' | 'in_revision' | 'completed';
+  designerEmail?: string;
+  designerName?: string;
+  salesPersonEmail?: string;
+  salesPerson?: string;
+  salesPersonName?: string;
+  pricingCategory?: 'T1' | 'T2' | 'T3' | 'T4';
+  rate?: number | null;
+  projectValue?: number | null;
+  projectCost?: number | null;
+  paymentStatus?: 'UNPAID' | 'PARTIALLY_PAID' | 'PAID';
+  upgradeHistory?: ProjectUpgradeRecord[];
+}
 
 /**
  * A single recorded modification to an already-created project (a scope or
@@ -92,4 +161,22 @@ export interface ProjectUpgradeRecord {
   // Salary slip number once the incentive delta has been paid to the
   // assigned designer(s). Null until that happens.
   incentivePaidInSlip?: string | null;
+}
+
+export interface PricingCategoryHistoryPeriod {
+  tier: string;
+  effectiveFrom: string; // ISO date YYYY-MM-DD or ISO string
+  effectiveTo?: string | null; // ISO date YYYY-MM-DD or null for open-ended
+}
+
+export interface ClientSubscriptionPlan {
+  planId?: string;
+  planName?: string;
+  scopeCovered: string; // e.g. 'Pre-Design', 'Detailed Engineering'
+  totalAllowedProjects: number; // e.g. 10
+  upfrontPrice: number; // Retainer invoice amount, e.g. 50000
+  durationMonths?: number; // e.g. 3, 6, 12
+  startDate: string; // ISO date YYYY-MM-DD
+  endDate: string; // ISO date YYYY-MM-DD
+  active?: boolean;
 }

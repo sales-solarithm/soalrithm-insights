@@ -1,13 +1,16 @@
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600;700&family=DM+Sans:wght@300;400;500;600;700&display=swap');
 @import "tailwindcss";
 
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  /* A4 Print & Invoice Variables */
+  /* Brand Theme Variables */
   --gold-light: #F0C842;
-  --gold:       #D4A017;
+  --gold:       #D4AF37;
   --gold-dark:  #A87A00;
   --charcoal:   #4A4A4A;
   --charcoal-deep: #2C2C2C;
+  --charcoal-base: #121212;
   --bg:         #F7F5F0;
   --bg-panel:   #FFFFFF;
   --border:     #E2D9C4;
@@ -18,7 +21,7 @@
   --danger-bg:  #FDF0EF;
   --success:    #1B6E3B;
   --success-bg: #EAF3DE;
-  --info:       #D4A017;
+  --info:       #D4AF37;
   --info-bg:    #FDF9EC;
   --font-head:  'Cormorant Garamond', Georgia, serif;
   --font-body:  'DM Sans', system-ui, -apple-system, sans-serif;
@@ -29,6 +32,42 @@
   --shadow-md:  0 4px 20px rgba(44,44,44,0.08);
 }
 
+/* Root typography & scale enforcement */
+html {
+  font-size: 15px;
+}
+
+/* Light / Dark Mode Surface & Text Enforcements (UIX-01) */
+html.dark {
+  color-scheme: dark;
+}
+
+html:not(.dark) {
+  color-scheme: light;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: 0.9375rem; /* ~14px-15px */
+  line-height: 1.5;
+}
+
+/* Portal-wide table and input legibility scale-up */
+table:not(.pv-table) th {
+  font-size: 0.8125rem; /* ~13px */
+}
+
+table:not(.pv-table) td {
+  font-size: 0.9375rem; /* ~14px-15px */
+}
+
+input:not([type="checkbox"]):not([type="radio"]):not(.pv-input),
+select:not(.pv-select),
+textarea:not(.pv-textarea) {
+  font-size: 0.9375rem; /* ~14px-15px */
+}
+
+/* Printable A4 Specifications */
 .a4-page {
   width: 210mm;
   min-height: 297mm;
@@ -65,7 +104,7 @@
   letter-spacing: 0.5px;
 }
 
-/* -- Header band -- */
+/* Header band */
 .pv-header-band {
   background: var(--charcoal-deep);
   padding: 5mm 6mm;
@@ -94,7 +133,7 @@
 .pv-contact-block .pv-contact-line { display: flex; align-items: center; justify-content: flex-end; gap: 5px; }
 .pv-contact-block svg { width: 11px; height: 11px; flex-shrink: 0; }
 
-/* -- Meta strip -- */
+/* Meta strip */
 .pv-meta-strip {
   background: var(--gold-light);
   padding: 4mm 6mm;
@@ -127,7 +166,7 @@
   display: inline-block;
 }
 
-/* -- Client / project grid (page 1 only) -- */
+/* Client / project grid (page 1 only) */
 .pv-info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5mm; }
 .pv-block-title {
   font-size: 9.5px;
@@ -142,9 +181,6 @@
 .pv-info-row { display: flex; gap: 6px; margin-bottom: 1.5mm; font-size: 11px; }
 .pv-info-row .pv-label { min-width: 24mm; color: var(--muted); font-weight: 500; flex-shrink: 0; }
 .pv-info-row .pv-value { color: var(--text); }
-/* Billing address needs to wrap across several lines, so it gets its own
-   stacked block (label above, value below) instead of the label/value flex
-   row used for single-line fields like Company Name or GSTIN. */
 .pv-address-block { margin-bottom: 1.5mm; font-size: 11px; }
 .pv-address-block .pv-label { color: var(--muted); font-weight: 500; margin-bottom: 0.5mm; }
 .pv-address-block .pv-address-value { color: var(--text); line-height: 1.4; }
@@ -153,7 +189,7 @@
 .pv-summary-stat-label { font-size: 8.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
 .pv-summary-stat-value { font-family: var(--font-head); font-size: 14px; font-weight: 600; color: var(--gold-dark); }
 
-/* -- Table -- */
+/* Table */
 table.pv-table { width: 100%; border-collapse: collapse; font-size: 10.5px; table-layout: fixed; }
 table.pv-table thead tr { background: var(--charcoal-deep); color: var(--gold-light); }
 table.pv-table thead th { padding: 2.2mm 2.5mm; font-weight: 500; font-size: 9.5px; letter-spacing: 0.4px; text-align: left; }
@@ -168,7 +204,7 @@ table.pv-table tbody td:nth-child(4), table.pv-table tbody td:nth-child(5) { tex
 table.pv-table tbody td:last-child { font-weight: 600; }
 table.pv-table tbody tr:nth-child(even) { background: #FDFBF7; }
 
-/* -- Totals / bank / terms (last page) -- */
+/* Totals / bank / terms (last page) */
 .pv-bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5mm; }
 .pv-bank-row { display: flex; gap: 4px; margin-bottom: 1.3mm; font-size: 10px; }
 .pv-bank-row .pv-label { min-width: 26mm; color: var(--muted); flex-shrink: 0; }
@@ -215,7 +251,7 @@ table.pv-table tbody tr:nth-child(even) { background: #FDFBF7; }
   letter-spacing: 0.5px;
 }
 
-/* -- Continued note + footer -- */
+/* Continued note + footer */
 .pv-continued-note { text-align: right; font-size: 10px; font-style: italic; color: var(--gold-dark); font-weight: 500; }
 .pv-footer {
   background: var(--charcoal-deep);

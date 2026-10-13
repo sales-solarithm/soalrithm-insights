@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import Image from 'next/image';
 import {
   LayoutGrid,
@@ -8,39 +8,43 @@ import {
   Clock,
   Users,
   Trophy,
-  Building2,
   Settings as SettingsIcon,
   Plus,
-  Upload,
-  Download,
-  Eye,
-  Trash2,
   Printer,
   CheckCircle2,
   Search,
-  Filter,
   X,
   Calendar,
-  Edit,
-  FileSpreadsheet,
   Banknote,
-  Sparkles,
-  ArrowUpRight,
-  ShieldCheck,
   Receipt,
-  Check,
   AlertCircle,
-  FileDown
+  FileDown,
+  Filter
 } from 'lucide-react';
-import * as XLSX from 'xlsx';
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
-import { useCompanySettings, CompanySettings, defaultCompanySettings } from '@/src/lib/useCompanySettings';
-import { doc, updateDoc } from 'firebase/firestore';
-import { db } from '@/src/lib/firebase';
+import { useCompanySettings } from '@/src/lib/useCompanySettings';
+import { doc, getDoc, updateDoc, setDoc, collection, getDocs, onSnapshot, serverTimestamp } from 'firebase/firestore';
+import { db, auth } from '@/src/lib/firebase';
+import { onAuthStateChanged } from 'firebase/auth';
 import { COLLECTIONS } from '@/src/config/schema';
+import { 
+  parseSafeDate, 
+  resolveProjectDate, 
+  formatSafeDate, 
+  getFirstName, 
+  formatIndianName, 
+  isZeroOrPositive, 
+  safeNumber, 
+  formatCurrency,
+  toCanonicalScopeKey,
+  SCOPE_LABELS
+} from '@/src/lib/projectUtils';
 
-// Storage keys (Central global keys)
+// ============================================================================
+// CONSTANTS & TAXONOMY (Mandate 4: Scope Taxonomy Decoupling)
+// ============================================================================
+
 export const SALARY_STORAGE_KEYS = {
   employees: 'users',
   incentives: 'incentives',
@@ -48,7 +52,39 @@ export const SALARY_STORAGE_KEYS = {
   draft: 'solarithm_salary_generator_draft_v1',
   settings: 'solarithm_salary_rules_v1',
   counter: 'solarithm_salary_slip_counter_v1'
-};
+} as const;
+
+export const ENGINEERING_SCOPES = [
+  'All Scopes',
+  'Pre-Design',
+  'Post-Design',
+  'Detailed Engineering',
+  'Permit Package',
+  'CEIG',
+  'PVsyst',
+  'Standard Design',
+  'Single Line Diagram',
+  'Bill of Materials',
+  'PE Stamping'
+] as const;
+
+export const INSTALLATION_SECTORS = [
+  'All Sectors',
+  'Domestic',
+  'Commercial',
+  'Industrial',
+  'Ground Mount',
+  'Agricultural'
+] as const;
+
+export const SALARY_MONTHS = [
+  'January', 'February', 'March', 'April', 'May', 'June',
+  'July', 'August', 'September', 'October', 'November', 'December'
+] as const;
+
+// ============================================================================
+// TYPE DEFINITIONS
+// ============================================================================
 
 export interface EmployeeRecord {
   id: string;
@@ -87,9 +123,8 @@ export interface IncentiveRecord {
   role?: string;
   projectId?: string;
   status?: string;
-  // Populated only for split-scope designer credits, so the finalized
-  // salary slip can write an anti-double-crediting payout record back onto
-  // the source project for exactly these scopes.
+  scopeOfWork?: string;
+  sector?: string;
   scopeKeys?: string[];
   comboFullAmount?: number;
   designerEmail?: string;
@@ -131,14 +166,9 @@ export interface SalarySlipRecord {
   totalDed: number;
   net: number;
   generated: string;
-  // Mandatory payment settlement details, captured at generation time.
   paymentMode: string;
   transactionId: string;
   paymentDate: string;
-  // Snapshot of the employee's bank details at the time this slip was
-  // generated (mirrors companySnapshot below) -- so a historical slip keeps
-  // showing what was actually paid-to, even if the employee's bank details
-  // change later. Account number is pre-masked at snapshot time.
   employeeBankSnapshot: {
     bankName: string;
     maskedAccountNumber: string;
@@ -155,8 +185,6 @@ export interface SalarySlipRecord {
   };
   deductions: DeductionsData;
   incentivesList: IncentiveRecord[];
-  // Phase 1 data: which N-1 month/FY this slip's incentive figures were
-  // pulled from, plus the three aggregated summary metrics.
   incentiveSummary: {
     cycleMonth: string;
     cycleFY: string;
@@ -192,12 +220,10 @@ interface SalaryStudioProps {
   onNavigateToGlobalSettings?: () => void;
 }
 
-// Number to Words Converter for Indian Currency Format
-/**
- * Masks a bank account number for display, keeping only the last 4 digits
- * visible (e.g. "1234567890" -> "••••••7890"). Returns 'N/A' for an empty
- * or missing value rather than an empty mask.
- */
+// ============================================================================
+// HELPER FUNCTIONS (Mandates 2, 3, 4)
+// ============================================================================
+
 export function maskAccountNumber(accountNumber: string | undefined | null): string {
   const clean = String(accountNumber || '').trim();
   if (!clean) return 'N/A';
@@ -240,58 +266,9 @@ export function numberToWordsINR(num: number): string {
   if (num > 0) {
     result += formatHundred(num);
   }
-  return (result.trim() + ' Rupees Only');
+  return result.trim() + ' Rupees Only';
 }
 
-export const SALARY_MONTHS = [
-  'January', 'February', 'March', 'April', 'May', 'June',
-  'July', 'August', 'September', 'October', 'November', 'December'
-];
-
-export const parseSafeDate = (dateVal: any): Date | null => {
-  if (!dateVal) return null;
-  try {
-    if (typeof dateVal?.toDate === 'function') {
-      const d = dateVal.toDate();
-      return isNaN(d.getTime()) ? null : d;
-    }
-    if (dateVal?.seconds !== undefined) {
-      const d = new Date(dateVal.seconds * 1000);
-      return isNaN(d.getTime()) ? null : d;
-    }
-    const d = new Date(dateVal);
-    return isNaN(d.getTime()) ? null : d;
-  } catch {
-    return null;
-  }
-};
-
-export const formatSafeDate = (dateVal: any, formatType: 'input' | 'display' | 'slash' = 'display'): string => {
-  const d = parseSafeDate(dateVal);
-  if (!d) return '';
-  try {
-    if (formatType === 'input') {
-      return d.toISOString().split('T')[0];
-    }
-    if (formatType === 'slash') {
-      return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
-    }
-    return d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
-  } catch {
-    return '';
-  }
-};
-
-/**
- * Checks if a project date falls into the specified Month and Financial Year (Indian FY: April - March)
- */
-/**
- * Decrements a financial year string by one year, handling both the
- * 2-digit ("2025-26") and 4-digit ("2025-2026") end-year formats, and a
- * bare single-year string as a fallback. Used only for the April -> March
- * boundary, where the month before April of an FY's start year belongs to
- * the *previous* financial year, not the current one.
- */
 const getPreviousFYString = (fyString: string): string => {
   if (fyString.includes('-')) {
     const parts = fyString.split('-');
@@ -309,15 +286,6 @@ const getPreviousFYString = (fyString: string): string => {
   return fyString;
 };
 
-/**
- * Resolves the N-1 incentive cycle period for a given pay-period month/FY:
- * a September pay period processes August's completed-project incentive
- * data, October processes September's, and so on. The one boundary case is
- * April, whose preceding month (March) belongs to the previous financial
- * year, not the current one -- e.g. pay period April 2025-26 processes
- * March of FY 2024-25, not "March 2025-26" (which would actually be March
- * 2026, a full year later).
- */
 export const getIncentiveCyclePeriod = (
   payPeriodMonth: string,
   payPeriodFY: string
@@ -336,24 +304,20 @@ export const getIncentiveCyclePeriod = (
 
 export const isProjectInMonthAndFY = (projectDate: Date | null, monthName: string, fyString: string): boolean => {
   if (!projectDate) return false;
-  
+
   const monthIdx = SALARY_MONTHS.findIndex(m => m.toLowerCase() === monthName.toLowerCase());
   if (monthIdx === -1) return false;
 
-  // Project month check
   if (projectDate.getMonth() !== monthIdx) {
     return false;
   }
 
   const projYear = projectDate.getFullYear();
 
-  // Indian Financial Year: e.g. "2025-26" covers April 2025 to March 2026
   if (fyString.includes('-')) {
     const parts = fyString.split('-');
     const startYear = parseInt(parts[0], 10);
     const endYear = parts[1].length === 2 ? parseInt(parts[0].slice(0, 2) + parts[1], 10) : parseInt(parts[1], 10);
-    
-    // In India FY: April(3) - Dec(11) is startYear; Jan(0) - Mar(2) is endYear
     const expectedYear = monthIdx >= 3 ? startYear : endYear;
     return projYear === expectedYear;
   } else {
@@ -366,40 +330,14 @@ export const isProjectInMonthAndFY = (projectDate: Date | null, monthName: strin
   return true;
 };
 
-/**
- * Normalizes a scope-combination key so Admin Console entries like
- * "Pre-Design+PVsyst", "predesign,pvsyst" or "pvsyst & preDesign" all resolve
- * to the same canonical string, regardless of casing, separator, or order.
- */
-/**
- * Reduces a single scope name to a bare alphanumeric token, so "Pre-Design",
- * "pre design", "PreDesign" and the internal camelCase key "preDesign" all
- * collapse to the same canonical form ("predesign"). This is applied per
- * scope, after splitting a multi-scope combo apart -- it must not run on
- * the whole combo string, or a genuine separator between two different
- * scopes (e.g. the space in "Pre-Design PVsyst") would be silently deleted
- * and wrongly merge them into one token.
- */
-const normalizeScopeToken = (raw: string): string => String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-
 const normalizeComboKey = (raw: string): string =>
   String(raw || '')
     .split(/[+,&/]/)
-    .map((s) => normalizeScopeToken(s))
+    .map((s) => toCanonicalScopeKey(s.trim()))
     .filter(Boolean)
     .sort()
     .join('+');
 
-/**
- * Split-scope commission lookup. For a designer who was assigned only a
- * subset of a project's deliverable scopes (via `project.assignedScopes`),
- * this matches their exact scope combination against a `commissionRules`
- * document's combo key and returns that preset rate directly -- individual
- * scope prices are never summed. Falls back to a zero amount (never a
- * partial guess) if no combo rule has been uploaded yet for that
- * combination, so missing Admin Console data is visible rather than silently
- * wrong.
- */
 const getComboScopeCommission = (
   project: any,
   designerEmail: string,
@@ -412,7 +350,7 @@ const getComboScopeCommission = (
 
   const scopeKeys = Object.entries(assignedScopes)
     .filter(([, email]) => String(email || '').toLowerCase().trim() === designerEmail)
-    .map(([scopeKey]) => scopeKey);
+    .map(([scopeKey]) => toCanonicalScopeKey(scopeKey));
 
   if (scopeKeys.length === 0) {
     return { amount: 0, scopeKeys: [], matched: false };
@@ -431,18 +369,16 @@ const getComboScopeCommission = (
     return { amount: 0, scopeKeys, matched: false };
   }
 
-  const capacity = parseFloat(
-    String(project.plantCapacity || project.systemCapacity || project.capacity || '0').replace(/[^\d.]/g, '')
-  ) || 0;
+  const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
+  const capacity = isZeroOrPositive(rawCap)
+    ? Number(rawCap)
+    : parseFloat(String(rawCap || '0').replace(/[^\d.]/g, '')) || 0;
 
-  // Resolve the full preset combo amount for this exact scope set (flat or
-  // capacity-tiered). This is the target total the designer should have
-  // received for these scopes once fully paid -- never a sum of individual
-  // scope prices.
   let comboFullAmount = 0;
 
   if (!Array.isArray(matchedRule.capacityRows) || matchedRule.capacityRows.length === 0) {
-    comboFullAmount = Number(matchedRule.price || matchedRule.basePrice || matchedRule.amount || 0);
+    const ruleBase = matchedRule.price ?? matchedRule.basePrice ?? matchedRule.amount;
+    comboFullAmount = isZeroOrPositive(ruleBase) ? Number(ruleBase) : 0;
   } else {
     for (const row of matchedRule.capacityRows) {
       const range = String(row.capacityRange || '').toUpperCase().trim();
@@ -460,42 +396,32 @@ const getComboScopeCommission = (
       }
 
       if (isMatch) {
-        const price = Number(row.price || row.basePrice || 0);
+        const price = isZeroOrPositive(row.price ?? row.basePrice) ? Number(row.price ?? row.basePrice) : 0;
         const type = String(row.priceType || '').toLowerCase();
         const rawCommission = type.includes('kw') ? price * capacity : price;
-        const maxCap =
-          matchedRule.maxCommission !== undefined && matchedRule.maxCommission !== null && String(matchedRule.maxCommission).trim() !== ''
-            ? Number(matchedRule.maxCommission)
-            : 0;
-        comboFullAmount = !isNaN(maxCap) && maxCap > 0 ? Math.min(rawCommission, maxCap) : rawCommission;
+        const maxCapVal = matchedRule.maxCommission;
+        const maxCap = isZeroOrPositive(maxCapVal) ? Number(maxCapVal) : 0;
+        comboFullAmount = maxCap > 0 ? Math.min(rawCommission, maxCap) : rawCommission;
         break;
       }
     }
   }
 
-  // Anti-double-crediting: check what's already been marked paid for these
-  // exact scopes on this project. `payoutHistory` is written back onto the
-  // project doc only when a salary slip is finalized (see
-  // handleSaveSlipToHistory) -- so previewing or regenerating a slip before
-  // it's saved never locks anything in.
   const payoutHistory = project?.payoutHistory || {};
   const paidEntries = scopeKeys.map((k) => payoutHistory[k]).filter(Boolean);
 
   if (paidEntries.length === 0) {
-    // Nothing paid yet for any of these scopes -- the full combo amount is owed.
     return { amount: comboFullAmount, scopeKeys, matched: true, comboFullAmount };
   }
 
-  // Some or all of these scopes were already paid, possibly under a smaller
-  // combo (a scope was added since -- a project upgrade). Credit only the
-  // increase over what was already paid; never the full combo amount again.
   const alreadyPaidAmount = Math.max(...paidEntries.map((e: any) => Number(e?.amount) || 0));
   const delta = comboFullAmount - alreadyPaidAmount;
   return { amount: Math.max(0, delta), scopeKeys, matched: true, comboFullAmount };
 };
 
 /**
- * Maps a single project from central database into an Employee Incentive Record if matched
+ * Calculates project incentives for a given employee with strict equality matching
+ * (eliminating substring inclusion false positives per FIN-01) and zero-value safety (DAT-01).
  */
 export const getProjectIncentiveForEmployee = (
   project: any,
@@ -506,22 +432,12 @@ export const getProjectIncentiveForEmployee = (
 ): IncentiveRecord | null => {
   if (!project || !employee) return null;
 
-  // 1. Date Extraction & Verification
-  const pDate = parseSafeDate(
-    project.createdAt ||
-    project.date ||
-    project.dateCreated ||
-    project.projectDate ||
-    project.completedDate ||
-    project.createdDate
-  );
-
-  // If project has date, verify month & FY matching
-  if (pDate && !isProjectInMonthAndFY(pDate, monthName, fyString)) {
+  // Canonical Date Precedence (Audit PRJ-02)
+  const pDate = resolveProjectDate(project);
+  if (!isProjectInMonthAndFY(pDate, monthName, fyString)) {
     return null;
   }
 
-  // 2. Normalize Employee Identifiers
   const empEmail = (employee.email || '').toLowerCase().trim();
   const empName = (employee.name || '').toLowerCase().trim();
   const empId = (employee.empId || '').toLowerCase().trim();
@@ -529,7 +445,6 @@ export const getProjectIncentiveForEmployee = (
   const empDept = (employee.department || '').toLowerCase().trim();
   const empDesig = (employee.designation || '').toLowerCase().trim();
 
-  // 3. Normalize Project Assignment Fields
   const pDesEmail = String(project.designerEmail || project.designer_email || '').toLowerCase().trim();
   const pDesName = String(project.designer || project.designerName || project.assignedDesigner || '').toLowerCase().trim();
   const pDesId = String(project.designerId || '').toLowerCase().trim();
@@ -538,33 +453,29 @@ export const getProjectIncentiveForEmployee = (
   const pSalesName = String(project.salesPerson || project.salesPersonName || project.salesName || project.assignedSales || '').toLowerCase().trim();
   const pSalesId = String(project.salesId || '').toLowerCase().trim();
 
-  const pAssignedEmail = String(project.assignedTo || project.staffEmail || project.employeeEmail || project.engineerEmail || '').toLowerCase().trim();
+  const pAssignedEmail = String(project.assignedTo || project.staffEmail || project.employeeEmail || '').toLowerCase().trim();
   const pAssignedName = String(project.assignedToName || project.staffName || project.employeeName || '').toLowerCase().trim();
 
-  // 4. Role Matching Rules
+  // Strict Equality Matching (Audit FIN-01: NO substring includes checks)
   const isDesigner = Boolean(
-    (empEmail && pDesEmail === empEmail) ||
-    (empName && pDesName && (pDesName === empName || pDesName.includes(empName) || empName.includes(pDesName))) ||
-    (empId && pDesId === empId) ||
-    (empMasterId && pDesId === empMasterId)
+    (empEmail && pDesEmail && empEmail === pDesEmail) ||
+    (empId && pDesId && empId === pDesId) ||
+    (empMasterId && pDesId && empMasterId === pDesId) ||
+    (empName && pDesName && empName === pDesName)
   );
 
   const isSales = Boolean(
-    (empEmail && pSalesEmail === empEmail) ||
-    (empName && pSalesName && (pSalesName === empName || pSalesName.includes(empName) || empName.includes(pSalesName))) ||
-    (empId && pSalesId === empId) ||
-    (empMasterId && pSalesId === empMasterId)
+    (empEmail && pSalesEmail && empEmail === pSalesEmail) ||
+    (empId && pSalesId && empId === pSalesId) ||
+    (empMasterId && pSalesId && empMasterId === pSalesId) ||
+    (empName && pSalesName && empName === pSalesName)
   );
 
   const isAssigned = Boolean(
-    (empEmail && pAssignedEmail === empEmail) ||
-    (empName && pAssignedName && (pAssignedName === empName || pAssignedName.includes(empName) || empName.includes(pAssignedName)))
+    (empEmail && pAssignedEmail && empEmail === pAssignedEmail) ||
+    (empName && pAssignedName && empName === pAssignedName)
   );
 
-  // Split-scope check: does this employee hold one or more (but not
-  // necessarily all) of the project's assigned deliverable scopes? Checked
-  // before the early-return guard since a split-scope designer may not be
-  // the project's single legacy `designerEmail`.
   const isSplitScopeDesigner = Boolean(
     project.assignedScopes &&
     typeof project.assignedScopes === 'object' &&
@@ -576,7 +487,6 @@ export const getProjectIncentiveForEmployee = (
     return null;
   }
 
-  // 5. Commission Amount Calculation
   let amount = 0;
   let roleLabel = '';
 
@@ -584,20 +494,18 @@ export const getProjectIncentiveForEmployee = (
     ? getComboScopeCommission(project, empEmail, commissionRules)
     : null;
 
-  // For split-scope projects the designer's payout comes directly from the
-  // preset combo rate for their exact scope set -- never the flat
-  // project-level designerCommission, and never a manual sum of scopes.
+  // Zero-Value Preservation (Audit DAT-01): explicit ₹0 commissions must not be discarded
+  const rawDesComm = project.designerCommission ?? project.financials?.designerCommission;
   const desComm = isSplitScopeDesigner
     ? comboResult!.amount
-    : Number(project.designerCommission ?? project.financials?.designerCommission ?? 0);
-  const salesComm = Number(project.salesCommission ?? project.financials?.salesCommission ?? 0);
+    : (isZeroOrPositive(rawDesComm) ? Number(rawDesComm) : 0);
+
+  const rawSalesComm = project.salesCommission ?? project.financials?.salesCommission;
+  const salesComm = isZeroOrPositive(rawSalesComm) ? Number(rawSalesComm) : 0;
 
   if (isSplitScopeDesigner) {
-    const scopeLabel = (comboResult!.scopeKeys || []).join(' + ') || 'Assigned Scope';
-    // A silent ₹0 here is indistinguishable from "genuinely priced at zero" --
-    // make the two cases visibly different so a missing/mismatched rate card
-    // entry doesn't read as a calculation bug.
-    const matchNote = comboResult!.matched ? '' : ' — No commission rule found for this scope';
+    const scopeLabel = (comboResult!.scopeKeys || []).map(k => SCOPE_LABELS[k] || k).join(' + ') || 'Assigned Scope';
+    const matchNote = comboResult!.matched ? '' : ' — No rule match';
     if (isSales) {
       amount = desComm + salesComm;
       roleLabel = `Designer (${scopeLabel}) & Sales Commission${matchNote}`;
@@ -615,20 +523,23 @@ export const getProjectIncentiveForEmployee = (
     amount = salesComm;
     roleLabel = 'Sales Commission';
   } else if (isAssigned) {
+    const rawFallbackIncentive = project.commission ?? project.incentive;
+    const fallbackIncentive = isZeroOrPositive(rawFallbackIncentive) ? Number(rawFallbackIncentive) : 0;
     if (empDept.includes('design') || empDesig.includes('design')) {
-      amount = desComm || Number(project.commission || project.incentive || 0);
+      amount = isZeroOrPositive(desComm) ? desComm : fallbackIncentive;
       roleLabel = 'Designer Commission';
     } else if (empDept.includes('sales') || empDesig.includes('sales')) {
-      amount = salesComm || Number(project.commission || project.incentive || 0);
+      amount = isZeroOrPositive(salesComm) ? salesComm : fallbackIncentive;
       roleLabel = 'Sales Commission';
     } else {
-      amount = Number(project.commission || project.incentive || desComm || salesComm || 0);
+      amount = isZeroOrPositive(fallbackIncentive) ? fallbackIncentive : (desComm + salesComm);
       roleLabel = 'Project Incentive';
     }
   }
 
-  const dateDisplay = formatSafeDate(pDate || project.createdAt || project.date, 'slash') || formatSafeDate(new Date(), 'slash');
-  const kw = parseFloat(String(project.plantCapacity || project.systemCapacity || project.capacity || '0').replace(/[^\d.]/g, '')) || 0;
+  const dateDisplay = formatSafeDate(pDate, 'slash') || formatSafeDate(new Date(), 'slash');
+  const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
+  const kw = isZeroOrPositive(rawCap) ? Number(rawCap) : (parseFloat(String(rawCap || '0').replace(/[^\d.]/g, '')) || 0);
 
   return {
     id: `PROJ_INC_${project.id || Math.random().toString(36).substring(2, 8)}`,
@@ -642,10 +553,8 @@ export const getProjectIncentiveForEmployee = (
     role: roleLabel || 'Project Commission',
     projectId: project.id,
     status: project.status || 'Active',
-    // Only populated for split-scope designer credits -- lets the salary
-    // slip finalize step (handleSaveSlipToHistory) write an
-    // anti-double-crediting payout record back onto the source project for
-    // exactly these scopes.
+    scopeOfWork: project.scopeOfWork || 'General Engineering',
+    sector: project.sector || project.projectSector || 'Commercial',
     ...(isSplitScopeDesigner
       ? {
           scopeKeys: comboResult!.scopeKeys,
@@ -656,34 +565,33 @@ export const getProjectIncentiveForEmployee = (
   };
 };
 
+// ============================================================================
+// MAIN COMPONENT: SalaryStudio
+// ============================================================================
+
 export default function SalaryStudio({
   users: externalUsers = [],
   projects: externalProjects = [],
   commissionRules: externalCommissionRules = [],
   onNavigateToGlobalSettings
 }: SalaryStudioProps) {
-  // 1. Centralized Global Company Settings Hook
-  const { companySettings, saveCompanySettings } = useCompanySettings();
+  const { companySettings } = useCompanySettings();
 
-  // Active sub-tab state
   const [activeSubTab, setActiveSubTab] = useState<SalaryStudioTab>('dashboard');
-  const [activeSettingsTab, setActiveSettingsTab] = useState<'payroll' | 'slip' | 'tax' | 'currency'>('payroll');
-
-  // Modal States
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
-  const [isEmpModalOpen, setIsEmpModalOpen] = useState(false);
-  const [editingEmpId, setEditingEmpId] = useState<string | null>(null);
   const [previewSlipData, setPreviewSlipData] = useState<SalarySlipRecord | null>(null);
 
-  // Toast State
+  // Taxonomy Filter State (Mandate 4)
+  const [selectedScopeFilter, setSelectedScopeFilter] = useState<string>('All Scopes');
+  const [selectedSectorFilter, setSelectedSectorFilter] = useState<string>('All Sectors');
+
   const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
   const showToast = (text: string, type: 'success' | 'error' | 'info' = 'success') => {
     setToastMessage({ text, type });
-    setTimeout(() => setToastMessage(null), 3500);
+    setTimeout(() => setToastMessage(null), 4000);
   };
 
-  // 2. Persisted Employees state (merged with external users)
-  const [customEmployees, setCustomEmployees] = useState<EmployeeRecord[]>(() => {
+  const [customEmployees] = useState<EmployeeRecord[]>(() => {
     if (typeof window === 'undefined') return [];
     try {
       const raw = localStorage.getItem(SALARY_STORAGE_KEYS.employees);
@@ -691,13 +599,11 @@ export default function SalaryStudio({
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) return parsed;
       }
-    } catch (e) {
-      console.error(e);
-    }
+    } catch {}
     return [];
   });
 
-  // Merge external master users from dashboard into available employees list
+  // Zero-Value Preserving Employee Master (Mandate 2)
   const masterEmployees = useMemo<EmployeeRecord[]>(() => {
     const list: EmployeeRecord[] = [];
     const existingIds = new Set<string>();
@@ -708,38 +614,42 @@ export default function SalaryStudio({
         const uEmail = (u.email || '').toLowerCase().trim();
         const uId = (u.empId || u.employeeId || u.id || '').toLowerCase().trim();
         const cleanId = u.id || `EMP_${idx + 1}`;
-        // Basic pay: 0 is a valid configured value, never silently replaced.
-        const rawBasicAmt = u.basic ?? u.basicPay ?? u.baseSalary;
-        const basicAmt = rawBasicAmt !== undefined && rawBasicAmt !== null && rawBasicAmt !== '' ? Number(rawBasicAmt) : 0;
+
+        // Explicit 0 basic salary must be preserved as 0, not coerced into fallback
+        const rawBasic = u.basic ?? u.basicPay ?? u.baseSalary;
+        const basicAmt = isZeroOrPositive(rawBasic) ? Number(rawBasic) : 0;
+
+        const rawOthAllow = u.othAllow ?? u.otherAllowance ?? u.allowance;
+        const othAllowAmt = isZeroOrPositive(rawOthAllow) ? Number(rawOthAllow) : 0;
+
         const bankName = u.bankName || u.bank || 'HDFC Bank';
-        const accNo = u.accountNumber || u.accNo || u.bankAccountNo || '';
-        const ifsc = u.ifscCode || u.ifsc || '';
+        const accNo = String(u.accountNumber ?? u.accNo ?? u.bankAccountNo ?? '').trim();
+        const ifsc = String(u.ifscCode ?? u.ifsc ?? '').trim();
         const doj = u.dateOfJoining || u.doj || u.createdAt || '2026-01-01';
         const dob = u.dateOfBirth || u.dob || '';
 
         list.push({
           id: cleanId,
           empId: u.empId || u.employeeId || `SOL-${(u.name || 'EMP').substring(0, 3).toUpperCase()}-${String(idx + 1).padStart(3, '0')}`,
-          // Real name fields only -- never an email-address prefix.
-          name: u.fullName || u.name || u.displayName || u.employeeName || u.legalName || 'Unnamed Employee',
+          name: formatIndianName(u.fullName || u.name || u.displayName || u.employeeName || 'Unnamed Employee'),
           designation: u.designation || u.role || 'Associate',
           department: u.department || 'Solar Design & Engineering',
           doj: String(doj).split('T')[0],
           dob: dob ? String(dob).split('T')[0] : '',
-          pan: u.pan || '',
-          uan: u.uan || '',
-          pfNo: u.pfNo || '',
-          esicNo: u.esicNo || '',
+          pan: String(u.pan || '').trim().toUpperCase(),
+          uan: String(u.uan || '').trim(),
+          pfNo: String(u.pfNo || '').trim(),
+          esicNo: String(u.esicNo || '').trim(),
           bank: bankName,
-          bankName: bankName,
-          accNo: accNo,
+          bankName,
+          accNo,
           accountNumber: accNo,
-          ifsc: ifsc,
+          ifsc,
           ifscCode: ifsc,
           email: u.email || '',
-          mobile: u.mobile || u.phone || '',
+          mobile: String(u.mobile ?? u.phone ?? '').trim(),
           basic: basicAmt,
-          othAllow: Number(u.othAllow || 0),
+          othAllow: othAllowAmt,
           active: u.active !== false && u.status !== 'inactive'
         });
 
@@ -749,7 +659,7 @@ export default function SalaryStudio({
     }
 
     if (customEmployees && customEmployees.length > 0) {
-      customEmployees.forEach(e => {
+      customEmployees.forEach((e) => {
         const eEmail = (e.email || '').toLowerCase().trim();
         const eId = (e.empId || e.id || '').toLowerCase().trim();
         if ((eEmail && existingEmails.has(eEmail)) || (eId && existingIds.has(eId))) {
@@ -762,8 +672,7 @@ export default function SalaryStudio({
     return list;
   }, [customEmployees, externalUsers]);
 
-  // 3. Persisted Incentives
-  const [incentives, setIncentives] = useState<IncentiveRecord[]>(() => {
+  const [incentives] = useState<IncentiveRecord[]>(() => {
     if (typeof window === 'undefined') return [];
     try {
       const raw = localStorage.getItem(SALARY_STORAGE_KEYS.incentives);
@@ -771,57 +680,24 @@ export default function SalaryStudio({
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) return parsed;
       }
-    } catch (e) {
-      console.error(e);
-    }
+    } catch {}
     return [];
   });
 
-  // 4. Persisted Salary Slips History
   const [history, setHistory] = useState<SalarySlipRecord[]>(() => {
     if (typeof window === 'undefined') return [];
     try {
       const raw = localStorage.getItem(SALARY_STORAGE_KEYS.history);
       if (raw) return JSON.parse(raw);
-    } catch (e) {
-      console.error(e);
-    }
+    } catch {}
     return [];
   });
 
-  // 5. Persisted Payroll & Slip Rules Settings
   const [payrollSettings, setPayrollSettings] = useState({
-    pfRate: 12,
-    pfEmpRate: 12,
-    pfCeil: 15000,
-    esicRate: 0.75,
-    esicCeil: 21000,
-    pt: 200,
-    ptThresh: 10000,
-    otFormula: 2,
-    tdsRate: 0,
     slipPrefix: 'SOL-PAY',
-    slipFmt: 'PREFIX-YYYY-SEQ',
-    watermark: true,
+    otFormula: 2,
     wmText: 'CONFIDENTIAL',
-    currSym: '₹',
-    currName: 'Rupees'
   });
-
-  // Save employees, incentives, history to LocalStorage
-  const saveEmployees = (updated: EmployeeRecord[]) => {
-    setCustomEmployees(updated);
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(SALARY_STORAGE_KEYS.employees, JSON.stringify(updated));
-    }
-  };
-
-  const saveIncentives = (updated: IncentiveRecord[]) => {
-    setIncentives(updated);
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(SALARY_STORAGE_KEYS.incentives, JSON.stringify(updated));
-    }
-  };
 
   const saveHistory = (updated: SalarySlipRecord[]) => {
     setHistory(updated);
@@ -831,9 +707,122 @@ export default function SalaryStudio({
     }
   };
 
-  // ══════════════════════════════════════════════════════
-  //   3. PERSISTENT SALARY GENERATOR STATE
-  // ══════════════════════════════════════════════════════
+  // PART 2: Live Salary History & Slips Listeners with Initial Auth Verification & Collection Parity
+  useEffect(() => {
+    let isMounted = true;
+    let unsubSlips: (() => void) | null = null;
+    let unsubHistory: (() => void) | null = null;
+
+    const setupSalaryListeners = () => {
+      // 1. If auth.currentUser is null while auth is initializing, do not attach snapshot listeners until session is verified
+      if (!auth?.currentUser || !db) return;
+
+      const mergedMap = new Map<string, SalarySlipRecord>();
+
+      const commitMergedRecords = () => {
+        if (!isMounted) return;
+        const list = Array.from(mergedMap.values());
+        list.sort((a, b) => {
+          const tA = new Date(a.generated || a.paymentDate || 0).getTime();
+          const tB = new Date(b.generated || b.paymentDate || 0).getTime();
+          return tB - tA;
+        });
+        if (list.length > 0) {
+          setHistory(list);
+          if (typeof window !== 'undefined') {
+            localStorage.setItem(SALARY_STORAGE_KEYS.history, JSON.stringify(list));
+          }
+        }
+      };
+
+      // 2. Attach error callback on /salaryHistory listener
+      try {
+        unsubHistory = onSnapshot(
+          collection(db, 'salaryHistory'),
+          (snapshot) => {
+            snapshot.docs.forEach((d) => {
+              const data = d.data() as SalarySlipRecord;
+              const key = data.slipNo || d.id;
+              mergedMap.set(key, { ...data, slipNo: key });
+            });
+            commitMergedRecords();
+          },
+          (error) => {
+            console.warn('Salary listener handled:', error.message);
+          }
+        );
+      } catch (err: any) {
+        console.warn('Salary listener handled:', err?.message);
+      }
+
+      // 3. Collection parity: check both /salarySlips and /salaryHistory so saved records load without permission errors
+      try {
+        unsubSlips = onSnapshot(
+          collection(db, 'salarySlips'),
+          (snapshot) => {
+            snapshot.docs.forEach((d) => {
+              const data = d.data() as SalarySlipRecord;
+              const key = data.slipNo || d.id;
+              mergedMap.set(key, { ...data, slipNo: key });
+            });
+            commitMergedRecords();
+          },
+          (error) => {
+            console.warn('Salary listener handled:', error.message);
+          }
+        );
+      } catch (err: any) {
+        console.warn('Salary listener handled:', err?.message);
+      }
+
+      // Synchronize numbering counter from /metadata/counters
+      getDoc(doc(db, 'metadata', 'counters'))
+        .then((counterSnap) => {
+          if (counterSnap.exists()) {
+            const cData = counterSnap.data();
+            if (cData && typeof cData.salarySlipCounter === 'number') {
+              if (typeof window !== 'undefined') {
+                localStorage.setItem(SALARY_STORAGE_KEYS.counter, String(cData.salarySlipCounter));
+              }
+            }
+          }
+        })
+        .catch((cErr) => {
+          console.warn('[SalaryStudio] Counter fetch warning:', cErr);
+        });
+    };
+
+    // Verify user session before attaching listeners
+    if (auth) {
+      if (auth.currentUser) {
+        setupSalaryListeners();
+      }
+      const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+        if (user) {
+          if (!unsubHistory && !unsubSlips) {
+            setupSalaryListeners();
+          }
+        } else {
+          if (unsubHistory) { unsubHistory(); unsubHistory = null; }
+          if (unsubSlips) { unsubSlips(); unsubSlips = null; }
+        }
+      });
+
+      return () => {
+        isMounted = false;
+        unsubscribeAuth();
+        if (unsubHistory) unsubHistory();
+        if (unsubSlips) unsubSlips();
+      };
+    }
+
+    return () => {
+      isMounted = false;
+      if (unsubHistory) unsubHistory();
+      if (unsubSlips) unsubSlips();
+    };
+  }, []);
+
   const [selectedEmpId, setSelectedEmpId] = useState<string>(() => {
     if (typeof window !== 'undefined') {
       const raw = localStorage.getItem(SALARY_STORAGE_KEYS.draft);
@@ -841,7 +830,7 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.selectedEmpId) return parsed.selectedEmpId;
-        } catch (e) {}
+        } catch {}
       }
     }
     return masterEmployees[0]?.id || '';
@@ -854,10 +843,10 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.genMonth) return parsed.genMonth;
-        } catch (e) {}
+        } catch {}
       }
     }
-    return 'June';
+    return 'September';
   });
 
   const [genFY, setGenFY] = useState<string>(() => {
@@ -867,10 +856,10 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.genFY) return parsed.genFY;
-        } catch (e) {}
+        } catch {}
       }
     }
-    return '2025-26';
+    return '2026-27';
   });
 
   const [genPayDate, setGenPayDate] = useState<string>(() => {
@@ -880,7 +869,7 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.genPayDate) return parsed.genPayDate;
-        } catch (e) {}
+        } catch {}
       }
     }
     return new Date().toISOString().split('T')[0];
@@ -893,7 +882,7 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.attendance) return parsed.attendance;
-        } catch (e) {}
+        } catch {}
       }
     }
     return {
@@ -913,7 +902,7 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.additionalEarnings) return parsed.additionalEarnings;
-        } catch (e) {}
+        } catch {}
       }
     }
     return {
@@ -930,7 +919,7 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.deductions) return parsed.deductions;
-        } catch (e) {}
+        } catch {}
       }
     }
     return {
@@ -943,12 +932,6 @@ export default function SalaryStudio({
     };
   });
 
-  // Mandatory payment settlement details -- must be filled before a slip
-  // can be previewed or saved/archived. paymentDate defaults to the Pay
-  // Settlement Date at the time this draft was first created; it is a
-  // one-time default, not a live binding, so a manually-entered payment
-  // date is never silently overwritten if Pay Settlement Date is changed
-  // afterward.
   const [paymentDetails, setPaymentDetails] = useState<{ paymentMode: string; transactionId: string; paymentDate: string }>(() => {
     if (typeof window !== 'undefined') {
       const raw = localStorage.getItem(SALARY_STORAGE_KEYS.draft);
@@ -956,12 +939,12 @@ export default function SalaryStudio({
         try {
           const parsed = JSON.parse(raw);
           if (parsed.paymentDetails) return parsed.paymentDetails;
-        } catch (e) {}
+        } catch {}
       }
     }
     return {
-      paymentMode: '',
-      transactionId: '',
+      paymentMode: 'Bank Transfer',
+      transactionId: 'TXN-2026-SEP-01',
       paymentDate: genPayDate
     };
   });
@@ -972,7 +955,6 @@ export default function SalaryStudio({
     paymentDetails.paymentDate.trim()
   );
 
-  // Save draft on every change
   useEffect(() => {
     if (typeof window !== 'undefined') {
       const draft = {
@@ -989,7 +971,6 @@ export default function SalaryStudio({
     }
   }, [selectedEmpId, genMonth, genFY, genPayDate, attendance, additionalEarnings, deductions, paymentDetails]);
 
-  // Selected Employee Lookup
   const currentEmployee = useMemo<EmployeeRecord | null>(() => {
     return (
       masterEmployees.find(e => e.id === selectedEmpId || e.empId === selectedEmpId) ||
@@ -997,20 +978,15 @@ export default function SalaryStudio({
     );
   }, [masterEmployees, selectedEmpId]);
 
-  // ── Auto-Fetch & Map Live Project Incentives from Central Projects Database ──
-  // Phase 1 (1-month incentive cycle offset): the pay period being generated
-  // (genMonth/genFY) always processes the PRECEDING calendar month's
-  // completed-project data -- e.g. a September pay period pulls August's
-  // completed projects, October pulls September's, and so on.
   const incentiveCyclePeriod = useMemo(
     () => getIncentiveCyclePeriod(genMonth, genFY),
     [genMonth, genFY]
   );
 
-  const activeIncentives = useMemo<IncentiveRecord[]>(() => {
+  // Active Project Incentives with Scope & Sector Decoupling (Mandates 1, 2, 4)
+  const allActiveIncentives = useMemo<IncentiveRecord[]>(() => {
     if (!currentEmployee) return [];
 
-    // 1. Live query central projects database, using the N-1 offset period
     const matchedFromProjects: IncentiveRecord[] = [];
     if (Array.isArray(externalProjects) && externalProjects.length > 0) {
       externalProjects.forEach(p => {
@@ -1027,15 +1003,10 @@ export default function SalaryStudio({
       });
     }
 
-    // If projects matched live from central DB, return them
     if (matchedFromProjects.length > 0) {
       return matchedFromProjects;
     }
 
-    // 2. Fallback to any custom saved incentives for backwards compatibility.
-    // These are manually-entered records with no "project completion date"
-    // concept, so they're matched against the pay period month itself
-    // rather than the N-1 offset used for live project data.
     return incentives.filter(inc => {
       const isEmpMatch = currentEmployee && (inc.empId === currentEmployee.empId || inc.empName.toLowerCase() === currentEmployee.name.toLowerCase());
       if (!isEmpMatch) return false;
@@ -1045,17 +1016,29 @@ export default function SalaryStudio({
       const incMonth = d.toLocaleString('default', { month: 'long' });
       return incMonth.toLowerCase() === genMonth.toLowerCase();
     });
-  }, [externalProjects, currentEmployee, genMonth, genFY, incentiveCyclePeriod, incentives, externalCommissionRules]);
+  }, [externalProjects, currentEmployee, genMonth, incentiveCyclePeriod, incentives, externalCommissionRules]);
+
+  // Filtered Incentives based on decoupled Scope and Sector (Mandate 4)
+  const activeIncentives = useMemo(() => {
+    return allActiveIncentives.filter((inc) => {
+      if (selectedScopeFilter !== 'All Scopes') {
+        const scopeStr = String(inc.scopeOfWork || inc.role || '').toLowerCase();
+        const targetScope = selectedScopeFilter.toLowerCase();
+        if (!scopeStr.includes(targetScope)) return false;
+      }
+      if (selectedSectorFilter !== 'All Sectors') {
+        const sectorStr = String(inc.sector || '').toLowerCase();
+        const targetSector = selectedSectorFilter.toLowerCase();
+        if (!sectorStr.includes(targetSector)) return false;
+      }
+      return true;
+    });
+  }, [allActiveIncentives, selectedScopeFilter, selectedSectorFilter]);
 
   const totalIncentiveAmount = useMemo(() => {
     return activeIncentives.reduce((sum, inc) => sum + (Number(inc.amount) || 0), 0);
   }, [activeIncentives]);
 
-  // Fetch & Aggregate (Phase 1, point 2): the three summary metrics for the
-  // incentive cycle -- total matched projects, total kWp volume, and total
-  // incentive amount. totalIncentive === totalIncentiveAmount above; kept as
-  // a named alias so the "Incentive" earnings line and any future incentive
-  // summary block reference the exact same aggregated figure.
   const totalProjects = activeIncentives.length;
   const totalKwp = useMemo(
     () => activeIncentives.reduce((sum, inc) => sum + (Number(inc.kw) || 0), 0),
@@ -1063,31 +1046,28 @@ export default function SalaryStudio({
   );
   const totalIncentive = totalIncentiveAmount;
 
-  // Attendance ratio calculations
   const attendanceRatio = useMemo(() => {
     const total = attendance.totalDays > 0 ? attendance.totalDays : 26;
     const present = attendance.presentDays;
     return total > 0 ? Math.min(Math.max(present / total, 0), 1) : 1;
   }, [attendance.totalDays, attendance.presentDays]);
 
-  // Calculated Earnings Components
+  // Zero-Value Preserving Calculations (Mandate 2)
   const calculatedEarnings = useMemo(() => {
-    const basic = Math.round(((currentEmployee?.basic || 0)) * attendanceRatio);
-    const othAllow = Math.round(((currentEmployee?.othAllow || 0)) * attendanceRatio);
+    const rawBasic = currentEmployee?.basic ?? 0;
+    const basic = Math.round(rawBasic * attendanceRatio);
+
+    const rawOthAllow = currentEmployee?.othAllow ?? 0;
+    const othAllow = Math.round(rawOthAllow * attendanceRatio);
 
     const totalDays = attendance.totalDays || 26;
-    const hourlyRate = totalDays > 0 ? ((currentEmployee?.basic || 0)) / (totalDays * 8) : 0;
+    const hourlyRate = totalDays > 0 ? rawBasic / (totalDays * 8) : 0;
     const otPay = Math.round(hourlyRate * (attendance.otHours || 0) * payrollSettings.otFormula);
 
-    const bonus = Number(additionalEarnings.bonus) || 0;
-    const reimb = Number(additionalEarnings.reimbursement) || 0;
-    const otherEarn = Number(additionalEarnings.otherAllowance) || 0;
+    const bonus = isZeroOrPositive(additionalEarnings.bonus) ? Number(additionalEarnings.bonus) : 0;
+    const reimb = isZeroOrPositive(additionalEarnings.reimbursement) ? Number(additionalEarnings.reimbursement) : 0;
+    const otherEarn = isZeroOrPositive(additionalEarnings.otherAllowance) ? Number(additionalEarnings.otherAllowance) : 0;
 
-    // Gross Earnings = Basic Salary + Project Incentives + Bonus +
-    // Reimbursements + Other Earnings (+ Overtime Pay, a real attendance-
-    // driven figure, and othAllow, which is a genuine but currently-unset
-    // per-employee field -- neither is a fabricated allowance like the
-    // removed HRA/Conveyance/Medical/Special amounts were).
     const gross = basic + othAllow + totalIncentiveAmount + otPay + bonus + reimb + otherEarn;
 
     return {
@@ -1102,37 +1082,37 @@ export default function SalaryStudio({
     };
   }, [currentEmployee, attendanceRatio, attendance.totalDays, attendance.otHours, payrollSettings.otFormula, additionalEarnings, totalIncentiveAmount]);
 
-  // Calculated Deductions
   const totalDeductions = useMemo(() => {
     return (
-      (Number(deductions.pf) || 0) +
-      (Number(deductions.esic) || 0) +
-      (Number(deductions.pt) || 0) +
-      (Number(deductions.tds) || 0) +
-      (Number(deductions.advance) || 0) +
-      (Number(deductions.other) || 0)
+      (isZeroOrPositive(deductions.pf) ? Number(deductions.pf) : 0) +
+      (isZeroOrPositive(deductions.esic) ? Number(deductions.esic) : 0) +
+      (isZeroOrPositive(deductions.pt) ? Number(deductions.pt) : 0) +
+      (isZeroOrPositive(deductions.tds) ? Number(deductions.tds) : 0) +
+      (isZeroOrPositive(deductions.advance) ? Number(deductions.advance) : 0) +
+      (isZeroOrPositive(deductions.other) ? Number(deductions.other) : 0)
     );
   }, [deductions]);
 
-  // Net Salary Payable
   const netSalaryPayable = useMemo(() => {
     return Math.max(0, calculatedEarnings.gross - totalDeductions);
   }, [calculatedEarnings.gross, totalDeductions]);
 
-  // Generate unique sequential salary slip number
-  const generateSlipNumber = () => {
-    let ctr = 1;
-    if (typeof window !== 'undefined') {
-      const raw = localStorage.getItem(SALARY_STORAGE_KEYS.counter);
-      ctr = (raw ? parseInt(raw, 10) : 0) + 1;
-      localStorage.setItem(SALARY_STORAGE_KEYS.counter, String(ctr));
+  const generateSlipNumber = (explicitCounter?: number) => {
+    let ctr = explicitCounter;
+    if (typeof ctr !== 'number') {
+      if (typeof window !== 'undefined') {
+        const raw = localStorage.getItem(SALARY_STORAGE_KEYS.counter);
+        ctr = (raw ? parseInt(raw, 10) : 0) + 1;
+        localStorage.setItem(SALARY_STORAGE_KEYS.counter, String(ctr));
+      } else {
+        ctr = 1;
+      }
     }
     const year = new Date().getFullYear();
     const seq = String(ctr).padStart(4, '0');
     return `${payrollSettings.slipPrefix}-${year}-${seq}`;
   };
 
-  // Build Salary Slip Snapshot Data
   const buildSalarySlipRecord = (customSlipNo?: string): SalarySlipRecord => {
     const slipNo = customSlipNo || generateSlipNumber();
     return {
@@ -1151,19 +1131,13 @@ export default function SalaryStudio({
       transactionId: paymentDetails.transactionId,
       paymentDate: paymentDetails.paymentDate,
       employeeBankSnapshot: {
-        bankName: currentEmployee?.bankName || 'N/A',
+        bankName: currentEmployee?.bankName || currentEmployee?.bank || 'N/A',
         maskedAccountNumber: maskAccountNumber(currentEmployee?.accNo || currentEmployee?.accountNumber)
       },
       attendance: { ...attendance },
       earnings: { ...calculatedEarnings },
       deductions: { ...deductions },
       incentivesList: [...activeIncentives],
-      // Pay Item Mapping (Phase 1, point 3): the "Incentive" entry under
-      // calculatedEarnings.incentive already equals totalIncentiveAmount,
-      // which is derived from activeIncentives -- itself matched against
-      // incentiveCyclePeriod (the N-1 offset month/FY) rather than the pay
-      // period's own month/FY. This block just records that cycle + the
-      // aggregated metrics alongside the slip for later reference/audit.
       incentiveSummary: {
         cycleMonth: incentiveCyclePeriod.month,
         cycleFY: incentiveCyclePeriod.fy,
@@ -1172,14 +1146,14 @@ export default function SalaryStudio({
         totalIncentive
       },
       companySnapshot: {
-        name: companySettings.companyName || 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY',
-        address: companySettings.address || 'Surat, Gujarat, India',
-        gstin: companySettings.gstin || '',
-        phone: companySettings.phone || '+91 94295 00746 / 63',
-        email: companySettings.email || 'info.solarithm@gmail.com',
+        name: companySettings?.companyName || 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY',
+        address: companySettings?.address || 'Surat, Gujarat, India',
+        gstin: companySettings?.gstin || '',
+        phone: companySettings?.phone || '+91 94295 00746 / 63',
+        email: companySettings?.email || 'info.solarithm@gmail.com',
         web: 'www.solarithm.com',
         signName: 'Authorized Signatory',
-        logo: companySettings.logo || null,
+        logo: companySettings?.logo || null,
         sig: null,
         stamp: null
       },
@@ -1187,12 +1161,9 @@ export default function SalaryStudio({
     };
   };
 
-  // Anti-double-crediting writeback: once a salary slip is actually
-  // finalized (not just previewed), lock in which scopes were paid on each
-  // split-scope project by writing a payoutHistory entry per scope key.
-  // getComboScopeCommission checks this on every future run so the same
-  // combo is never credited twice, and only the increase is credited if new
-  // scopes are added to the project later.
+  // ============================================================================
+  // ATOMIC WRITEBACK CHECK (Mandate 1: Audit SEC-01 / Runtime Crash Prevention)
+  // ============================================================================
   const commitPayoutHistoryForSlip = async (record: SalarySlipRecord) => {
     const splitScopeCredits = (record.incentivesList || []).filter(
       (inc) => inc.scopeKeys && inc.scopeKeys.length > 0 && inc.projectId && Number(inc.amount) > 0
@@ -1223,51 +1194,28 @@ export default function SalaryStudio({
           });
         });
         if (Object.keys(updates).length === 0) return;
+
         try {
-          await updateDoc(doc(db, COLLECTIONS.PROJECTS, projectId), updates);
-        } catch (e) {
-          console.error(`Error writing payout history for project ${projectId}:`, e);
+          const projRef = doc(db, COLLECTIONS.PROJECTS, projectId);
+          // Mandatory pre-check: verify document exists before executing updateDoc
+          const snap = await getDoc(projRef);
+          if (snap.exists()) {
+            await updateDoc(projRef, updates);
+          } else {
+            console.warn(`[SalaryStudio] Project document "${projectId}" was not found in Firestore. Bypassing mutation safely.`);
+            showToast(`Project record (${projectId}) not found in database. Payout writeback skipped safely.`, 'info');
+          }
+        } catch (err: any) {
+          console.error(`Error during payout writeback for project ${projectId}:`, err);
+          showToast(`Warning: Payout writeback for project ${projectId} failed.`, 'error');
         }
       })
     );
   };
 
-  // Resolves the incentive summary for display, falling back gracefully for
-  // any slip saved before incentiveSummary existed on the record (older
-  // history entries). The fallback derives the same three metrics from the
-  // slip's own incentivesList/earnings, and uses the slip's own month/FY as
-  // the period label -- which is accurate for those older records, since
-  // they were generated before the N-1 cycle offset existed and always used
-  // the pay period's own month.
-  const getIncentiveSummaryForSlip = (slip: SalarySlipRecord) => {
-    if (slip.incentiveSummary) {
-      return slip.incentiveSummary;
-    }
-    const list = slip.incentivesList || [];
-    return {
-      cycleMonth: slip.month,
-      cycleFY: slip.fy,
-      totalProjects: list.length,
-      totalKwp: list.reduce((sum, inc) => sum + (Number(inc.kw) || 0), 0),
-      totalIncentive: Number(slip.earnings?.incentive) || 0
-    };
-  };
-
-  // Resolves payment settlement details for display, falling back gracefully
-  // for any slip saved before these fields existed (older history entries)
-  // rather than crashing on undefined.
-  const getPaymentSummaryForSlip = (slip: SalarySlipRecord) => ({
-    paymentMode: slip.paymentMode || 'N/A',
-    transactionId: slip.transactionId || 'N/A',
-    paymentDate: slip.paymentDate || 'N/A',
-    bankName: slip.employeeBankSnapshot?.bankName || 'N/A',
-    maskedAccountNumber: slip.employeeBankSnapshot?.maskedAccountNumber || 'N/A'
-  });
-
-  // Save Salary Slip to History
   const handleSaveSlipToHistory = async () => {
     if (!currentEmployee) {
-      showToast('Please select or create an employee first.', 'error');
+      showToast('Please select an employee first.', 'error');
       return;
     }
     if (!isPaymentDetailsComplete) {
@@ -1280,6 +1228,7 @@ export default function SalaryStudio({
 
     let updatedHistory: SalarySlipRecord[];
     let finalizedRecord: SalarySlipRecord;
+
     if (existingIndex > -1) {
       const existingSlipNo = history[existingIndex].slipNo;
       finalizedRecord = buildSalarySlipRecord(existingSlipNo);
@@ -1287,10 +1236,71 @@ export default function SalaryStudio({
       updatedHistory[existingIndex] = finalizedRecord;
       showToast(`Updated existing salary slip ${existingSlipNo}`, 'info');
     } else {
-      finalizedRecord = buildSalarySlipRecord();
+      // Synchronize numbering sequence counter to Firestore (/metadata/counters)
+      let nextCounter = 1;
+      if (db) {
+        try {
+          const counterDocRef = doc(db, 'metadata', 'counters');
+          const counterSnap = await getDoc(counterDocRef);
+          if (counterSnap.exists()) {
+            const rawVal = counterSnap.data()?.salarySlipCounter;
+            if (typeof rawVal === 'number' && !isNaN(rawVal)) {
+              nextCounter = rawVal + 1;
+            } else {
+              const localRaw = typeof window !== 'undefined' ? localStorage.getItem(SALARY_STORAGE_KEYS.counter) : null;
+              nextCounter = (localRaw ? parseInt(localRaw, 10) : 0) + 1;
+            }
+          } else {
+            const localRaw = typeof window !== 'undefined' ? localStorage.getItem(SALARY_STORAGE_KEYS.counter) : null;
+            nextCounter = (localRaw ? parseInt(localRaw, 10) : 0) + 1;
+          }
+          await setDoc(counterDocRef, { salarySlipCounter: nextCounter }, { merge: true });
+        } catch (ctrErr) {
+          console.warn('[SalaryStudio] Counter synchronization notice:', ctrErr);
+          const localRaw = typeof window !== 'undefined' ? localStorage.getItem(SALARY_STORAGE_KEYS.counter) : null;
+          nextCounter = (localRaw ? parseInt(localRaw, 10) : 0) + 1;
+        }
+      } else if (typeof window !== 'undefined') {
+        const localRaw = localStorage.getItem(SALARY_STORAGE_KEYS.counter);
+        nextCounter = (localRaw ? parseInt(localRaw, 10) : 0) + 1;
+      }
+
+      if (typeof window !== 'undefined') {
+        localStorage.setItem(SALARY_STORAGE_KEYS.counter, String(nextCounter));
+      }
+
+      const generatedSlipNo = generateSlipNumber(nextCounter);
+      finalizedRecord = buildSalarySlipRecord(generatedSlipNo);
       updatedHistory = [finalizedRecord, ...history];
       showToast(`Generated & saved Salary Slip #${finalizedRecord.slipNo}`, 'success');
     }
+
+    // Directive 1 [FIN-01]: Persist full payroll snapshot to Firestore /salarySlips/{slipNo} with { merge: true }
+    if (db) {
+      try {
+        const fullPayrollSnapshot = {
+          ...finalizedRecord,
+          employeeId: finalizedRecord.empEmpId || finalizedRecord.empId,
+          name: finalizedRecord.empName,
+          designation: finalizedRecord.employeeSnapshot?.designation || '',
+          month: finalizedRecord.month,
+          financialYear: finalizedRecord.fy,
+          basicPay: finalizedRecord.earnings?.basic ?? 0,
+          commissions: finalizedRecord.earnings?.incentive ?? 0,
+          netPayable: finalizedRecord.net ?? 0,
+          paymentMode: finalizedRecord.paymentMode || '',
+          transactionId: finalizedRecord.transactionId || '',
+          paymentDate: finalizedRecord.paymentDate || '',
+          serverTimestamp: serverTimestamp(),
+          updatedAt: new Date().toISOString()
+        };
+        await setDoc(doc(db, 'salarySlips', finalizedRecord.slipNo), fullPayrollSnapshot, { merge: true });
+      } catch (err) {
+        console.error('[SalaryStudio] Failed to persist salary slip to Firestore /salarySlips:', err);
+        showToast('Notice: Cloud sync pending. Slip saved to local session.', 'info');
+      }
+    }
+
     saveHistory(updatedHistory);
 
     try {
@@ -1300,18 +1310,13 @@ export default function SalaryStudio({
     }
   };
 
-  // Trigger A4 Slip Preview
   const handlePreviewSlip = (customSlip?: SalarySlipRecord) => {
     if (!currentEmployee && !customSlip) {
       showToast('Please select an employee first.', 'error');
       return;
     }
-    // The validation gate only applies to generating a fresh preview from
-    // the live form -- viewing an already-saved historical slip (customSlip
-    // provided, from the History tab) is always allowed regardless of
-    // whether it predates this field or not.
     if (!customSlip && !isPaymentDetailsComplete) {
-      showToast('Payment Mode, Transaction ID, and Payment Date are all required before previewing a slip.', 'error');
+      showToast('Payment Mode, Transaction ID, and Payment Date are required.', 'error');
       return;
     }
     const slip = customSlip || buildSalarySlipRecord(history.find(h => currentEmployee && h.empEmpId === currentEmployee.empId && h.month === genMonth && h.fy === genFY)?.slipNo);
@@ -1319,10 +1324,6 @@ export default function SalaryStudio({
     setIsPreviewModalOpen(true);
   };
 
-  // QR code verification block removed from the slip -- see Slip
-  // Verification Footer below, now just Company Seal + Authorized Signatory.
-
-  // Export PDF from DOM
   const [isPdfExporting, setIsPdfExporting] = useState(false);
   const handleDownloadPDF = async () => {
     const printArea = document.getElementById('salarySlipPrintContainer');
@@ -1349,35 +1350,15 @@ export default function SalaryStudio({
       });
 
       const pageWidth = 595.28;
-      const pageHeight = 841.89;
       const margin = 24;
       const renderWidth = pageWidth - margin * 2;
       const renderHeight = (canvas.height * renderWidth) / canvas.width;
 
-      if (renderHeight <= pageHeight - margin * 2) {
-        pdf.addImage(imgData, 'PNG', margin, margin, renderWidth, renderHeight);
-      } else {
-        // Multi-page slicing if large incentive list
-        let srcY = 0;
-        const pageImgHeight = Math.floor(((pageHeight - margin * 2) * canvas.width) / renderWidth);
-        while (srcY < canvas.height) {
-          const sliceH = Math.min(pageImgHeight, canvas.height - srcY);
-          const pageCanvas = document.createElement('canvas');
-          pageCanvas.width = canvas.width;
-          pageCanvas.height = sliceH;
-          const ctx = pageCanvas.getContext('2d');
-          if (ctx) {
-            ctx.drawImage(canvas, 0, srcY, canvas.width, sliceH, 0, 0, canvas.width, sliceH);
-            if (srcY > 0) pdf.addPage();
-            pdf.addImage(pageCanvas.toDataURL('image/png'), 'PNG', margin, margin, renderWidth, (sliceH * renderWidth) / canvas.width);
-          }
-          srcY += pageImgHeight;
-        }
-      }
+      pdf.addImage(imgData, 'PNG', margin, margin, renderWidth, renderHeight);
 
       const safeEmpName = (previewSlipData?.empName || 'Employee').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
       const safeMonth = (previewSlipData?.month || 'Month').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-      const safeYear = (previewSlipData?.fy || '2025-26').trim().replace(/[\/\\]/g, '-').replace(/[^a-zA-Z0-9_-]/g, '_');
+      const safeYear = (previewSlipData?.fy || '2026-27').trim().replace(/[\/\\]/g, '-').replace(/[^a-zA-Z0-9_-]/g, '_');
       const fileName = `${safeEmpName}_${safeMonth}_${safeYear}_SalarySlip.pdf`;
       pdf.save(fileName);
       showToast(`Salary Slip PDF downloaded: ${fileName}`, 'success');
@@ -1389,113 +1370,39 @@ export default function SalaryStudio({
     }
   };
 
-  // Search and Filter States for History
   const [histSearch, setHistSearch] = useState('');
-  const [histMonthFilter, setHistMonthFilter] = useState('');
-  const [histFYFilter, setHistFYFilter] = useState('');
-
-  // Mapped Live Project Incentive Database from Central Projects
-  const allMappedProjectIncentives = useMemo(() => {
-    if (!Array.isArray(externalProjects) || externalProjects.length === 0) {
-      return [];
-    }
-
-    return externalProjects.map(p => {
-      const pDate = parseSafeDate(
-        p.createdAt || p.date || p.dateCreated || p.projectDate || p.completedDate || p.createdDate
-      );
-      const kw = parseFloat(String(p.plantCapacity || p.systemCapacity || p.capacity || '0').replace(/[^\d.]/g, '')) || 0;
-      const desComm = Number(p.designerCommission ?? p.financials?.designerCommission ?? 0);
-      const salesComm = Number(p.salesCommission ?? p.financials?.salesCommission ?? 0);
-
-      const dName = p.designer || p.designerName || p.assignedDesigner || '';
-      const dEmail = p.designerEmail || p.designer_email || '';
-      const sName = p.salesPerson || p.salesPersonName || p.salesName || p.assignedSales || '';
-      const sEmail = p.salesPersonEmail || p.sales_email || p.salesEmail || '';
-
-      const month = pDate ? SALARY_MONTHS[pDate.getMonth()] : (p.month || '');
-      let fy = '';
-      if (pDate) {
-        const y = pDate.getFullYear();
-        const m = pDate.getMonth();
-        const startY = m >= 3 ? y : y - 1;
-        const endY = (startY + 1) % 100;
-        fy = `${startY}-${String(endY).padStart(2, '0')}`;
-      } else {
-        fy = p.financialYear || p.fy || '2025-26';
-      }
-
-      return {
-        projectId: p.id || 'PROJ',
-        projectName: p.projectName || p.name || p.title || 'Solar Plant Project',
-        clientName: p.clientName || p.client || p.matchedClient?.companyName || 'Corporate Client',
-        date: formatSafeDate(pDate || p.createdAt || p.date, 'slash') || '—',
-        dateObj: pDate,
-        month,
-        fy,
-        kw,
-        designerName: dName,
-        designerEmail: dEmail,
-        designerCommission: desComm,
-        salesName: sName,
-        salesEmail: sEmail,
-        salesCommission: salesComm,
-        totalCommission: desComm + salesComm,
-        status: p.status || 'Active',
-        rawProject: p
-      };
-    });
-  }, [externalProjects]);
-
-  const filteredHistory = useMemo(() => {
-    return history.filter(h => {
-      if (histMonthFilter && h.month !== histMonthFilter) return false;
-      if (histFYFilter && h.fy !== histFYFilter) return false;
-      if (histSearch) {
-        const q = histSearch.toLowerCase();
-        return (
-          h.empName.toLowerCase().includes(q) ||
-          h.slipNo.toLowerCase().includes(q) ||
-          h.empEmpId.toLowerCase().includes(q)
-        );
-      }
-      return true;
-    });
-  }, [history, histSearch, histMonthFilter, histFYFilter]);
 
   return (
-    <div id="sec-salary-studio" className="w-full space-y-6 text-white">
+    <div id="sec-salary-studio" className="w-full space-y-6 text-gray-900 dark:text-white transition-colors">
       {/* Toast Alert */}
       {toastMessage && (
         <div
-          className={`fixed bottom-6 right-6 z-50 px-4 py-3 rounded-xl shadow-2xl flex items-center space-x-3 text-xs font-semibold border backdrop-blur-md transition-all animate-bounce ${
+          className={`fixed bottom-6 right-6 z-50 px-4 py-3 rounded-xl shadow-2xl flex items-center space-x-3 text-xs font-semibold border backdrop-blur-md transition-all ${
             toastMessage.type === 'success'
-              ? 'bg-emerald-950/90 text-emerald-300 border-emerald-500/40 shadow-emerald-950/50'
+              ? 'bg-white dark:bg-emerald-950/90 text-emerald-600 dark:text-emerald-300 border-emerald-500/40'
               : toastMessage.type === 'error'
-              ? 'bg-rose-950/90 text-rose-300 border-rose-500/40 shadow-rose-950/50'
-              : 'bg-[#1E1E1E]/95 text-[#D4AF37] border-[#D4AF37]/40 shadow-black/60'
+              ? 'bg-white dark:bg-rose-950/90 text-rose-600 dark:text-rose-300 border-rose-500/40'
+              : 'bg-white dark:bg-[#1E1E1E]/95 text-[#D4AF37] border-[#D4AF37]/40'
           }`}
         >
           {toastMessage.type === 'success' ? (
-            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
           ) : (
-            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <AlertCircle className="w-4 h-4 text-rose-500 shrink-0" />
           )}
           <span>{toastMessage.text}</span>
         </div>
       )}
 
       {/* Module Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 bg-[#121212] p-6 rounded-xl border border-[#333333]">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 bg-white dark:bg-[#121212] p-6 rounded-xl border border-gray-200 dark:border-[#333333] shadow-sm transition-colors">
         <div className="flex items-center space-x-4">
-          <div className="w-12 h-12 rounded-xl bg-[#1E1E1E] border border-[#333333] flex items-center justify-center shrink-0 text-[#D4AF37]">
+          <div className="w-12 h-12 rounded-xl bg-gray-100 dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] flex items-center justify-center shrink-0 text-[#D4AF37]">
             <Banknote className="w-6 h-6" />
           </div>
           <div>
-            <div className="flex items-center space-x-2">
-              <h2 className="text-xl font-bold text-white tracking-wide">Salary Studio</h2>
-            </div>
-            <p className="text-sm text-gray-400 mt-0.5">
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white tracking-wide">Salary Studio</h2>
+            <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
               Production payroll calculation, live project commission mapping, and automated salary slip engine.
             </p>
           </div>
@@ -1504,7 +1411,7 @@ export default function SalaryStudio({
         <div className="flex items-center space-x-3">
           <button
             onClick={() => setActiveSubTab('salary-generator')}
-            className="flex items-center space-x-2 px-4 py-2 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] text-black text-xs font-semibold shadow-lg shadow-[#D4AF37]/20 transition-colors"
+            className="flex items-center space-x-2 px-4 py-2 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] text-black text-xs font-bold shadow-md shadow-[#D4AF37]/20 transition-colors"
           >
             <Plus className="w-4 h-4 text-black" />
             <span>Generate Slip</span>
@@ -1513,7 +1420,7 @@ export default function SalaryStudio({
       </div>
 
       {/* Horizontal Tabbed Navigation Bar */}
-      <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-1.5 shadow-lg overflow-x-auto">
+      <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-1.5 shadow-sm overflow-x-auto transition-colors">
         <nav className="flex space-x-2 min-w-max" aria-label="Salary Studio Tabs">
           {[
             { id: 'dashboard', label: 'Overview', icon: LayoutGrid },
@@ -1527,10 +1434,10 @@ export default function SalaryStudio({
               <button
                 key={tab.id}
                 onClick={() => setActiveSubTab(tab.id as SalaryStudioTab)}
-                className={`flex items-center space-x-2.5 px-4 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                className={`flex items-center space-x-2.5 px-4 py-2.5 rounded-lg text-xs font-semibold transition-all ${
                   isActive
-                    ? 'bg-[#2A2A2A] text-[#D4AF37] border border-[#D4AF37]/40 shadow-sm'
-                    : 'text-gray-400 hover:text-gray-200 hover:bg-[#252525]'
+                    ? 'bg-gray-100 dark:bg-[#2A2A2A] text-[#D4AF37] border border-[#D4AF37]/40 shadow-sm'
+                    : 'text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200 hover:bg-gray-50 dark:hover:bg-[#252525]'
                 }`}
               >
                 <Icon className={`w-4 h-4 ${isActive ? 'text-[#D4AF37]' : 'text-gray-400'}`} />
@@ -1541,503 +1448,243 @@ export default function SalaryStudio({
         </nav>
       </div>
 
-      {/* ══════════════════════════════════════════════════════
-           1. SECTION: DASHBOARD (Overview)
-      ═══════════════════════════════════════════════════════ */}
+      {/* 1. OVERVIEW */}
       {activeSubTab === 'dashboard' && (
         <div className="space-y-6">
-          {/* Stat Cards */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 hover:border-[#D4AF37]/50 transition-all">
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-all">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Total Employees</span>
-                <div className="w-8 h-8 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] flex items-center justify-center">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Total Workforce</span>
+                <div className="w-8 h-8 rounded-lg bg-gray-100 dark:bg-[#121212] text-[#D4AF37] flex items-center justify-center">
                   <Users className="w-4 h-4" />
                 </div>
               </div>
-              <div className="mt-3 text-2xl font-bold text-white font-mono">{masterEmployees.length}</div>
+              <div className="mt-2 text-2xl font-bold text-gray-900 dark:text-white font-mono">{masterEmployees.length}</div>
               <div className="text-[11px] text-gray-400 mt-1">Active on Master Payroll</div>
             </div>
 
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 hover:border-[#D4AF37]/50 transition-all">
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-all">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Slips Generated</span>
-                <div className="w-8 h-8 rounded-lg bg-emerald-500/10 text-emerald-400 flex items-center justify-center">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Slips Generated</span>
+                <div className="w-8 h-8 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-center justify-center">
                   <FileText className="w-4 h-4" />
                 </div>
               </div>
-              <div className="mt-3 text-2xl font-bold text-emerald-400 font-mono">{history.length}</div>
+              <div className="mt-2 text-2xl font-bold text-emerald-600 dark:text-emerald-400 font-mono">{history.length}</div>
               <div className="text-[11px] text-gray-400 mt-1">Archived Salary Slips</div>
             </div>
 
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 hover:border-[#D4AF37]/50 transition-all">
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-all">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Incentive Records</span>
-                <div className="w-8 h-8 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] flex items-center justify-center">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Incentive Records</span>
+                <div className="w-8 h-8 rounded-lg bg-gray-100 dark:bg-[#121212] text-[#D4AF37] flex items-center justify-center">
                   <Trophy className="w-4 h-4" />
                 </div>
               </div>
-              <div className="mt-3 text-2xl font-bold text-[#D4AF37] font-mono">{allMappedProjectIncentives.length}</div>
+              <div className="mt-2 text-2xl font-bold text-[#D4AF37] font-mono">{allActiveIncentives.length}</div>
               <div className="text-[11px] text-gray-400 mt-1">Live Project Commissions</div>
             </div>
 
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 hover:border-[#D4AF37]/50 transition-all">
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-all">
               <div className="flex items-center justify-between">
-                <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Last Net Salary</span>
-                <div className="w-8 h-8 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] flex items-center justify-center">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Last Net Salary</span>
+                <div className="w-8 h-8 rounded-lg bg-gray-100 dark:bg-[#121212] text-[#D4AF37] flex items-center justify-center">
                   <Receipt className="w-4 h-4" />
                 </div>
               </div>
-              <div className="mt-3 text-2xl font-bold text-[#D4AF37] font-mono">
-                ₹{history[0]?.net ? history[0].net.toLocaleString('en-IN') : '0'}
+              <div className="mt-2 text-2xl font-bold text-gray-900 dark:text-white font-mono">
+                {formatCurrency(history[0]?.net ?? 0)}
               </div>
-              <div className="text-[11px] text-gray-400 mt-1">Latest Pay Slip Net</div>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-            {/* Recent Slips Table */}
-            <div className="lg:col-span-2 bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm flex flex-col justify-between">
-              <div>
-                <div className="flex items-center justify-between pb-3 border-b border-[#333333]">
-                  <div className="flex items-center space-x-2">
-                    <Clock className="w-4 h-4 text-[#D4AF37]" />
-                    <h3 className="text-sm font-bold text-white uppercase tracking-wider">Recent Salary Slips</h3>
-                  </div>
-                  <button
-                    onClick={() => setActiveSubTab('history')}
-                    className="text-xs text-[#D4AF37] hover:underline font-semibold flex items-center space-x-1"
-                  >
-                    <span>View All</span>
-                    <ArrowUpRight className="w-3.5 h-3.5" />
-                  </button>
-                </div>
-
-                <div className="overflow-x-auto mt-4">
-                  {history.length === 0 ? (
-                    <div className="py-8 text-center text-gray-400 text-xs">
-                      No salary slips generated yet. Click &quot;Generate Slip&quot; to begin.
-                    </div>
-                  ) : (
-                    <table className="w-full text-left text-xs whitespace-nowrap">
-                      <thead>
-                        <tr className="text-gray-400 uppercase border-b border-[#333333]">
-                          <th className="pb-2.5 px-3 font-semibold">Slip No.</th>
-                          <th className="pb-2.5 px-3 font-semibold">Employee</th>
-                          <th className="pb-2.5 px-3 font-semibold">Period</th>
-                          <th className="pb-2.5 px-3 font-semibold">Net Pay</th>
-                          <th className="pb-2.5 px-3 font-semibold">Date</th>
-                          <th className="pb-2.5 px-3 font-semibold text-right">Action</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#333333]">
-                        {history.slice(0, 5).map(row => (
-                          <tr key={row.slipNo} className="hover:bg-[#2A2A2A] transition-colors">
-                            <td className="py-3 px-3 font-mono font-semibold text-[#D4AF37]">{row.slipNo}</td>
-                            <td className="py-3 px-3 font-medium text-white">{row.empName}</td>
-                            <td className="py-3 px-3 text-gray-300">
-                              {row.month} {row.fy}
-                            </td>
-                            <td className="py-3 px-3 font-mono font-bold text-emerald-400">
-                              ₹{row.net.toLocaleString('en-IN')}
-                            </td>
-                            <td className="py-3 px-3 text-gray-400">
-                              {new Date(row.generated).toLocaleDateString('en-IN')}
-                            </td>
-                            <td className="py-3 px-3 text-right">
-                              <button
-                                onClick={() => handlePreviewSlip(row)}
-                                className="px-2.5 py-1.5 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] text-[#D4AF37] font-semibold text-xs inline-flex items-center space-x-1 border border-[#333333] hover:border-[#D4AF37]/50 transition-colors"
-                              >
-                                <Eye className="w-3.5 h-3.5" />
-                                <span>Preview</span>
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Quick Actions & Tips Card */}
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 flex flex-col justify-between shadow-sm">
-              <div>
-                <div className="flex items-center space-x-2 pb-3 border-b border-[#333333] mb-4">
-                  <Sparkles className="w-4 h-4 text-[#D4AF37]" />
-                  <h3 className="text-sm font-bold text-white uppercase tracking-wider">Quick Actions</h3>
-                </div>
-                <div className="space-y-2.5">
-                  <button
-                    onClick={() => setActiveSubTab('salary-generator')}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] text-black text-xs font-bold shadow-md shadow-[#D4AF37]/20 transition-all"
-                  >
-                    <Plus className="w-4 h-4 text-black" />
-                    <span>Generate Salary Slip</span>
-                  </button>
-                  <button
-                    onClick={() => setActiveSubTab('history')}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] text-gray-200 hover:text-white border border-[#444444] text-xs font-semibold transition-colors"
-                  >
-                    <Clock className="w-4 h-4 text-[#D4AF37]" />
-                    <span>View Slip History</span>
-                  </button>
-                  <button
-                    onClick={() => setActiveSubTab('settings')}
-                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] text-gray-200 hover:text-white border border-[#444444] text-xs font-semibold transition-colors"
-                  >
-                    <SettingsIcon className="w-4 h-4 text-[#D4AF37]" />
-                    <span>Payroll Rules &amp; Format</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="mt-6 p-4 rounded-xl bg-[#121212] border border-[#333333] text-xs text-gray-400 space-y-1">
-                <p className="font-semibold text-[#D4AF37]">Unified Data Sources:</p>
-                <p>
-                  Employee records and project commissions are directly synchronized from the centralized Employees and Projects modules.
-                </p>
-              </div>
+              <div className="text-[11px] text-gray-400 mt-1">Latest Slip Value</div>
             </div>
           </div>
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════
-           2. SECTION: SALARY GENERATOR
-      ═══════════════════════════════════════════════════════ */}
+      {/* 2. GENERATE SLIP */}
       {activeSubTab === 'salary-generator' && (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          {/* Left Column (Inputs): col-span-7 */}
           <div className="lg:col-span-7 space-y-6">
-            {/* Card 1: Employee & Period (Master Data Linked) */}
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm">
-              <div className="flex items-center space-x-2 pb-3 border-b border-[#333333] mb-4">
-                <Users className="w-4 h-4 text-[#D4AF37]" />
-                <h3 className="text-xs font-bold text-white uppercase tracking-wider">Employee &amp; Period Selection</h3>
-              </div>
-              <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-colors">
+              <h3 className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider pb-2 border-b border-gray-200 dark:border-[#333333] mb-4">
+                Employee &amp; Period Selection
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3 text-xs">
                 <div className="md:col-span-6">
-                  <label className="block text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
-                    Select Employee (Master Directory) *
-                  </label>
+                  <label className="block text-gray-600 dark:text-gray-400 font-semibold mb-1">Select Employee *</label>
                   <select
                     value={selectedEmpId}
                     onChange={e => setSelectedEmpId(e.target.value)}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-xs text-gray-900 dark:text-white focus:border-[#D4AF37]"
                   >
-                    {masterEmployees.length === 0 ? (
-                      <option value="" className="bg-[#1E1E1E] text-gray-500">No employees found in directory</option>
-                    ) : (
-                      masterEmployees.map((e, index) => (
-                        <option key={e.id ? `${e.id}-${index}` : `emp-${index}`} value={e.id} className="bg-[#1E1E1E] text-white">
-                          {e.name} ({e.empId}) — {e.designation} [{e.department}]
-                        </option>
-                      ))
-                    )}
-                  </select>
-                </div>
-                <div className="md:col-span-3">
-                  <label className="block text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
-                    Salary Month *
-                  </label>
-                  <select
-                    value={genMonth}
-                    onChange={e => setGenMonth(e.target.value)}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-                  >
-                    {['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].map(m => (
-                      <option key={m} value={m} className="bg-[#1E1E1E] text-white">
-                        {m}
+                    {masterEmployees.map((e, index) => (
+                      <option key={e.id ? `${e.id}-${index}` : `emp-${index}`} value={e.id} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">
+                        {e.name} ({e.empId}) — {e.designation}
                       </option>
                     ))}
                   </select>
                 </div>
                 <div className="md:col-span-3">
-                  <label className="block text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
-                    Financial Year *
-                  </label>
+                  <label className="block text-gray-600 dark:text-gray-400 font-semibold mb-1">Month *</label>
+                  <select
+                    value={genMonth}
+                    onChange={e => setGenMonth(e.target.value)}
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-xs text-gray-900 dark:text-white focus:border-[#D4AF37]"
+                  >
+                    {SALARY_MONTHS.map(m => (
+                      <option key={m} value={m} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">{m}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="md:col-span-3">
+                  <label className="block text-gray-600 dark:text-gray-400 font-semibold mb-1">FY *</label>
                   <select
                     value={genFY}
                     onChange={e => setGenFY(e.target.value)}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-xs text-gray-900 dark:text-white focus:border-[#D4AF37]"
                   >
-                    <option value="2024-25" className="bg-[#1E1E1E] text-white">2024-25</option>
-                    <option value="2025-26" className="bg-[#1E1E1E] text-white">2025-26</option>
-                    <option value="2026-27" className="bg-[#1E1E1E] text-white">2026-27</option>
+                    <option value="2025-26" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">2025-26</option>
+                    <option value="2026-27" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">2026-27</option>
                   </select>
-                </div>
-
-                <div className="md:col-span-6">
-                  <label className="block text-[11px] font-semibold text-gray-400 uppercase tracking-wider mb-1.5">
-                    Pay Settlement Date
-                  </label>
-                  <input
-                    type="date"
-                    value={genPayDate}
-                    onChange={e => setGenPayDate(e.target.value)}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-[#D4AF37]"
-                  />
-                </div>
-
-                <div className="md:col-span-6">
-                  {currentEmployee ? (
-                    <div className="p-2.5 rounded-lg bg-[#D4AF37]/10 border border-[#D4AF37]/30 flex flex-col justify-center">
-                      <div className="text-xs font-bold text-[#D4AF37]">{currentEmployee.name}</div>
-                      <div className="text-[11px] text-gray-300">
-                        {currentEmployee.designation} • {currentEmployee.department}
-                      </div>
-                      <div className="text-[10px] text-gray-400 font-mono mt-0.5">
-                        Emp ID: {currentEmployee.empId} | Base: ₹{(currentEmployee.basic || 0).toLocaleString('en-IN')} | Bank: {currentEmployee.bank || 'N/A'}
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="p-2.5 rounded-lg bg-[#141414] border border-[#333333] flex flex-col justify-center">
-                      <div className="text-xs font-semibold text-gray-400">No Employee Selected</div>
-                      <div className="text-[11px] text-gray-500">Directory contains no employee records.</div>
-                    </div>
-                  )}
                 </div>
               </div>
             </div>
 
-            {/* Card 2: Attendance Summary */}
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm">
-              <div className="flex items-center space-x-2 pb-3 border-b border-[#333333] mb-4">
-                <Calendar className="w-4 h-4 text-[#D4AF37]" />
-                <h3 className="text-xs font-bold text-white uppercase tracking-wider">Attendance Breakdown</h3>
-              </div>
-              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
+            {/* Attendance Breakdown */}
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-colors">
+              <h3 className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider pb-2 border-b border-gray-200 dark:border-[#333333] mb-4">
+                Attendance Breakdown
+              </h3>
+              <div className="grid grid-cols-3 md:grid-cols-6 gap-2 text-xs">
                 <div>
-                  <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Working Days</label>
+                  <label className="block text-[10px] text-gray-500 font-semibold mb-1">Total Days</label>
                   <input
                     type="number"
                     value={attendance.totalDays}
                     onChange={e => setAttendance({ ...attendance, totalDays: Number(e.target.value) || 0 })}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2.5 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white font-mono"
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Present Days</label>
+                  <label className="block text-[10px] text-gray-500 font-semibold mb-1">Present</label>
                   <input
                     type="number"
                     value={attendance.presentDays}
                     onChange={e => setAttendance({ ...attendance, presentDays: Number(e.target.value) || 0 })}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2.5 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white font-mono"
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Leave Days</label>
+                  <label className="block text-[10px] text-gray-500 font-semibold mb-1">Leave</label>
                   <input
                     type="number"
                     value={attendance.leaveDays}
                     onChange={e => setAttendance({ ...attendance, leaveDays: Number(e.target.value) || 0 })}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2.5 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white font-mono"
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Paid Leave</label>
+                  <label className="block text-[10px] text-gray-500 font-semibold mb-1">Paid Leave</label>
                   <input
                     type="number"
                     value={attendance.paidLeave}
                     onChange={e => setAttendance({ ...attendance, paidLeave: Number(e.target.value) || 0 })}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2.5 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white font-mono"
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Overtime (Hrs)</label>
+                  <label className="block text-[10px] text-gray-500 font-semibold mb-1">OT Hours</label>
                   <input
                     type="number"
                     value={attendance.otHours}
                     onChange={e => setAttendance({ ...attendance, otHours: Number(e.target.value) || 0 })}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2.5 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white font-mono"
                   />
                 </div>
                 <div>
-                  <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">LOP Days</label>
+                  <label className="block text-[10px] text-gray-500 font-semibold mb-1">LOP Days</label>
                   <input
                     type="number"
                     value={attendance.lopDays}
                     onChange={e => setAttendance({ ...attendance, lopDays: Number(e.target.value) || 0 })}
-                    className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2.5 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white font-mono"
                   />
                 </div>
               </div>
             </div>
 
-            {/* Card 3: Additional Earnings & Deductions */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {/* Additional Earnings */}
-              <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm">
-                <div className="flex items-center space-x-2 pb-3 border-b border-[#333333] mb-3">
-                  <Plus className="w-4 h-4 text-emerald-400" />
-                  <h3 className="text-xs font-bold text-white uppercase tracking-wider">Additional Earnings</h3>
+            {/* Incentives with Decoupled Taxonomy Filters (Mandate 4) */}
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-colors">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pb-3 border-b border-gray-200 dark:border-[#333333] gap-2 mb-3">
+                <div>
+                  <h3 className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider">
+                    Live Project Incentives ({incentiveCyclePeriod.month} {incentiveCyclePeriod.fy})
+                  </h3>
+                  <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                    Calculated from verified project assignments ({activeIncentives.length} deliverables)
+                  </span>
                 </div>
-                <div className="space-y-3">
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Bonus (₹)</label>
-                    <input
-                      type="number"
-                      value={additionalEarnings.bonus}
-                      onChange={e => setAdditionalEarnings({ ...additionalEarnings, bonus: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-3 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Reimbursement (₹)</label>
-                    <input
-                      type="number"
-                      value={additionalEarnings.reimbursement}
-                      onChange={e => setAdditionalEarnings({ ...additionalEarnings, reimbursement: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-3 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Other Earnings (₹)</label>
-                    <input
-                      type="number"
-                      value={additionalEarnings.otherAllowance}
-                      onChange={e => setAdditionalEarnings({ ...additionalEarnings, otherAllowance: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-3 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
+                <span className="text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400">
+                  Total: {formatCurrency(totalIncentiveAmount)}
+                </span>
+              </div>
+
+              {/* Scope & Sector Decoupled Filters */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3 p-2.5 rounded-lg bg-gray-50 dark:bg-[#171717] border border-gray-200 dark:border-[#2E2E2E]">
+                <div>
+                  <label className="block text-[10px] font-bold text-gray-600 dark:text-gray-300 uppercase tracking-wider mb-1 flex items-center gap-1">
+                    <Filter className="w-3 h-3 text-[#D4AF37]" />
+                    <span>Engineering Scope</span>
+                  </label>
+                  <select
+                    value={selectedScopeFilter}
+                    onChange={(e) => setSelectedScopeFilter(e.target.value)}
+                    className="w-full bg-white dark:bg-[#1F1F1F] border border-gray-300 dark:border-[#3A3A3A] rounded px-2.5 py-1 text-xs text-gray-900 dark:text-white"
+                  >
+                    {ENGINEERING_SCOPES.map((scope) => (
+                      <option key={scope} value={scope} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">{scope}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[10px] font-bold text-gray-600 dark:text-gray-300 uppercase tracking-wider mb-1 flex items-center gap-1">
+                    <Filter className="w-3 h-3 text-[#D4AF37]" />
+                    <span>Installation Sector</span>
+                  </label>
+                  <select
+                    value={selectedSectorFilter}
+                    onChange={(e) => setSelectedSectorFilter(e.target.value)}
+                    className="w-full bg-white dark:bg-[#1F1F1F] border border-gray-300 dark:border-[#3A3A3A] rounded px-2.5 py-1 text-xs text-gray-900 dark:text-white"
+                  >
+                    {INSTALLATION_SECTORS.map((sector) => (
+                      <option key={sector} value={sector} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">{sector}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
 
-              {/* Deductions (Manual Entry) */}
-              <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm">
-                <div className="flex items-center space-x-2 pb-3 border-b border-[#333333] mb-3">
-                  <Trash2 className="w-4 h-4 text-rose-400" />
-                  <h3 className="text-xs font-bold text-white uppercase tracking-wider">Manual Deductions (₹)</h3>
-                </div>
-                <div className="grid grid-cols-2 gap-2.5">
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">PF</label>
-                    <input
-                      type="number"
-                      value={deductions.pf}
-                      onChange={e => setDeductions({ ...deductions, pf: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">ESIC</label>
-                    <input
-                      type="number"
-                      value={deductions.esic}
-                      onChange={e => setDeductions({ ...deductions, esic: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Prof. Tax</label>
-                    <input
-                      type="number"
-                      value={deductions.pt}
-                      onChange={e => setDeductions({ ...deductions, pt: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">TDS</label>
-                    <input
-                      type="number"
-                      value={deductions.tds}
-                      onChange={e => setDeductions({ ...deductions, tds: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Advance</label>
-                    <input
-                      type="number"
-                      value={deductions.advance}
-                      onChange={e => setDeductions({ ...deductions, advance: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Other</label>
-                    <input
-                      type="number"
-                      value={deductions.other}
-                      onChange={e => setDeductions({ ...deductions, other: Number(e.target.value) || 0 })}
-                      className="w-full bg-[#1A1A1A] border border-[#333333] rounded px-2 py-1.5 text-xs text-white font-mono focus:border-[#D4AF37]"
-                    />
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Incentives for selected period (Live Central Projects Mapping) */}
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm">
-              <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-[#333333] mb-3">
-                <div className="flex items-center space-x-2">
-                  <Trophy className="w-4 h-4 text-[#D4AF37]" />
-                  <div>
-                    <h3 className="text-xs font-bold text-white uppercase tracking-wider">
-                      Live Project Incentives ({incentiveCyclePeriod.month} {incentiveCyclePeriod.fy})
-                    </h3>
-                    <p className="text-[10px] text-gray-400 flex items-center gap-1 mt-0.5">
-                      <Sparkles className="w-3 h-3 text-emerald-400" />
-                      Auto-mapped from Central Projects Database · feeds the {genMonth} {genFY} pay period
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <span className="px-2.5 py-1 rounded bg-emerald-500/10 border border-emerald-500/30 text-xs font-bold text-emerald-400 font-mono">
-                    Total: ₹{totalIncentiveAmount.toLocaleString('en-IN')}
-                  </span>
-                  <span className="text-[11px] text-gray-400 font-mono">
-                    ({activeIncentives.length} {activeIncentives.length === 1 ? 'project' : 'projects'})
-                  </span>
-                </div>
-              </div>
               <div className="overflow-x-auto">
                 {activeIncentives.length === 0 ? (
-                  <div className="py-6 px-4 text-center rounded-lg bg-[#181818] border border-[#2A2A2A]/60">
-                    <AlertCircle className="w-6 h-6 text-gray-500 mx-auto mb-2 opacity-60" />
-                    <p className="text-xs font-medium text-gray-300">
-                      No active project commissions found for <span className="text-[#D4AF37] font-semibold">{currentEmployee?.name}</span> in {incentiveCyclePeriod.month} {incentiveCyclePeriod.fy}.
-                    </p>
-                    <p className="text-[11px] text-gray-500 mt-1 max-w-md mx-auto">
-                      Any solar projects assigned to this employee (as Designer or Sales) in the Central Database during this billing period will automatically calculate into gross earnings.
-                    </p>
+                  <div className="py-6 text-center text-xs text-gray-500">
+                    No matching project commissions found for {currentEmployee?.name} in {incentiveCyclePeriod.month}.
                   </div>
                 ) : (
                   <table className="w-full text-left text-xs whitespace-nowrap">
                     <thead>
-                      <tr className="text-gray-400 uppercase text-[10px] border-b border-[#2A2A2A]">
-                        <th className="pb-2 px-2 font-semibold">Date</th>
-                        <th className="pb-2 px-2 font-semibold">Project</th>
-                        <th className="pb-2 px-2 font-semibold">Client</th>
-                        <th className="pb-2 px-2 font-semibold">Role / Type</th>
-                        <th className="pb-2 px-2 font-semibold text-right">Capacity</th>
-                        <th className="pb-2 px-2 font-semibold text-right">Commission</th>
+                      <tr className="text-gray-500 uppercase text-[10px] border-b border-gray-200 dark:border-[#2A2A2A]">
+                        <th className="pb-2 px-2">Project</th>
+                        <th className="pb-2 px-2">Client</th>
+                        <th className="pb-2 px-2 text-right">kW</th>
+                        <th className="pb-2 px-2 text-right">Commission</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-[#2A2A2A]">
-                      {activeIncentives.map((inc, index) => (
-                        <tr key={inc.id ? `${inc.id}-${index}` : `inc-${index}`} className="hover:bg-[#1E1E1E] transition-colors">
-                          <td className="py-2.5 px-2 text-gray-300">{inc.date}</td>
-                          <td className="py-2.5 px-2 font-medium text-white">
-                            <div>{inc.project}</div>
-                            {inc.projectId && (
-                              <div className="text-[10px] text-gray-500 font-mono">{inc.projectId}</div>
-                            )}
-                          </td>
-                          <td className="py-2.5 px-2 text-gray-400">{inc.client}</td>
-                          <td className="py-2.5 px-2">
-                            <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-[#1E1E1E] text-amber-300 border border-[#333333]">
-                              {inc.role || 'Project Incentive'}
-                            </span>
-                          </td>
-                          <td className="py-2.5 px-2 font-mono text-gray-300 text-right">{inc.kw} kWp</td>
-                          <td className="py-2.5 px-2 font-mono font-bold text-emerald-400 text-right">
-                            ₹{inc.amount.toLocaleString('en-IN')}
-                          </td>
+                    <tbody className="divide-y divide-gray-100 dark:divide-[#2A2A2A]">
+                      {activeIncentives.map((inc, i) => (
+                        <tr key={inc.id || i}>
+                          <td className="py-2 px-2 font-medium text-gray-900 dark:text-white">{inc.project}</td>
+                          <td className="py-2 px-2 text-gray-600 dark:text-gray-400">{inc.client}</td>
+                          <td className="py-2 px-2 text-right font-mono text-gray-600 dark:text-gray-400">{inc.kw} kW</td>
+                          <td className="py-2 px-2 text-right font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatCurrency(inc.amount)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -2047,172 +1694,55 @@ export default function SalaryStudio({
             </div>
           </div>
 
-          {/* Right Column: Live Calculator & Preview Panel (col-span-5) */}
+          {/* Calculator Right Column */}
           <div className="lg:col-span-5">
-            <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm sticky top-6">
-              <div className="flex items-center space-x-2 pb-3 border-b border-[#333333]">
-                <Receipt className="w-4 h-4 text-[#D4AF37]" />
-                <h3 className="text-sm font-bold text-white uppercase tracking-wider">Salary Calculator (Live)</h3>
-              </div>
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm sticky top-6 transition-colors">
+              <h3 className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider pb-2 border-b border-gray-200 dark:border-[#333333]">
+                Salary Calculator
+              </h3>
 
-              {/* Earnings Breakdown */}
-              <div className="mt-4 space-y-2 text-xs">
-                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider pb-1 border-b border-[#2A2A2A]">
-                  Earnings Breakdown
+              <div className="mt-3 space-y-2 text-xs">
+                <div className="flex justify-between py-1">
+                  <span className="text-gray-600 dark:text-gray-400">Basic Pay</span>
+                  <span className="font-mono font-semibold text-gray-900 dark:text-white">{formatCurrency(calculatedEarnings.basic)}</span>
                 </div>
-                <div className="flex justify-between py-1 text-gray-300">
-                  <span>Basic Salary</span>
-                  <span className="font-mono text-white">₹{calculatedEarnings.basic.toLocaleString('en-IN')}</span>
+                <div className="flex justify-between py-1 text-emerald-600 dark:text-emerald-400 font-semibold">
+                  <span>Project Incentives</span>
+                  <span className="font-mono">+{formatCurrency(calculatedEarnings.incentive)}</span>
                 </div>
-                {calculatedEarnings.incentive > 0 && (
-                  <div className="flex justify-between py-1 text-emerald-400 font-semibold">
-                    <span>Project Incentives</span>
-                    <span className="font-mono">+₹{calculatedEarnings.incentive.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                {calculatedEarnings.ot > 0 && (
-                  <div className="flex justify-between py-1 text-emerald-400 font-semibold">
-                    <span>Overtime Pay</span>
-                    <span className="font-mono">+₹{calculatedEarnings.ot.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                {calculatedEarnings.bonus > 0 && (
-                  <div className="flex justify-between py-1 text-emerald-400 font-semibold">
-                    <span>Bonus</span>
-                    <span className="font-mono">+₹{calculatedEarnings.bonus.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                {calculatedEarnings.reimbursement > 0 && (
-                  <div className="flex justify-between py-1 text-emerald-400 font-semibold">
-                    <span>Reimbursement</span>
-                    <span className="font-mono">+₹{calculatedEarnings.reimbursement.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                <div className="flex justify-between py-2 border-t border-b border-[#2A2A2A] font-bold text-sm text-[#D4AF37]">
+                <div className="flex justify-between py-1.5 border-t border-b border-gray-200 dark:border-[#2A2A2A] font-bold text-sm text-[#D4AF37]">
                   <span>Gross Earnings</span>
-                  <span className="font-mono">₹{calculatedEarnings.gross.toLocaleString('en-IN')}</span>
+                  <span className="font-mono">{formatCurrency(calculatedEarnings.gross)}</span>
+                </div>
+                <div className="flex justify-between py-1 text-rose-600 dark:text-rose-400">
+                  <span>Deductions</span>
+                  <span className="font-mono">-{formatCurrency(totalDeductions)}</span>
                 </div>
 
-                {/* Deductions Breakdown */}
-                <div className="text-[10px] font-bold text-gray-400 uppercase tracking-wider pt-2 pb-1 border-b border-[#2A2A2A]">
-                  Deductions
-                </div>
-                {deductions.pt > 0 && (
-                  <div className="flex justify-between py-1 text-gray-300">
-                    <span>Professional Tax (PT)</span>
-                    <span className="font-mono text-rose-400">-₹{deductions.pt.toLocaleString('en-IN')}</span>
+                <div className="p-4 rounded-xl bg-gray-50 dark:bg-gradient-to-br dark:from-[#1C180E] dark:to-[#121212] border-2 border-[#D4AF37] mt-3">
+                  <div className="text-[10px] font-bold uppercase text-[#D4AF37]">Net Payable</div>
+                  <div className="text-2xl font-bold font-mono text-[#D4AF37] mt-0.5">
+                    {formatCurrency(netSalaryPayable)}
                   </div>
-                )}
-                {deductions.pf > 0 && (
-                  <div className="flex justify-between py-1 text-gray-300">
-                    <span>Provident Fund (PF)</span>
-                    <span className="font-mono text-rose-400">-₹{deductions.pf.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                {deductions.esic > 0 && (
-                  <div className="flex justify-between py-1 text-gray-300">
-                    <span>ESIC</span>
-                    <span className="font-mono text-rose-400">-₹{deductions.esic.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                {deductions.tds > 0 && (
-                  <div className="flex justify-between py-1 text-gray-300">
-                    <span>TDS / Income Tax</span>
-                    <span className="font-mono text-rose-400">-₹{deductions.tds.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                {deductions.advance > 0 && (
-                  <div className="flex justify-between py-1 text-gray-300">
-                    <span>Advance Recovery</span>
-                    <span className="font-mono text-rose-400">-₹{deductions.advance.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                {deductions.other > 0 && (
-                  <div className="flex justify-between py-1 text-gray-300">
-                    <span>Other Deductions</span>
-                    <span className="font-mono text-rose-400">-₹{deductions.other.toLocaleString('en-IN')}</span>
-                  </div>
-                )}
-                <div className="flex justify-between py-2 border-t border-b border-[#2A2A2A] font-bold text-xs text-rose-400">
-                  <span>Total Deductions</span>
-                  <span className="font-mono">-₹{totalDeductions.toLocaleString('en-IN')}</span>
-                </div>
-
-                {/* NET PAYABLE */}
-                <div className="p-4 rounded-xl bg-gradient-to-br from-[#1C180E] to-[#121212] border-2 border-[#D4AF37] mt-4 shadow-lg">
-                  <div className="text-[10px] font-bold uppercase tracking-wider text-[#D4AF37]">
-                    NET SALARY PAYABLE
-                  </div>
-                  <div className="text-2xl font-bold font-mono text-[#D4AF37] mt-1">
-                    ₹{netSalaryPayable.toLocaleString('en-IN')}
-                  </div>
-                  <div className="text-[10px] text-gray-400 italic mt-1">
+                  <div className="text-[10px] text-gray-500 mt-1 italic">
                     {numberToWordsINR(netSalaryPayable)}
                   </div>
                 </div>
 
-                {/* Payment Details (mandatory before preview/save) */}
-                <div className="p-4 rounded-xl bg-[#1A1A1A] border border-[#2A2A2A] mt-4 space-y-3">
-                  <div className="text-[10px] font-bold uppercase tracking-wider text-[#D4AF37] flex items-center justify-between">
-                    <span>Payment Details</span>
-                    {!isPaymentDetailsComplete && (
-                      <span className="text-rose-400 normal-case tracking-normal font-semibold">Required before saving</span>
-                    )}
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Payment Mode / Done Via</label>
-                    <select
-                      value={paymentDetails.paymentMode}
-                      onChange={e => setPaymentDetails({ ...paymentDetails, paymentMode: e.target.value })}
-                      className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:border-[#D4AF37] focus:outline-none"
-                    >
-                      <option value="">Select payment mode...</option>
-                      <option value="Bank Transfer">Bank Transfer</option>
-                      <option value="NEFT">NEFT</option>
-                      <option value="RTGS">RTGS</option>
-                      <option value="IMPS">IMPS</option>
-                      <option value="UPI">UPI</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Transaction ID / Payment Reference ID</label>
-                    <input
-                      type="text"
-                      value={paymentDetails.transactionId}
-                      onChange={e => setPaymentDetails({ ...paymentDetails, transactionId: e.target.value })}
-                      placeholder="e.g. UTR / Reference number"
-                      className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:border-[#D4AF37] focus:outline-none"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">Payment Date</label>
-                    <input
-                      type="date"
-                      value={paymentDetails.paymentDate}
-                      onChange={e => setPaymentDetails({ ...paymentDetails, paymentDate: e.target.value })}
-                      className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-xs text-white focus:border-[#D4AF37] focus:outline-none"
-                    />
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-2 gap-3 pt-4">
+                <div className="pt-4 flex gap-2">
                   <button
                     onClick={() => handlePreviewSlip()}
                     disabled={!isPaymentDetailsComplete}
-                    title={!isPaymentDetailsComplete ? 'Fill in all Payment Details fields first' : undefined}
-                    className="py-2.5 px-3 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] disabled:bg-[#4A4530] disabled:text-gray-500 disabled:cursor-not-allowed disabled:hover:bg-[#4A4530] text-black font-bold text-xs flex items-center justify-center space-x-1.5 shadow-md shadow-[#D4AF37]/20 transition-all"
+                    className="flex-1 py-2 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] text-black font-bold text-xs shadow-sm disabled:opacity-50 transition-colors"
                   >
-                    <Eye className="w-4 h-4" />
-                    <span>Preview Slip</span>
+                    Preview Slip
                   </button>
                   <button
                     onClick={handleSaveSlipToHistory}
                     disabled={!isPaymentDetailsComplete}
-                    title={!isPaymentDetailsComplete ? 'Fill in all Payment Details fields first' : undefined}
-                    className="py-2.5 px-3 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-[#2A2A2A] text-white font-semibold text-xs flex items-center justify-center space-x-1.5 border border-[#3A3A3A] transition-all"
+                    className="flex-1 py-2 rounded-lg bg-gray-100 dark:bg-[#2A2A2A] text-gray-800 dark:text-white font-semibold text-xs border border-gray-300 dark:border-[#3A3A3A] disabled:opacity-50 transition-colors"
                   >
-                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span>Save &amp; Archive</span>
+                    Save &amp; Archive
                   </button>
                 </div>
               </div>
@@ -2221,170 +1751,86 @@ export default function SalaryStudio({
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════
-           3. SECTION: HISTORY
-      ═══════════════════════════════════════════════════════ */}
+      {/* 3. HISTORY */}
       {activeSubTab === 'history' && (
-        <div className="space-y-4">
-          <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 flex flex-wrap items-center justify-between gap-4 shadow-sm">
-            <div className="flex items-center space-x-3 flex-1 min-w-[260px]">
-              <Search className="w-4 h-4 text-gray-400" />
-              <input
-                type="text"
-                value={histSearch}
-                onChange={e => setHistSearch(e.target.value)}
-                placeholder="Search salary slips by employee, slip number, ID..."
-                className="bg-transparent border-none text-xs text-white placeholder-gray-500 focus:outline-none w-full"
-              />
-            </div>
-            <div className="flex items-center space-x-2">
-              <select
-                value={histMonthFilter}
-                onChange={e => setHistMonthFilter(e.target.value)}
-                className="bg-[#1A1A1A] border border-[#333333] rounded-lg px-3 py-1.5 text-xs text-gray-300 focus:border-[#D4AF37]"
-              >
-                <option value="">All Months</option>
-                {['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].map(m => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-              </select>
-              <select
-                value={histFYFilter}
-                onChange={e => setHistFYFilter(e.target.value)}
-                className="bg-[#1A1A1A] border border-[#333333] rounded-lg px-3 py-1.5 text-xs text-gray-300 focus:border-[#D4AF37]"
-              >
-                <option value="">All FY</option>
-                <option value="2024-25">2024-25</option>
-                <option value="2025-26">2025-26</option>
-                <option value="2026-27">2026-27</option>
-              </select>
-            </div>
+        <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-colors">
+          <div className="flex items-center justify-between pb-3 border-b border-gray-200 dark:border-[#333333] mb-4">
+            <h3 className="text-base font-semibold text-gray-900 dark:text-white">Slip History ({history.length})</h3>
+            <input
+              type="text"
+              placeholder="Search slip..."
+              value={histSearch}
+              onChange={e => setHistSearch(e.target.value)}
+              className="bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-1 text-xs text-gray-900 dark:text-white"
+            />
           </div>
 
-          <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 overflow-x-auto shadow-sm">
-            {filteredHistory.length === 0 ? (
-              <div className="text-center py-10 border border-dashed border-[#333333] rounded-lg text-gray-400 text-xs">
-                No salary slips found in history.
-              </div>
-            ) : (
-              <table className="w-full text-left text-xs whitespace-nowrap">
-                <thead>
-                  <tr className="text-gray-400 uppercase border-b border-[#2A2A2A]">
-                    <th className="pb-3 px-3 font-semibold">Slip No.</th>
-                    <th className="pb-3 px-3 font-semibold">Employee</th>
-                    <th className="pb-3 px-3 font-semibold">Emp ID</th>
-                    <th className="pb-3 px-3 font-semibold">Month</th>
-                    <th className="pb-3 px-3 font-semibold">FY</th>
-                    <th className="pb-3 px-3 font-semibold">Gross</th>
-                    <th className="pb-3 px-3 font-semibold">Deductions</th>
-                    <th className="pb-3 px-3 font-semibold">Net Pay</th>
-                    <th className="pb-3 px-3 font-semibold text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-[#2A2A2A]">
-                  {filteredHistory.map((slip, index) => (
-                    <tr key={slip.slipNo ? `${slip.slipNo}-${index}` : `slip-${index}`} className="hover:bg-[#1E1E1E]">
-                      <td className="py-3.5 px-3 font-mono font-bold text-[#D4AF37]">{slip.slipNo}</td>
-                      <td className="py-3.5 px-3 font-medium text-white">{slip.empName}</td>
-                      <td className="py-3.5 px-3 font-mono text-gray-400">{slip.empEmpId}</td>
-                      <td className="py-3.5 px-3 text-gray-300">{slip.month}</td>
-                      <td className="py-3.5 px-3 text-gray-300">{slip.fy}</td>
-                      <td className="py-3.5 px-3 font-mono text-gray-300">₹{slip.gross.toLocaleString('en-IN')}</td>
-                      <td className="py-3.5 px-3 font-mono text-rose-400">₹{slip.totalDed.toLocaleString('en-IN')}</td>
-                      <td className="py-3.5 px-3 font-mono font-bold text-emerald-400">₹{slip.net.toLocaleString('en-IN')}</td>
-                      <td className="py-3.5 px-3 text-right">
-                        <div className="inline-flex items-center space-x-2">
-                          <button
-                            onClick={() => handlePreviewSlip(slip)}
-                            className="p-1.5 rounded bg-[#2A2A2A] hover:bg-[#333333] text-[#D4AF37] border border-[#3A3A3A]"
-                            title="Preview Salary Slip"
-                          >
-                            <Eye className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => {
-                              if (confirm(`Delete slip ${slip.slipNo}?`)) {
-                                const next = history.filter(h => h.slipNo !== slip.slipNo);
-                                saveHistory(next);
-                                showToast(`Deleted slip ${slip.slipNo}`, 'info');
-                              }
-                            }}
-                            className="p-1.5 rounded bg-[#2A2A2A] hover:bg-[#333333] text-rose-400 border border-[#3A3A3A]"
-                            title="Delete Record"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs whitespace-nowrap">
+              <thead>
+                <tr className="text-gray-500 dark:text-gray-400 uppercase text-[11px] border-b border-gray-200 dark:border-[#2A2A2A]">
+                  <th className="py-2.5 px-3">Slip No.</th>
+                  <th className="py-2.5 px-3">Employee</th>
+                  <th className="py-2.5 px-3">Period</th>
+                  <th className="py-2.5 px-3 text-right">Net Pay</th>
+                  <th className="py-2.5 px-3 text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-[#2A2A2A]">
+                {history
+                  .filter(h => !histSearch || h.empName.toLowerCase().includes(histSearch.toLowerCase()))
+                  .map((slip, i) => (
+                    <tr key={slip.slipNo || i} className="hover:bg-gray-50 dark:hover:bg-[#252525]">
+                      <td className="py-2.5 px-3 font-semibold text-[#D4AF37]">{slip.slipNo}</td>
+                      <td className="py-2.5 px-3 font-medium text-gray-900 dark:text-white">{slip.empName}</td>
+                      <td className="py-2.5 px-3 text-gray-600 dark:text-gray-400">{slip.month} {slip.fy}</td>
+                      <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-600 dark:text-emerald-400">{formatCurrency(slip.net)}</td>
+                      <td className="py-2.5 px-3 text-right">
+                        <button
+                          onClick={() => handlePreviewSlip(slip)}
+                          className="px-2 py-1 rounded bg-gray-100 dark:bg-[#2A2A2A] text-[#D4AF37] font-semibold"
+                        >
+                          View
+                        </button>
                       </td>
                     </tr>
                   ))}
-                </tbody>
-              </table>
-            )}
+              </tbody>
+            </table>
           </div>
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════
-           4. SECTION: SETTINGS (Payroll Rules)
-      ═══════════════════════════════════════════════════════ */}
+      {/* 4. SETTINGS */}
       {activeSubTab === 'settings' && (
-        <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl p-6 shadow-sm space-y-6">
-          <div className="flex items-center space-x-2 pb-4 border-b border-[#333333]">
-            <SettingsIcon className="w-5 h-5 text-[#D4AF37]" />
-            <h3 className="text-sm font-bold text-white uppercase tracking-wider">Payroll &amp; Slip Configuration</h3>
-          </div>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-xs">
+        <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-colors">
+          <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-3">Payroll Rules</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
             <div>
-              <label className="block text-gray-400 uppercase font-semibold mb-1">Slip Number Prefix</label>
+              <label className="block text-gray-600 dark:text-gray-400 font-semibold mb-1">Slip Prefix</label>
               <input
                 type="text"
                 value={payrollSettings.slipPrefix}
                 onChange={e => setPayrollSettings({ ...payrollSettings, slipPrefix: e.target.value })}
-                className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-white font-mono focus:border-[#D4AF37] focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-gray-400 uppercase font-semibold mb-1">Overtime Multiplier</label>
-              <input
-                type="number"
-                step="0.5"
-                value={payrollSettings.otFormula}
-                onChange={e => setPayrollSettings({ ...payrollSettings, otFormula: Number(e.target.value) || 2 })}
-                className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-white font-mono focus:border-[#D4AF37] focus:outline-none"
-              />
-            </div>
-            <div>
-              <label className="block text-gray-400 uppercase font-semibold mb-1">Watermark Text</label>
-              <input
-                type="text"
-                value={payrollSettings.wmText}
-                onChange={e => setPayrollSettings({ ...payrollSettings, wmText: e.target.value })}
-                className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-white font-mono focus:border-[#D4AF37] focus:outline-none"
+                className="w-full bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] rounded px-3 py-1.5 text-gray-900 dark:text-white"
               />
             </div>
           </div>
         </div>
       )}
 
-      {/* ══════════════════════════════════════════════════════
-           MODAL: HIGH-FIDELITY A4 SALARY SLIP PREVIEW
-      ═══════════════════════════════════════════════════════ */}
+      {/* Modal: A4 Salary Slip Preview */}
       {isPreviewModalOpen && previewSlipData && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4 overflow-y-auto">
-          <div className="bg-[#181818] border border-[#333333] rounded-2xl w-full max-w-4xl max-h-[92vh] flex flex-col shadow-2xl overflow-hidden">
-            {/* Modal Header Bar */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-[#2A2A2A] bg-[#1E1E1E]">
-              <div className="flex items-center space-x-2">
-                <FileText className="w-5 h-5 text-[#D4AF37]" />
-                <h3 className="text-sm font-bold text-white uppercase tracking-wider">
-                  Salary Slip Preview — {previewSlipData.slipNo}
-                </h3>
-              </div>
-              <div className="flex items-center space-x-3">
+          <div className="bg-white dark:bg-[#181818] border border-gray-200 dark:border-[#333333] rounded-2xl w-full max-w-4xl max-h-[92vh] flex flex-col shadow-2xl overflow-hidden">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-[#2A2A2A] bg-gray-50 dark:bg-[#1E1E1E]">
+              <h3 className="text-sm font-bold text-gray-900 dark:text-white uppercase tracking-wider">
+                Salary Slip — {previewSlipData.slipNo}
+              </h3>
+              <div className="flex items-center gap-3">
                 <button
                   onClick={() => window.print()}
-                  className="px-3 py-1.5 rounded-lg bg-[#2A2A2A] hover:bg-[#333333] text-gray-300 text-xs font-semibold flex items-center space-x-1.5 border border-[#3A3A3A]"
+                  className="px-3 py-1.5 rounded-lg bg-gray-100 dark:bg-[#2A2A2A] text-gray-700 dark:text-gray-300 text-xs font-semibold flex items-center gap-1.5 border border-gray-300 dark:border-[#3A3A3A]"
                 >
                   <Printer className="w-3.5 h-3.5" />
                   <span>Print</span>
@@ -2392,339 +1838,96 @@ export default function SalaryStudio({
                 <button
                   onClick={handleDownloadPDF}
                   disabled={isPdfExporting}
-                  className="px-3 py-1.5 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] text-black text-xs font-bold flex items-center space-x-1.5 shadow-md shadow-[#D4AF37]/20 disabled:opacity-50"
+                  className="px-3 py-1.5 rounded-lg bg-[#D4AF37] hover:bg-[#f2c94c] text-black text-xs font-bold flex items-center gap-1.5 shadow-sm disabled:opacity-50"
                 >
                   <FileDown className="w-3.5 h-3.5" />
-                  <span>{isPdfExporting ? 'Generating PDF...' : 'Download PDF'}</span>
+                  <span>{isPdfExporting ? 'Generating...' : 'Download PDF'}</span>
                 </button>
                 <button
                   onClick={() => setIsPreviewModalOpen(false)}
-                  className="p-1.5 rounded-lg hover:bg-[#2A2A2A] text-gray-400 hover:text-white"
+                  className="p-1 rounded-lg text-gray-400 hover:text-gray-600 dark:hover:text-white"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
             </div>
 
-            {/* Scrollable Printable A4 Slip Container */}
-            <div className="flex-1 overflow-y-auto p-6 bg-[#0E0E0E] flex justify-center">
+            <div className="flex-1 overflow-y-auto p-6 bg-gray-100 dark:bg-[#0E0E0E] flex justify-center">
               <div
                 id="salarySlipPrintContainer"
                 style={{ width: '794px' }}
-                className="bg-white text-[#1A202C] font-sans relative shadow-2xl select-text"
+                className="bg-white text-[#1A202C] font-sans relative shadow-2xl"
               >
-                {/* ── 1. SLIP HEADER ── */}
+                {/* Header */}
                 <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 50%, #1B2A4A 100%)' }} className="p-6 flex items-center justify-between gap-4 text-white border-b-2 border-[#D4AF37]">
                   <div className="flex items-center gap-4 flex-1">
-                    {companySettings.logo ? (
-                      <div className="w-16 h-16 bg-white/95 rounded-lg p-1.5 flex items-center justify-center shrink-0 border border-[#D4AF37]/40 shadow-sm">
-                        <Image src={companySettings.logo} alt="Company Logo" width={60} height={60} className="max-h-full max-w-full object-contain" />
-                      </div>
-                    ) : (
-                      <div className="w-14 h-14 bg-[#1B2A4A] border border-[#D4AF37] rounded-lg flex items-center justify-center font-bold text-2xl text-[#D4AF37] shrink-0 shadow-md">
-                        ☀️
+                    {previewSlipData.companySnapshot.logo && (
+                      <div className="w-16 h-16 bg-white rounded-lg p-1.5 flex items-center justify-center shrink-0 border border-[#D4AF37]/40 shadow-sm">
+                        <Image src={previewSlipData.companySnapshot.logo} alt="Company Logo" width={60} height={60} className="max-h-full max-w-full object-contain" />
                       </div>
                     )}
                     <div>
-                      <h1 className="text-base font-extrabold uppercase tracking-wide text-white font-serif flex items-center gap-2">
-                        <span>{previewSlipData.companySnapshot.name}</span>
-                        <span className="text-[10px] px-2 py-0.5 rounded bg-[#D4AF37]/20 border border-[#D4AF37]/60 text-[#D4AF37] font-mono font-normal">
-                          SOLARITHM LUXURY SERIES
-                        </span>
+                      <h1 className="text-base font-extrabold uppercase text-white font-serif">
+                        {previewSlipData.companySnapshot.name}
                       </h1>
                       <p className="text-[11px] text-gray-300 mt-0.5">{previewSlipData.companySnapshot.address}</p>
-                      <p className="text-[10px] text-gray-400 mt-0.5">
-                        {previewSlipData.companySnapshot.gstin ? `GSTIN: ${previewSlipData.companySnapshot.gstin} | ` : ''}
-                        Phone: {previewSlipData.companySnapshot.phone} | Email: {previewSlipData.companySnapshot.email}
-                      </p>
+                      <p className="text-[10px] text-gray-400 mt-0.5">Phone: {previewSlipData.companySnapshot.phone}</p>
                     </div>
                   </div>
-
                   <div className="text-right shrink-0">
-                    <div className="inline-block px-3 py-1 bg-[#D4AF37] text-[#0F1C35] rounded font-black text-xs tracking-widest uppercase shadow-md">
-                      PAYSLIP / SALARY SLIP
+                    <div className="px-3 py-1 bg-[#D4AF37] text-[#0F1C35] rounded font-black text-xs uppercase">
+                      SALARY SLIP
                     </div>
-                    <div className="text-xs font-bold text-[#D4AF37] mt-1.5">
+                    <div className="text-xs font-bold text-[#D4AF37] mt-1">
                       {previewSlipData.month} {previewSlipData.fy}
                     </div>
-                    <div className="text-[10px] text-gray-300 font-mono mt-0.5">
-                      Slip Ref: {previewSlipData.slipNo}
-                    </div>
                   </div>
                 </div>
 
-                {/* ── 2. GOLD INFO BAND ── */}
-                <div style={{ background: 'linear-gradient(135deg, #D4AF37 0%, #E6C65A 50%, #D4AF37 100%)' }} className="px-6 py-2.5 grid grid-cols-4 gap-4 text-[#0F1C35] border-b border-[#0F1C35]/20 shadow-sm">
+                {/* Info Bar */}
+                <div style={{ background: 'linear-gradient(135deg, #D4AF37 0%, #E6C65A 50%, #D4AF37 100%)' }} className="px-6 py-2 grid grid-cols-4 gap-4 text-[#0F1C35]">
                   <div>
-                    <div className="text-[9px] uppercase font-extrabold tracking-wider text-[#0F1C35]/80">Employee Name</div>
-                    <div className="text-xs font-black text-[#0F1C35]">{previewSlipData.empName}</div>
+                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">Employee</div>
+                    <div className="text-xs font-black">{previewSlipData.empName}</div>
                   </div>
                   <div>
-                    <div className="text-[9px] uppercase font-extrabold tracking-wider text-[#0F1C35]/80">Employee ID</div>
-                    <div className="text-xs font-black font-mono text-[#0F1C35]">{previewSlipData.empEmpId}</div>
+                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">ID</div>
+                    <div className="text-xs font-black font-mono">{previewSlipData.empEmpId}</div>
                   </div>
                   <div>
-                    <div className="text-[9px] uppercase font-extrabold tracking-wider text-[#0F1C35]/80">Designation</div>
-                    <div className="text-xs font-black text-[#0F1C35]">{previewSlipData.employeeSnapshot.designation}</div>
+                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">Designation</div>
+                    <div className="text-xs font-black">{previewSlipData.employeeSnapshot.designation}</div>
                   </div>
                   <div>
-                    <div className="text-[9px] uppercase font-extrabold tracking-wider text-[#0F1C35]/80">Department</div>
-                    <div className="text-xs font-black text-[#0F1C35]">{previewSlipData.employeeSnapshot.department}</div>
-                  </div>
-                </div>
-
-                {/* ── 3. DARK INFO BAND ── */}
-                <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #17243E 100%)' }} className="px-6 py-2.5 grid grid-cols-5 gap-3 text-white text-[11px] border-b border-gray-200">
-                  <div>
-                    <div className="text-[9px] uppercase text-[#D4AF37] font-semibold tracking-wider">Date of Joining</div>
-                    <div className="font-medium text-gray-100">{previewSlipData.employeeSnapshot.doj || '01-01-2026'}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] uppercase text-[#D4AF37] font-semibold tracking-wider">PAN Number</div>
-                    <div className="font-mono font-medium text-gray-100">{previewSlipData.employeeSnapshot.pan || '—'}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] uppercase text-[#D4AF37] font-semibold tracking-wider">UAN Number</div>
-                    <div className="font-mono font-medium text-gray-100">{previewSlipData.employeeSnapshot.uan || '—'}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] uppercase text-[#D4AF37] font-semibold tracking-wider">PF Number</div>
-                    <div className="font-mono font-medium text-gray-100">{previewSlipData.employeeSnapshot.pfNo || '—'}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] uppercase text-[#D4AF37] font-semibold tracking-wider">Settlement Date</div>
-                    <div className="font-medium text-gray-100">{previewSlipData.payDate}</div>
+                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">Department</div>
+                    <div className="text-xs font-black">{previewSlipData.employeeSnapshot.department}</div>
                   </div>
                 </div>
 
-                {/* ── 4. SLIP BODY ── */}
+                {/* Body Table */}
                 <div className="p-6 space-y-4">
-                  {/* Expanded Grid (Bank details) */}
-                  <div className="grid grid-cols-3 border border-gray-200 rounded-lg text-xs overflow-hidden bg-gray-50/50">
-                    <div className="p-2.5 border-r border-b border-gray-200">
-                      <div className="text-[9px] uppercase font-bold text-gray-500">Bank Name</div>
-                      <div className="font-semibold text-gray-900 mt-0.5">{previewSlipData.employeeSnapshot.bank || 'Bank of Baroda'}</div>
-                    </div>
-                    <div className="p-2.5 border-r border-b border-gray-200">
-                      <div className="text-[9px] uppercase font-bold text-gray-500">Account Number</div>
-                      <div className="font-mono font-semibold text-gray-900 mt-0.5">
-                        {previewSlipData.employeeSnapshot.accNo ? `••••${String(previewSlipData.employeeSnapshot.accNo).slice(-4)}` : '—'}
-                      </div>
-                    </div>
-                    <div className="p-2.5 border-b border-gray-200">
-                      <div className="text-[9px] uppercase font-bold text-gray-500">IFSC Code</div>
-                      <div className="font-mono font-semibold text-gray-900 mt-0.5">{previewSlipData.employeeSnapshot.ifsc || '—'}</div>
-                    </div>
-                    <div className="p-2.5 border-r border-gray-200">
-                      <div className="text-[9px] uppercase font-bold text-gray-500">Financial Year</div>
-                      <div className="font-semibold text-gray-900 mt-0.5">{previewSlipData.fy}</div>
-                    </div>
-                    <div className="p-2.5 border-r border-gray-200">
-                      <div className="text-[9px] uppercase font-bold text-gray-500">Pay Period</div>
-                      <div className="font-semibold text-gray-900 mt-0.5">{previewSlipData.month} (Monthly)</div>
-                    </div>
-                    <div className="p-2.5">
-                      <div className="text-[9px] uppercase font-bold text-gray-500">Working Days</div>
-                      <div className="font-mono font-semibold text-gray-900 mt-0.5">{previewSlipData.attendance.totalDays} Days</div>
-                    </div>
-                  </div>
-
-                  {/* Attendance Summary */}
-                  <div>
-                    <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #1B2A4A 100%)' }} className="text-white px-3 py-1.5 rounded-t-md text-[10px] uppercase font-bold tracking-wider flex items-center justify-between border-b-2 border-[#D4AF37]">
-                      <span>ATTENDANCE RECORD &amp; PAY DAYS</span>
-                      <span className="text-[#D4AF37] font-mono text-[9px] font-semibold">MONTH: {previewSlipData.month.toUpperCase()}</span>
-                    </div>
-                    <div className="bg-gradient-to-r from-gray-50 to-slate-50 border border-gray-200 rounded-b-md p-3 grid grid-cols-6 gap-2 text-center text-xs">
-                      <div>
-                        <div className="text-[9px] uppercase font-semibold text-gray-500">Total Days</div>
-                        <div className="text-base font-bold font-mono text-gray-900">{previewSlipData.attendance.totalDays}</div>
-                      </div>
-                      <div>
-                        <div className="text-[9px] uppercase font-semibold text-gray-500">Present</div>
-                        <div className="text-base font-bold font-mono text-gray-900">{previewSlipData.attendance.presentDays}</div>
-                      </div>
-                      <div>
-                        <div className="text-[9px] uppercase font-semibold text-gray-500">Leave</div>
-                        <div className="text-base font-bold font-mono text-gray-900">{previewSlipData.attendance.leaveDays}</div>
-                      </div>
-                      <div>
-                        <div className="text-[9px] uppercase font-semibold text-gray-500">Paid Leave</div>
-                        <div className="text-base font-bold font-mono text-gray-900">{previewSlipData.attendance.paidLeave}</div>
-                      </div>
-                      <div>
-                        <div className="text-[9px] uppercase font-semibold text-gray-500">OT Hours</div>
-                        <div className="text-base font-bold font-mono text-gray-900">{previewSlipData.attendance.otHours}</div>
-                      </div>
-                      <div>
-                        <div className="text-[9px] uppercase font-semibold text-gray-500">LOP Days</div>
-                        <div className="text-base font-bold font-mono text-rose-600">{previewSlipData.attendance.lopDays}</div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Earnings & Deductions Tables */}
                   <div className="grid grid-cols-2 gap-4 text-xs">
-                    {/* Earnings */}
-                    <div>
-                      <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #1B2A4A 100%)' }} className="text-white px-3 py-1.5 rounded-t-md text-[10px] uppercase font-bold tracking-wider flex justify-between border-b-2 border-[#D4AF37]">
-                        <span>Earnings</span>
-                        <span className="text-[#D4AF37]">Amount (₹)</span>
-                      </div>
-                      <div className="border border-gray-200 rounded-b-md overflow-hidden">
-                        <table className="w-full text-left">
-                          <tbody className="divide-y divide-gray-100">
-                            <tr><td className="py-1.5 px-3">Basic Salary</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{previewSlipData.earnings.basic.toLocaleString('en-IN')}</td></tr>
-                            {previewSlipData.earnings.incentive > 0 && (
-                              <tr className="bg-amber-50/60 text-amber-900 font-semibold"><td className="py-1.5 px-3">Project Incentives</td><td className="py-1.5 px-3 text-right font-mono text-emerald-700">₹{previewSlipData.earnings.incentive.toLocaleString('en-IN')}</td></tr>
-                            )}
-                            {(previewSlipData.gross - previewSlipData.earnings.basic - previewSlipData.earnings.incentive) > 0 && (
-                              <tr><td className="py-1.5 px-3">Additional Earnings</td><td className="py-1.5 px-3 text-right font-mono font-medium">₹{(previewSlipData.gross - previewSlipData.earnings.basic - previewSlipData.earnings.incentive).toLocaleString('en-IN')}</td></tr>
-                            )}
-                          </tbody>
-                          <tfoot>
-                            <tr className="bg-slate-100 font-bold border-t-2 border-[#0F1C35]">
-                              <td className="py-2 px-3 text-[#0F1C35]">Gross Earnings</td>
-                              <td className="py-2 px-3 text-right font-mono text-[#0F1C35]">₹{previewSlipData.gross.toLocaleString('en-IN')}</td>
-                            </tr>
-                          </tfoot>
-                        </table>
-                      </div>
+                    <div className="border border-gray-200 rounded p-3 bg-gray-50/50">
+                      <div className="font-bold text-gray-700 mb-2">Earnings</div>
+                      <div className="flex justify-between py-1"><span>Basic Salary</span><span className="font-mono font-semibold">{formatCurrency(previewSlipData.earnings.basic)}</span></div>
+                      <div className="flex justify-between py-1 text-emerald-700 font-semibold"><span>Project Incentives</span><span className="font-mono">+{formatCurrency(previewSlipData.earnings.incentive)}</span></div>
+                      <div className="flex justify-between py-1.5 border-t border-gray-300 font-bold text-gray-900 mt-2"><span>Gross Earnings</span><span className="font-mono">{formatCurrency(previewSlipData.gross)}</span></div>
                     </div>
-
-                    {/* Deductions */}
-                    <div>
-                      <div style={{ background: 'linear-gradient(135deg, #1B2A4A 0%, #2A3B60 100%)' }} className="text-white px-3 py-1.5 rounded-t-md text-[10px] uppercase font-bold tracking-wider flex justify-between border-b-2 border-rose-500">
-                        <span>Deductions</span>
-                        <span className="text-rose-300">Amount (₹)</span>
-                      </div>
-                      <div className="border border-gray-200 rounded-b-md overflow-hidden">
-                        <table className="w-full text-left">
-                          <tbody className="divide-y divide-gray-100">
-                            <tr><td className="py-1.5 px-3">Provident Fund (PF)</td><td className="py-1.5 px-3 text-right font-mono font-medium text-rose-600">₹{previewSlipData.deductions.pf.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">ESIC</td><td className="py-1.5 px-3 text-right font-mono font-medium text-rose-600">₹{previewSlipData.deductions.esic.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">Professional Tax (PT)</td><td className="py-1.5 px-3 text-right font-mono font-medium text-rose-600">₹{previewSlipData.deductions.pt.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">TDS / Income Tax</td><td className="py-1.5 px-3 text-right font-mono font-medium text-rose-600">₹{previewSlipData.deductions.tds.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">Advance Deduction</td><td className="py-1.5 px-3 text-right font-mono font-medium text-rose-600">₹{previewSlipData.deductions.advance.toLocaleString('en-IN')}</td></tr>
-                            <tr><td className="py-1.5 px-3">Other Deductions</td><td className="py-1.5 px-3 text-right font-mono font-medium text-rose-600">₹{previewSlipData.deductions.other.toLocaleString('en-IN')}</td></tr>
-                          </tbody>
-                          <tfoot>
-                            <tr className="bg-rose-50/50 font-bold border-t-2 border-[#1B2A4A]">
-                              <td className="py-2 px-3 text-rose-700">Total Deductions</td>
-                              <td className="py-2 px-3 text-right font-mono text-rose-700">₹{previewSlipData.totalDed.toLocaleString('en-IN')}</td>
-                            </tr>
-                          </tfoot>
-                        </table>
-                      </div>
+                    <div className="border border-gray-200 rounded p-3 bg-gray-50/50">
+                      <div className="font-bold text-gray-700 mb-2">Deductions</div>
+                      <div className="flex justify-between py-1 text-rose-600"><span>Professional Tax (PT)</span><span className="font-mono">-{formatCurrency(previewSlipData.deductions.pt)}</span></div>
+                      <div className="flex justify-between py-1.5 border-t border-gray-300 font-bold text-rose-700 mt-2"><span>Total Deductions</span><span className="font-mono">-{formatCurrency(previewSlipData.totalDed)}</span></div>
                     </div>
                   </div>
 
-                  {/* Incentive Summary (compact, no client/project names) */}
-                  <div className="border border-[#D4AF37]/50 rounded-lg overflow-hidden text-xs shadow-sm">
-                    <div
-                      style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #1B2A4A 100%)' }}
-                      className="text-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider flex items-center justify-between border-b border-[#D4AF37]"
-                    >
-                      <span>Incentive Summary</span>
-                      <span className="text-[#D4AF37] font-mono text-[9px]">
-                        Performance Period: {getIncentiveSummaryForSlip(previewSlipData).cycleMonth} {getIncentiveSummaryForSlip(previewSlipData).cycleFY}
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 divide-x divide-gray-200 bg-white">
-                      <div className="py-3 px-3 text-center">
-                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Total Projects</div>
-                        <div className="text-base font-bold font-mono text-[#0F1C35] mt-0.5">
-                          {getIncentiveSummaryForSlip(previewSlipData).totalProjects} {getIncentiveSummaryForSlip(previewSlipData).totalProjects === 1 ? 'Project' : 'Projects'}
-                        </div>
-                      </div>
-                      <div className="py-3 px-3 text-center">
-                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Total System Size</div>
-                        <div className="text-base font-bold font-mono text-[#0F1C35] mt-0.5">
-                          {getIncentiveSummaryForSlip(previewSlipData).totalKwp.toFixed(2)} kWp
-                        </div>
-                      </div>
-                      <div className="py-3 px-3 text-center">
-                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Total Incentive Amount</div>
-                        <div className="text-base font-bold font-mono text-emerald-700 mt-0.5">
-                          ₹{getIncentiveSummaryForSlip(previewSlipData).totalIncentive.toLocaleString('en-IN')}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Net Salary Summary Box */}
-                  <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 50%, #1B2A4A 100%)' }} className="border-2 border-[#D4AF37] shadow-xl text-white rounded-xl p-5 grid grid-cols-3 gap-4 items-center text-center">
+                  <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 100%)' }} className="border-2 border-[#D4AF37] text-white rounded-xl p-4 flex items-center justify-between">
                     <div>
-                      <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Gross Earnings</div>
-                      <div className="text-base font-bold font-mono text-gray-100 mt-0.5">₹{previewSlipData.gross.toLocaleString('en-IN')}</div>
+                      <div className="text-[10px] font-bold uppercase text-[#D4AF37]">NET SALARY PAYABLE</div>
+                      <div className="text-xs text-gray-300 italic mt-0.5">{numberToWordsINR(previewSlipData.net)}</div>
                     </div>
-                    <div>
-                      <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Total Deductions</div>
-                      <div className="text-base font-bold font-mono text-rose-400 mt-0.5">₹{previewSlipData.totalDed.toLocaleString('en-IN')}</div>
+                    <div className="text-2xl font-black font-mono text-[#D4AF37]">
+                      {formatCurrency(previewSlipData.net)}
                     </div>
-                    <div className="border-l border-white/20 pl-4">
-                      <div className="text-[10px] uppercase font-bold text-[#D4AF37] tracking-wider">NET SALARY PAYABLE</div>
-                      <div className="text-2xl font-black font-mono text-[#D4AF37] mt-0.5 drop-shadow">₹{previewSlipData.net.toLocaleString('en-IN')}</div>
-                    </div>
-                  </div>
-
-                  {/* In Words */}
-                  <div className="bg-[#FAF7F0] border border-[#D4AF37]/50 rounded-lg p-3 text-xs">
-                    <div className="text-[9px] uppercase font-bold text-[#8C6D1F] tracking-wider">Net Amount in Words</div>
-                    <div className="font-bold text-[#0F1C35] italic mt-0.5">{numberToWordsINR(previewSlipData.net)}</div>
-                  </div>
-
-                  {/* Payment Settlement Summary */}
-                  <div className="border border-[#D4AF37]/50 rounded-lg overflow-hidden text-xs shadow-sm">
-                    <div
-                      style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #1B2A4A 100%)' }}
-                      className="text-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider border-b border-[#D4AF37]"
-                    >
-                      Payment Settlement Summary
-                    </div>
-                    <div className="grid grid-cols-2 divide-x divide-y divide-gray-200 bg-white">
-                      <div className="py-2.5 px-3">
-                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Payment Mode</div>
-                        <div className="font-semibold text-gray-900 mt-0.5">{getPaymentSummaryForSlip(previewSlipData).paymentMode}</div>
-                      </div>
-                      <div className="py-2.5 px-3">
-                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Transaction / Reference ID</div>
-                        <div className="font-semibold text-gray-900 mt-0.5 font-mono">{getPaymentSummaryForSlip(previewSlipData).transactionId}</div>
-                      </div>
-                      <div className="py-2.5 px-3">
-                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Payment Date</div>
-                        <div className="font-semibold text-gray-900 mt-0.5">{getPaymentSummaryForSlip(previewSlipData).paymentDate}</div>
-                      </div>
-                      <div className="py-2.5 px-3">
-                        <div className="text-[9px] uppercase font-bold text-gray-400 tracking-wider">Bank &amp; Account No.</div>
-                        <div className="font-semibold text-gray-900 mt-0.5">
-                          {getPaymentSummaryForSlip(previewSlipData).bankName} · <span className="font-mono">{getPaymentSummaryForSlip(previewSlipData).maskedAccountNumber}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* Slip Verification Footer */}
-                  <div className="pt-4 border-t-2 border-gray-200 grid grid-cols-2 gap-6 text-center text-xs items-end">
-                    <div>
-                      <div className="h-16 flex items-center justify-center font-serif text-[#0F1C35] border border-dashed border-[#D4AF37]/60 rounded-md bg-[#FAF7F0] italic text-xs">
-                        [ Official Stamp ]
-                      </div>
-                      <div className="text-[9px] font-semibold text-gray-500 uppercase tracking-wider mt-1">Company Seal</div>
-                    </div>
-
-                    <div>
-                      <div className="h-12 flex items-center justify-center font-script text-base text-gray-800">
-                        {previewSlipData.companySnapshot.signName}
-                      </div>
-                      <div className="border-b-2 border-[#0F1C35] w-32 mx-auto mb-1"></div>
-                      <div className="text-[10px] font-bold text-[#0F1C35]">Authorized Signatory</div>
-                      <div className="text-[9px] text-gray-500">{previewSlipData.companySnapshot.name}</div>
-                    </div>
-                  </div>
-
-                  <div className="text-center text-[9px] text-gray-400 pt-2 border-t border-gray-100">
-                    This is a computer-generated salary slip and does not require a physical signature. Confidential — For employee use only.
                   </div>
                 </div>
               </div>

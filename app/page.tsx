@@ -1,8 +1,16 @@
 'use client';
+
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { collection, onSnapshot, doc, updateDoc, deleteDoc, addDoc, getDoc, getDocs, query, where } from 'firebase/firestore';
-import { signOut } from 'firebase/auth';
-import { db, auth } from '@/src/lib/firebase';
+import { 
+  collection, 
+  onSnapshot, 
+  doc, 
+  updateDoc, 
+  deleteDoc, 
+  addDoc 
+} from 'firebase/firestore';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth, db } from '@/src/lib/firebase';
 import { useOwnerAuth } from '@/src/context/OwnerAuthContext';
 import { useTheme } from '@/src/context/ThemeContext';
 import OwnerLogin from '@/src/components/OwnerLogin';
@@ -25,16 +33,12 @@ import {
   Award,
   PieChart,
   Calendar,
-  ArrowUpRight,
   RotateCcw,
   Filter,
   LineChart,
   Clock,
   Trophy,
   Star,
-  Sparkles,
-  CheckCircle2,
-  AlertCircle,
   CreditCard,
   Banknote,
   LogOut,
@@ -48,163 +52,45 @@ import {
   ResponsiveContainer,
   AreaChart,
   Area,
-  BarChart,
-  Bar,
   XAxis,
   YAxis,
   Tooltip,
-  CartesianGrid,
-  Legend
+  CartesianGrid
 } from 'recharts';
-import { COLLECTIONS, PROJECT_FIELDS, CLIENT_FIELDS, CLIENT_STATUS, ProjectUpgradeRecord } from '@/src/config/schema';
-import { STORAGE_KEYS } from '@/src/lib/invoicePdfEngine';
+import { 
+  COLLECTIONS, 
+  PROJECT_FIELDS, 
+  CLIENT_FIELDS, 
+  CLIENT_STATUS, 
+  ProjectUpgradeRecord 
+} from '@/src/config/schema';
+import { 
+  parseSafeDate, 
+  formatSafeDate, 
+  getProjectDate, 
+  formatCurrency, 
+  toTitleCase, 
+  getFirstName, 
+  formatIndianName, 
+  safeNumber, 
+  isZeroOrPositive, 
+  buildUpgradeRecordIfChanged, 
+  findMatchingCapacityRow,
+  calculateSlabCost,
+  calculateSlabCommission,
+  SCOPE_LABELS, 
+  MONTH_OPTIONS,
+  resolveProjectPaymentStatus,
+  resolveEffectivePricingCategory
+} from '@/src/lib/projectUtils';
 import BillingModule from '@/src/components/Billing';
 import CompanySettingsView from '@/src/components/CompanySettingsView';
 import SalaryStudio from '@/src/components/SalaryStudio';
 import EmployeeDirectory from '@/src/components/EmployeeDirectory';
-
-const parseSafeDate = (dateVal: any): Date | null => {
-  if (!dateVal) return null;
-  try {
-    if (typeof dateVal?.toDate === 'function') {
-      const d = dateVal.toDate();
-      return isNaN(d.getTime()) ? null : d;
-    }
-    if (dateVal?.seconds !== undefined) {
-      const d = new Date(dateVal.seconds * 1000);
-      return isNaN(d.getTime()) ? null : d;
-    }
-    const d = new Date(dateVal);
-    return isNaN(d.getTime()) ? null : d;
-  } catch {
-    return null;
-  }
-};
-
-const formatSafeDate = (dateVal: any, formatType: 'input' | 'display' | 'slash' = 'display'): string => {
-  const d = parseSafeDate(dateVal);
-  if (!d) return "";
-  try {
-    if (formatType === 'input') {
-      return d.toISOString().split('T')[0];
-    }
-    if (formatType === 'slash') {
-      return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
-    }
-    return d.toLocaleDateString();
-  } catch {
-    return "";
-  }
-};
-
-const MONTH_OPTIONS = [
-  { value: 'all', label: 'All Months' },
-  { value: '0', label: 'January' },
-  { value: '1', label: 'February' },
-  { value: '2', label: 'March' },
-  { value: '3', label: 'April' },
-  { value: '4', label: 'May' },
-  { value: '5', label: 'June' },
-  { value: '6', label: 'July' },
-  { value: '7', label: 'August' },
-  { value: '8', label: 'September' },
-  { value: '9', label: 'October' },
-  { value: '10', label: 'November' },
-  { value: '11', label: 'December' },
-];
-
-const toTitleCase = (str: any): string => {
-  if (str === null || str === undefined) return '';
-  if (typeof str !== 'string') {
-    if (typeof str === 'number') return String(str);
-    if (typeof str === 'object') {
-      if (str.name) return toTitleCase(String(str.name));
-      if (str.label) return toTitleCase(String(str.label));
-      if (str.title) return toTitleCase(String(str.title));
-      if (str.companyName) return toTitleCase(String(str.companyName));
-      return '';
-    }
-    return String(str);
-  }
-  return str
-    .toLowerCase()
-    .split(' ')
-    .map(word => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(' ');
-};
-
-// Split-scope architecture: canonical scope keys -> display labels.
-// A project's `assignedScopes` map (e.g. { preDesign: 'a@x.com', ceig: 'b@x.com' })
-// lets each deliverable scope be assigned to a different designer.
-const SCOPE_LABELS: Record<string, string> = {
-  preDesign: 'Pre-Design',
-  ceig: 'CEIG',
-  ifp: 'IFP',
-  pvsyst: 'PVsyst',
-};
-
-/**
- * Compares a project's state before and after an edit, and builds a
- * ProjectUpgradeRecord if the scope, capacity, or cost actually changed.
- * Returns null when nothing upgrade-relevant changed, so a routine save
- * (e.g. fixing a typo in the project name) never creates a spurious
- * history entry. `upgradeDate` is always "now" -- the moment the change was
- * saved -- and is intentionally independent of the project's own
- * createdAt/date fields, which this never touches.
- */
-const buildUpgradeRecordIfChanged = (
-  originalProject: any,
-  editedProject: any,
-  reason?: string
-): ProjectUpgradeRecord | null => {
-  const previousScope = String(originalProject?.scopeOfWork || '');
-  const newScope = String(editedProject?.scopeOfWork || '');
-
-  const previousCapacity =
-    originalProject?.plantCapacity || originalProject?.systemCapacity || originalProject?.capacity || '';
-  const newCapacity =
-    editedProject?.plantCapacity || editedProject?.systemCapacity || editedProject?.capacity || '';
-
-  const previousCost = Number(originalProject?.calculatedCost) || 0;
-  const newCost = Number(editedProject?.calculatedCost) || 0;
-  const costDifferential = newCost - previousCost;
-
-  const scopeChanged = previousScope !== newScope;
-  const capacityChanged = String(previousCapacity) !== String(newCapacity);
-  const costChanged = costDifferential !== 0;
-
-  if (!scopeChanged && !capacityChanged && !costChanged) {
-    return null;
-  }
-
-  return {
-    upgradeId: `UPG_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-    upgradeDate: new Date().toISOString(),
-    previousScope,
-    newScope,
-    previousCapacity,
-    newCapacity,
-    costDifferential,
-    reason,
-    invoicedInPeriod: null,
-    incentivePaidInSlip: null
-  };
-};
-
-const getProjectDate = (project: any): Date | null => {
-  if (!project) return null;
-  // Priority: projectDate -> date -> createdAt. This function feeds nearly
-  // every date-sensitive calculation in the dashboard (the Projects table,
-  // revenue/expense periods, year dropdowns), so a retroactively-corrected
-  // project date now takes effect consistently everywhere, not just in one
-  // place -- matching the same fix already applied to Billing's own date
-  // matcher.
-  return parseSafeDate(
-    project.projectDate ||
-    project.date ||
-    project.createdAt
-  );
-};
+import PricingRulesView from '@/src/components/PricingRulesView';
+import ProposalsView from '@/src/components/ProposalsView';
+import EditProjectModal from '@/src/components/EditProjectModal';
+import ProjectsDirectory from '@/src/components/ProjectsDirectory';
 
 export default function DashboardPage() {
   const { theme, toggleTheme } = useTheme();
@@ -218,6 +104,8 @@ export default function DashboardPage() {
   const [proposals, setProposals] = useState<any[]>([]);
   const [invoices, setInvoices] = useState<any[]>([]);
   const [salaryHistory, setSalaryHistory] = useState<any[]>([]);
+  const [operationalExpenses, setOperationalExpenses] = useState<any[]>([]);
+  const [operationalIncomes, setOperationalIncomes] = useState<any[]>([]);
   
   // Executive profile & session controls
   const { 
@@ -229,25 +117,11 @@ export default function DashboardPage() {
     expireSession
   } = useOwnerAuth();
 
-  // 15-minute inactivity auto-logout. Lives here, at the root of the
-  // authenticated dashboard, and only runs while a verified owner is signed in.
-  useInactivityLogout({
-    enabled: authStatus === 'authorized',
-    onExpire: expireSession
-  });
-  const executiveProfile = ownerProfile || {
-    name: 'Executive Owner',
-    email: 'owner@solarithmdesign.com',
-    role: 'owner'
-  };
-
   // Time-based filtering state
   const [selectedMonth, setSelectedMonth] = useState<string>('all');
   const [selectedYear, setSelectedYear] = useState<string>('all');
-  // Projects Directory: column-header filters, search, and pagination.
-  // These are scoped to this one table -- they don't affect the shared
-  // Month/Year timeline filters above, which other dashboard sections
-  // (revenue, expenses) also depend on.
+
+  // Projects Directory: column-header filters, search, and pagination
   const [projectClientFilter, setProjectClientFilter] = useState<string>('all');
   const [projectScopeFilter, setProjectScopeFilter] = useState<string>('all');
   const [projectStatusFilter, setProjectStatusFilter] = useState<string>('all');
@@ -258,9 +132,6 @@ export default function DashboardPage() {
   const [expensePeriod, setExpensePeriod] = useState<'monthly' | 'quarterly' | 'yearly' | 'all'>('monthly');
 
   // Pricing Rules Filter States
-  const [selectedCategory, setSelectedCategory] = useState('');
-  const [selectedScope, setSelectedScope] = useState('');
-  const [selectedSubService, setSelectedSubService] = useState('');
   const [clientSearchTerm, setClientSearchTerm] = useState('');
 
   // Modal states
@@ -269,15 +140,36 @@ export default function DashboardPage() {
   const [projectPendingDeletion, setProjectPendingDeletion] = useState<any>(null);
   const [isDeletingProject, setIsDeletingProject] = useState(false);
   const [deleteProjectError, setDeleteProjectError] = useState<string | null>(null);
-  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+
+  const handleSignOutAndReset = useCallback(async () => {
+    setProjects([]);
+    setClients([]);
+    setPricingRules([]);
+    setCommissionRules([]);
+    setUsers([]);
+    setAuditLogs([]);
+    setProposals([]);
+    setInvoices([]);
+    setSalaryHistory([]);
+    setEditingProject(null);
+    setIsEditProjectModalOpen(false);
+    setActiveTab('Dashboard');
+    await handleSignOut();
+  }, [handleSignOut]);
+
+  // 15-minute inactivity auto-logout for verified owners
+  useInactivityLogout({
+    enabled: authStatus === 'authorized',
+    onExpire: expireSession
+  });
+
+  const executiveProfile = ownerProfile || {
+    name: 'Executive Owner',
+    email: 'owner@solarithmdesign.com',
+    role: 'owner'
+  };
 
   useEffect(() => {
-    // Don't open any Firestore listeners until the user is a verified owner.
-    // Pre-login they'd just be rejected by the owner-only security rules,
-    // and since they'd never re-subscribe on their own, the dashboard would
-    // stay empty after signing in. This effect re-runs when authStatus
-    // changes, so listeners start right after a successful login and are
-    // torn down on sign-out.
     if (authStatus !== 'authorized') return;
 
     let unsubscribeProjects: (() => void) | undefined;
@@ -289,7 +181,8 @@ export default function DashboardPage() {
     let unsubscribeCommissions: (() => void) | undefined;
     let unsubscribeInvoices: (() => void) | undefined;
     let unsubscribeSalaryHistory: (() => void) | undefined;
-    let unsubscribeAuditLogs: (() => void) | undefined;
+    let unsubscribeExpenses: (() => void) | undefined;
+    let unsubscribeIncomes: (() => void) | undefined;
 
     try {
       unsubscribeInvoices = onSnapshot(collection(db, 'invoices'), (snapshot) => {
@@ -337,18 +230,11 @@ export default function DashboardPage() {
         console.warn("Firestore pricing rules listener error:", err);
       });
 
-      // Synchronize employee directory & user profiles with Solarithm Master Blueprint
       let employeesMap: Record<string, any> = {};
       let usersMap: Record<string, any> = {};
 
       const syncEmployeesAndUsers = () => {
         const map = new Map<string, any>();
-        // Secondary index: normalized employeeId -> the map key it's filed
-        // under. Lets a corporate `employees` record and a personal-account
-        // `users` record for the same person merge into one entry even when
-        // their emails differ (e.g. a personal Google sign-in vs. the
-        // official @solarithmdesign.com address), instead of creating an
-        // orphan duplicate with a placeholder name.
         const employeeIdIndex = new Map<string, string>();
 
         const registerEmployeeId = (record: any, mapKey: string) => {
@@ -361,19 +247,14 @@ export default function DashboardPage() {
           }
         };
 
-        // Process users store
         Object.values(usersMap).forEach(u => {
-          // .trim() matters here: a trailing/leading space on one record's
-          // email (a common data-entry slip) would otherwise produce a
-          // different map key and silently create a duplicate profile.
           const key = (u.email || u.id || '').toLowerCase().trim();
           if (key) {
             map.set(key, u);
             registerEmployeeId(u, key);
           }
         });
-        // Merge primary employees directory records (highest authoritative KYC store).
-        // Joined first by email, then falling back to employeeId.
+
         Object.values(employeesMap).forEach(emp => {
           const emailKey = (emp.email || '').toLowerCase().trim();
           const empIdRaw = emp.employeeId || emp.empId;
@@ -445,15 +326,18 @@ export default function DashboardPage() {
         console.warn("Firestore salaryHistory listener error:", err);
       });
 
-      unsubscribeAuditLogs = onSnapshot(collection(db, COLLECTIONS.AUDIT_LOGS), (snapshot) => {
-        const logsData = snapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data()
-        }));
-        setAuditLogs(logsData);
-      }, (err) => {
-        console.warn("Firestore auditLogs listener error:", err);
-      });
+      // Solarithm Flow: Operational Expenses Outflows
+      unsubscribeExpenses = onSnapshot(collection(db, 'expenses'), (snapshot) => {
+        const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setOperationalExpenses(list);
+      }, (err) => console.warn("Firestore expenses listener notice:", err));
+
+      // Solarithm Flow: Direct Revenue Inflows
+      unsubscribeIncomes = onSnapshot(collection(db, 'incomes'), (snapshot) => {
+        const list = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        setOperationalIncomes(list);
+      }, (err) => console.warn("Firestore incomes listener notice:", err));
+
     } catch (err) {
       console.error("Firebase connection error:", err);
     }
@@ -468,7 +352,82 @@ export default function DashboardPage() {
       if (unsubscribeProposals) unsubscribeProposals();
       if (unsubscribeCommissions) unsubscribeCommissions();
       if (unsubscribeSalaryHistory) unsubscribeSalaryHistory();
-      if (unsubscribeAuditLogs) unsubscribeAuditLogs();
+      if (unsubscribeExpenses) unsubscribeExpenses();
+      if (unsubscribeIncomes) unsubscribeIncomes();
+    };
+  }, [authStatus]);
+
+  // DIRECTIVES 1 & 2: Guard auditLogs listener lifecycle with Firebase Auth state
+  useEffect(() => {
+    let unsubscribeAuditLogs: (() => void) | null = null;
+    let isMounted = true;
+
+    // 1. If auth is still loading, unauthorized, or db/auth unavailable, do not attach
+    if (authStatus !== 'authorized' || !db || !auth) {
+      setAuditLogs([]);
+      return;
+    }
+
+    const attachAuditListener = (user: any) => {
+      // Wait until auth.currentUser is fully resolved and non-null
+      if (!user || !isMounted || !db) return;
+
+      if (unsubscribeAuditLogs) {
+        unsubscribeAuditLogs();
+        unsubscribeAuditLogs = null;
+      }
+
+      try {
+        unsubscribeAuditLogs = onSnapshot(
+          collection(db, COLLECTIONS.AUDIT_LOGS),
+          (snapshot) => {
+            if (!isMounted) return;
+            const logsData = snapshot.docs.map((doc) => ({
+              id: doc.id,
+              ...doc.data()
+            }));
+            setAuditLogs(logsData);
+          },
+          (err: any) => {
+            // Directive 2: Graceful error handler for transient session reloads or permission initialization
+            if (process.env.NODE_ENV === 'development') {
+              console.warn('[AuditLogs] Non-fatal listener event handled:', err?.message || 'Permission pending');
+            }
+          }
+        );
+      } catch (err: any) {
+        console.warn('[AuditLogs] Handled listener attachment warning:', err?.message || err);
+      }
+    };
+
+    // If auth.currentUser is already resolved and present
+    if (auth.currentUser) {
+      attachAuditListener(auth.currentUser);
+    }
+
+    // Wait until auth.currentUser is fully resolved before creating the subscription
+    const unsubscribeAuth = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        attachAuditListener(user);
+      } else {
+        if (unsubscribeAuditLogs) {
+          unsubscribeAuditLogs();
+          unsubscribeAuditLogs = null;
+        }
+        if (isMounted) {
+          setAuditLogs([]);
+        }
+      }
+    });
+
+    // 3. Ensure proper cleanup: unsubscribe whenever component unmounts or user logs out
+    return () => {
+      isMounted = false;
+      unsubscribeAuth();
+      if (unsubscribeAuditLogs) {
+        unsubscribeAuditLogs();
+        unsubscribeAuditLogs = null;
+      }
     };
   }, [authStatus]);
 
@@ -478,11 +437,11 @@ export default function DashboardPage() {
         (c) => c.id === project.clientId || c.companyName === project.clientName
       );
 
-      const activeCategory = String(
-        project.pricingCategory || 
-        (matchedClient && matchedClient.pricingCategory) || 
-        'T1'
-      ).toLowerCase().trim();
+      const pDate = getProjectDate(project) || new Date();
+      const resolvedTier = project.pricingCategory 
+        ? project.pricingCategory 
+        : (matchedClient ? resolveEffectivePricingCategory(matchedClient, pDate) : 'T1');
+      const activeCategory = String(resolvedTier).toLowerCase().trim();
 
       const rawCapacity = String(project.plantCapacity || project.systemCapacity || project.capacity || '0');
       const capacity = parseFloat(rawCapacity.replace(/[^\d.]/g, '')) || 0;
@@ -490,33 +449,31 @@ export default function DashboardPage() {
       const scope = String(project.scopeOfWork || '').toLowerCase().trim();
       const subService = String(project.subService || 'Standard').toLowerCase().trim();
 
-      // 1. HISTORICAL DATA LOCK
+      // Historical Data Lock
       let calculatedCost = 0;
       let isCostLocked = false;
       
-      if (project.finalCost !== undefined && project.finalCost !== null && !isNaN(Number(project.finalCost)) && Number(project.finalCost) > 0) {
+      if (isZeroOrPositive(project.finalCost)) {
         calculatedCost = Number(project.finalCost);
         isCostLocked = true;
-      } else if (project.calculatedCost !== undefined && project.calculatedCost !== null && !isNaN(Number(project.calculatedCost)) && Number(project.calculatedCost) > 0) {
+      } else if (isZeroOrPositive(project.calculatedCost)) {
         calculatedCost = Number(project.calculatedCost);
         isCostLocked = true;
-      } else if (project.cost !== undefined && project.cost !== null && !isNaN(Number(project.cost)) && Number(project.cost) > 0) {
+      } else if (isZeroOrPositive(project.cost)) {
         calculatedCost = Number(project.cost);
         isCostLocked = true;
-      } else if (project.amount !== undefined && project.amount !== null && !isNaN(Number(project.amount)) && Number(project.amount) > 0) {
+      } else if (isZeroOrPositive(project.amount)) {
         calculatedCost = Number(project.amount);
         isCostLocked = true;
-      } else if (project.totalCost !== undefined && project.totalCost !== null && !isNaN(Number(project.totalCost)) && Number(project.totalCost) > 0) {
+      } else if (isZeroOrPositive(project.totalCost)) {
         calculatedCost = Number(project.totalCost);
         isCostLocked = true;
-      } else if (project.price !== undefined && project.price !== null && !isNaN(Number(project.price)) && Number(project.price) > 0) {
+      } else if (isZeroOrPositive(project.price)) {
         calculatedCost = Number(project.price);
         isCostLocked = true;
       }
 
-      let finalMatchedRule = null;
-
-      // 2. DYNAMIC CALCULATION
+      // Dynamic Pricing Fallback
       if (!isCostLocked) {
         const matchedRule = pricingRules.find(
           (rule) => {
@@ -528,47 +485,10 @@ export default function DashboardPage() {
           }
         );
 
-        if (matchedRule && Array.isArray(matchedRule.capacityRows)) {
-          // 3. CAPACITY RANGE PARSING
-          for (const row of matchedRule.capacityRows) {
-            const range = String(row.capacityRange || '').toUpperCase().trim();
-            let isMatch = false;
-
-            if (range.includes('-')) {
-              const [minStr, maxStr] = range.split('-');
-              const min = Number(minStr);
-              const max = Number(maxStr);
-              if (capacity >= min && capacity <= max) {
-                isMatch = true;
-              }
-            } else if (range.includes('ABOVE') || range.includes('>')) {
-              const min = Number(range.replace('ABOVE', '').replace('>', '').trim());
-              if (capacity > min) {
-                isMatch = true;
-              }
-            } else if (range.includes('UP TO') || range.includes('<=')) {
-              const max = Number(range.replace('UP TO', '').replace('<=', '').trim());
-              if (capacity <= max) {
-                isMatch = true;
-              }
-            } else if (range.includes('<')) {
-              const max = Number(range.replace('<', '').trim());
-              if (capacity < max) {
-                isMatch = true;
-              }
-            }
-
-            if (isMatch) {
-              finalMatchedRule = row;
-              // 4. PRICE TYPE MATH
-              const price = Number(row.price || row.basePrice || 0);
-              if (row.priceType === 'Per KW' || row.priceType === 'Per kW') {
-                calculatedCost = price * capacity;
-              } else {
-                calculatedCost = price; // Fixed
-              }
-              break;
-            }
+        if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+          const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
+          if (matchedRow) {
+            calculatedCost = calculateSlabCost(matchedRow, capacity);
           }
         }
         if (calculatedCost === 0 && matchedRule && (matchedRule.basePrice || matchedRule.price)) {
@@ -576,18 +496,14 @@ export default function DashboardPage() {
         }
       }
 
-      // 5. COMMISSION ENGINE
+      // Commission Engine with Zero-Value Safety
       const calculateCommission = (role: string) => {
-        // Explicit value on project takes absolute priority regardless of status
         const lockedVal = role === 'designer' 
-          ? (project.designerCommission ?? project.financials?.designerCommission)
-          : (project.salesCommission ?? project.financials?.salesCommission);
+          ? (project.designerCommission ?? project.designerFee ?? project.financials?.designerCommission)
+          : (project.salesCommission ?? project.commission ?? project.totalCommission ?? project.financials?.salesCommission);
         
-        if (lockedVal !== undefined && lockedVal !== null && String(lockedVal).trim() !== '') {
-          const numVal = Number(lockedVal);
-          if (!isNaN(numVal) && numVal > 0) {
-            return numVal;
-          }
+        if (isZeroOrPositive(lockedVal)) {
+          return Number(lockedVal);
         }
 
         let matchedRule = commissionRules.find(rule => {
@@ -598,7 +514,6 @@ export default function DashboardPage() {
         });
 
         if (!matchedRule) {
-          // Fallback to Standard subService
           matchedRule = commissionRules.find(rule => {
             const ruleRole = String(rule.role || '').toLowerCase().trim();
             const ruleScope = String(rule.scope || rule.scopeOfWork || '').toLowerCase().trim();
@@ -607,37 +522,17 @@ export default function DashboardPage() {
           });
         }
 
-        if (matchedRule && Array.isArray(matchedRule.capacityRows)) {
-          for (const row of matchedRule.capacityRows) {
-            const range = String(row.capacityRange || '').toUpperCase().trim();
-            let isMatch = false;
-
-            if (range.includes('-')) {
-              const [minStr, maxStr] = range.split('-');
-              if (capacity >= Number(minStr) && capacity <= Number(maxStr)) isMatch = true;
-            } else if (range.includes('ABOVE') || range.includes('>')) {
-              if (capacity > Number(range.replace('ABOVE', '').replace('>', '').trim())) isMatch = true;
-            } else if (range.includes('UP TO') || range.includes('<=')) {
-              if (capacity <= Number(range.replace('UP TO', '').replace('<=', '').trim())) isMatch = true;
-            } else if (range.includes('<')) {
-              if (capacity < Number(range.replace('<', '').trim())) isMatch = true;
-            }
-
-            if (isMatch) {
-              const price = Number(row.price || row.basePrice || 0);
-              const type = String(row.priceType || '').toLowerCase();
-              const rawCommission = (type.includes('kw')) ? (price * capacity) : price;
-              
-              const maxCap = (matchedRule.maxCommission !== undefined && matchedRule.maxCommission !== null && String(matchedRule.maxCommission).trim() !== '')
-                ? Number(matchedRule.maxCommission)
-                : 0;
-
-              if (!isNaN(maxCap) && maxCap > 0) {
-                return Math.min(rawCommission, maxCap);
-              }
-              return rawCommission;
-            }
+        if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+          const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
+          if (matchedRow) {
+            const maxCap = isZeroOrPositive(matchedRule.maxCommission)
+              ? Number(matchedRule.maxCommission)
+              : 0;
+            return calculateSlabCommission(matchedRow, capacity, maxCap);
           }
+        }
+        if (matchedRule && isZeroOrPositive(matchedRule.basePrice || matchedRule.price)) {
+          return Number(matchedRule.basePrice || matchedRule.price || 0);
         }
         return 0;
       };
@@ -645,14 +540,14 @@ export default function DashboardPage() {
       const designerCommission = calculateCommission('designer');
       const salesCommission = calculateCommission('sales');
 
-      const directComm = Number(project.commission ?? project.totalCommission ?? project.incentive ?? 0);
+      const directComm = safeNumber(project.commission ?? project.totalCommission ?? project.incentive);
       let totalCommissionExpense = designerCommission + salesCommission;
-      if (totalCommissionExpense === 0 && !isNaN(directComm) && directComm > 0) {
+      if (totalCommissionExpense === 0 && directComm > 0) {
         totalCommissionExpense = directComm;
       }
 
       if (Array.isArray(project.employeeCommissions)) {
-        const arrSum = project.employeeCommissions.reduce((sum: number, c: any) => sum + (Number(c.amount || c.commission || 0) || 0), 0);
+        const arrSum = project.employeeCommissions.reduce((sum: number, c: any) => sum + safeNumber(c.amount || c.commission), 0);
         if (arrSum > totalCommissionExpense) {
           totalCommissionExpense = arrSum;
         }
@@ -680,59 +575,161 @@ export default function DashboardPage() {
     });
   }, [projects, clients, pricingRules, commissionRules]);
 
-  const handleUpdateProject = async () => {
-    if (!editingProject || !editingProject.id) return;
-    const originalProject = projects.find(p => p.id === editingProject.id) || {};
+  const handleUpdateProject = async (overrideData?: any) => {
+    const targetProject = overrideData || editingProject;
+    if (!targetProject || !targetProject.id) return;
+    const originalProject = projects.find(p => p.id === targetProject.id) || {};
+
+    const finalCostValue = safeNumber(targetProject.finalCost ?? targetProject.calculatedCost ?? targetProject.cost);
+    const salesCommissionValue = safeNumber(targetProject.salesCommission ?? targetProject.commission);
+    const designerCommissionValue = safeNumber(targetProject.designerCommission ?? targetProject.designerFee);
+    const plantCapacityValue = safeNumber(targetProject.plantCapacity ?? targetProject.systemCapacity ?? targetProject.capacity);
+
+    // CRITICAL DATE PRESERVATION (Audit Task 5):
+    // Preserve existing date strictly: project.projectDate || project.date || project.createdAt
+    // Do NOT set new Date() unless the user explicitly changed the date picker value in the form
+    const originalDate = originalProject.projectDate || originalProject.date || originalProject.createdAt || '';
+    const originalFormattedDate = parseSafeDate(originalDate)?.toISOString().split('T')[0] || '';
+    const dateExplicitlyChanged = Boolean(
+      targetProject.projectDate &&
+      targetProject.projectDate !== originalDate &&
+      targetProject.projectDate !== originalFormattedDate
+    );
+    const finalProjectDate = dateExplicitlyChanged ? targetProject.projectDate : (originalDate || targetProject.projectDate || '');
 
     const updatedData: any = {
-      projectName: editingProject.projectName || '',
-      clientName: editingProject.clientName || '',
-      status: editingProject.status || 'Active',
-      scopeOfWork: editingProject.scopeOfWork || '',
-      designerEmail: editingProject.designerEmail || '',
-      salesPersonEmail: editingProject.salesPersonEmail || '',
-      systemCapacity: editingProject.systemCapacity || editingProject.capacity || '',
-      capacity: editingProject.capacity || editingProject.systemCapacity || '',
-      plantCapacity: editingProject.plantCapacity || editingProject.systemCapacity || editingProject.capacity || '',
-      subService: editingProject.subService || '',
-      pricingCategory: editingProject.pricingCategory || '',
-      // Crucial rule: the project's original entry date is never touched by
-      // an edit/upgrade, regardless of what the edit form happens to carry.
-      // This always writes back the pre-edit value, never editingProject's.
-      createdAt: originalProject.createdAt,
-      calculatedCost: Number(editingProject.calculatedCost) || 0,
-      designerCommission: Number(editingProject.designerCommission) || 0,
-      salesCommission: Number(editingProject.salesCommission) || 0
+      projectName: (targetProject.projectName || '').trim(),
+      clientName: (targetProject.clientName || '').trim(),
+      clientId: targetProject.clientId || originalProject.clientId || '',
+      status: targetProject.status || originalProject.status || 'Active',
+      scopeOfWork: targetProject.scopeOfWork || originalProject.scopeOfWork || 'Detailed Engineering',
+      subService: targetProject.subService || originalProject.subService || 'Standard',
+      pricingCategory: targetProject.pricingCategory || originalProject.pricingCategory || 'T1',
+      designerEmail: targetProject.designerEmail ?? originalProject.designerEmail ?? '',
+      designerName: targetProject.designerName || (targetProject.designerEmail ? getEmployeeName(targetProject.designerEmail) : (originalProject.designerName || '')),
+      salesPersonEmail: targetProject.salesPersonEmail || originalProject.salesPersonEmail || '',
+      systemCapacity: plantCapacityValue,
+      capacity: plantCapacityValue,
+      plantCapacity: plantCapacityValue,
+      capacityUnit: targetProject.capacityUnit || originalProject.capacityUnit || 'KW',
+      projectDate: finalProjectDate,
+      date: finalProjectDate,
+      createdAt: originalProject.createdAt || finalProjectDate,
+      calculatedCost: finalCostValue,
+      finalCost: finalCostValue,
+      cost: finalCostValue,
+      // Critical Commission Output Persistence
+      salesCommission: salesCommissionValue,
+      commission: salesCommissionValue,
+      totalCommission: salesCommissionValue + designerCommissionValue,
+      designerCommission: designerCommissionValue,
+      designerFee: designerCommissionValue,
+      updatedAt: new Date().toISOString()
     };
 
-    // Detect a real scope/capacity/cost change and append (never overwrite)
-    // an upgrade record -- this is what lets billing and payroll later
-    // identify "this is a modification, not the original entry" without
-    // ever touching createdAt/date.
-    const upgradeRecord = buildUpgradeRecordIfChanged(originalProject, editingProject);
+    const upgradeRecord = buildUpgradeRecordIfChanged(originalProject, targetProject);
     if (upgradeRecord) {
       updatedData.upgradeHistory = [...(originalProject.upgradeHistory || []), upgradeRecord];
     }
 
-    // Update local state immediately
-    setProjects(prev => prev.map(p => p.id === editingProject.id ? { ...p, ...updatedData } : p));
+    const previousProjects = [...projects];
 
+    setProjects(prev => prev.map(p => {
+      if (p.id !== targetProject.id) return p;
+      const totComm = salesCommissionValue + designerCommissionValue;
+      return {
+        ...p,
+        ...updatedData,
+        designerCommission: designerCommissionValue,
+        salesCommission: salesCommissionValue,
+        commission: salesCommissionValue,
+        totalCommissionExpense: totComm,
+        financials: {
+          ...(p.financials || {}),
+          costOfProject: finalCostValue,
+          salesCommission: salesCommissionValue,
+          designerCommission: designerCommissionValue,
+          totalCommissionExpense: totComm,
+          remainingBalance: finalCostValue - totComm
+        }
+      };
+    }));
+
+    // Firestore updates must only modify fields that were changed by the user (Audit Task 5)
     try {
-      const projectRef = doc(db, COLLECTIONS.PROJECTS, editingProject.id);
-      await updateDoc(projectRef, updatedData);
+      const projectRef = doc(db, COLLECTIONS.PROJECTS, targetProject.id);
+      const firestoreUpdatePayload: Record<string, any> = {
+        updatedAt: new Date().toISOString()
+      };
+
+      if (targetProject.projectName && targetProject.projectName !== originalProject.projectName) {
+        firestoreUpdatePayload.projectName = targetProject.projectName.trim();
+      }
+      if (targetProject.clientName && targetProject.clientName !== originalProject.clientName) {
+        firestoreUpdatePayload.clientName = targetProject.clientName.trim();
+      }
+      if (targetProject.clientId && targetProject.clientId !== originalProject.clientId) {
+        firestoreUpdatePayload.clientId = targetProject.clientId;
+      }
+      if (targetProject.status && targetProject.status !== originalProject.status) {
+        firestoreUpdatePayload.status = targetProject.status;
+      }
+      if (targetProject.scopeOfWork && targetProject.scopeOfWork !== originalProject.scopeOfWork) {
+        firestoreUpdatePayload.scopeOfWork = targetProject.scopeOfWork;
+      }
+      if (targetProject.subService && targetProject.subService !== originalProject.subService) {
+        firestoreUpdatePayload.subService = targetProject.subService;
+      }
+      if (targetProject.pricingCategory && targetProject.pricingCategory !== originalProject.pricingCategory) {
+        firestoreUpdatePayload.pricingCategory = targetProject.pricingCategory;
+      }
+      if (targetProject.designerEmail !== originalProject.designerEmail) {
+        firestoreUpdatePayload.designerEmail = targetProject.designerEmail || '';
+        firestoreUpdatePayload.designerName = targetProject.designerName || (targetProject.designerEmail ? getEmployeeName(targetProject.designerEmail) : '');
+      }
+      if (targetProject.salesPersonEmail !== originalProject.salesPersonEmail) {
+        firestoreUpdatePayload.salesPersonEmail = targetProject.salesPersonEmail || '';
+      }
+      if (plantCapacityValue !== safeNumber(originalProject.plantCapacity)) {
+        firestoreUpdatePayload.plantCapacity = plantCapacityValue;
+        firestoreUpdatePayload.systemCapacity = plantCapacityValue;
+        firestoreUpdatePayload.capacity = plantCapacityValue;
+      }
+      if (finalCostValue !== safeNumber(originalProject.finalCost)) {
+        firestoreUpdatePayload.calculatedCost = finalCostValue;
+        firestoreUpdatePayload.finalCost = finalCostValue;
+        firestoreUpdatePayload.cost = finalCostValue;
+      }
+      if (salesCommissionValue !== safeNumber(originalProject.salesCommission)) {
+        firestoreUpdatePayload.salesCommission = salesCommissionValue;
+        firestoreUpdatePayload.commission = salesCommissionValue;
+      }
+      if (designerCommissionValue !== safeNumber(originalProject.designerCommission)) {
+        firestoreUpdatePayload.designerCommission = designerCommissionValue;
+        firestoreUpdatePayload.designerFee = designerCommissionValue;
+      }
+      firestoreUpdatePayload.totalCommission = salesCommissionValue + designerCommissionValue;
+
+      // Strict Date preservation in Firestore: only write if explicitly changed by user
+      if (dateExplicitlyChanged) {
+        firestoreUpdatePayload.projectDate = finalProjectDate;
+        firestoreUpdatePayload.date = finalProjectDate;
+      }
+
+      if (upgradeRecord) {
+        firestoreUpdatePayload.upgradeHistory = [...(originalProject.upgradeHistory || []), upgradeRecord];
+      }
+
+      await updateDoc(projectRef, firestoreUpdatePayload);
     } catch (error) {
-      console.warn("Could not sync project update to Firestore:", error);
+      console.warn("Could not sync project update to Firestore, rolling back:", error);
+      setProjects(previousProjects);
     }
     
     setIsEditProjectModalOpen(false);
     setEditingProject(null);
   };
 
-  // Permanently deletes a project from Firestore. Only removes the project
-  // document itself -- invoices and salary/incentive history that reference
-  // it by projectId are left alone, since those are historical financial
-  // records and shouldn't disappear just because the source project was
-  // deleted from the directory.
   const handleConfirmDeleteProject = async () => {
     if (!projectPendingDeletion?.id) return;
     setIsDeletingProject(true);
@@ -749,14 +746,8 @@ export default function DashboardPage() {
       return;
     }
 
-    // Local state update: financialProjects, filteredFinancialProjects, and
-    // every dashboard metric derived from `projects` are memoized off this
-    // array, so removing it here immediately reflects everywhere -- no
-    // manual refresh needed.
     setProjects((prev) => prev.filter((p) => p.id !== projectId));
 
-    // Best-effort audit trail for an irreversible action. Never blocks the
-    // deletion itself if this write fails.
     try {
       await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
         action: 'PROJECT_DELETED',
@@ -773,6 +764,26 @@ export default function DashboardPage() {
     setProjectPendingDeletion(null);
   };
 
+  const handleDeleteProjectDirectly = async (projectId: string, projectName: string) => {
+    try {
+      await deleteDoc(doc(db, COLLECTIONS.PROJECTS, projectId));
+    } catch (error) {
+      console.error('Failed to delete project from Firestore:', error);
+    }
+    setProjects((prev) => prev.filter((p) => p.id !== projectId));
+    try {
+      await addDoc(collection(db, COLLECTIONS.AUDIT_LOGS), {
+        action: 'PROJECT_DELETED',
+        actor: executiveProfile?.email || 'owner',
+        target: projectId,
+        details: { projectName: projectName || 'Untitled' },
+        timestamp: new Date().toISOString()
+      });
+    } catch (logErr) {
+      console.warn('Audit log write for project deletion failed:', logErr);
+    }
+  };
+
   const stats = [
     { name: 'Billing', collection: 'invoices', icon: Receipt, count: invoices?.length || 0, color: 'text-[#D4AF37]' },
     { name: 'Salary Studio', collection: 'salary_slips', icon: Banknote, count: salaryHistory?.length || 0, color: 'text-[#D4AF37]' },
@@ -783,19 +794,24 @@ export default function DashboardPage() {
     { name: 'Employees', collection: COLLECTIONS.EMPLOYEES, icon: Users, count: users?.length || 0, color: 'text-[#D4AF37]' },
   ];
 
-  const availableDesigners = users.filter(u => String(u.department).toLowerCase() === 'designer' || String(u.role).toLowerCase() === 'designer');
-  const availableSales = users.filter(u => String(u.department).toLowerCase() === 'sales' || String(u.role).toLowerCase() === 'sales');
-
   const getEmployeeName = useCallback((email: string | undefined | null) => {
     if (!email) return 'N/A';
     const user = users.find(u => u.email?.toLowerCase() === email?.toLowerCase());
     return user?.name || user?.displayName || email.split('@')[0];
   }, [users]);
 
-  // Builds the "Pre-Design & PVsyst: Designer A | CEIG & IFP: Designer B" summary
-  // for split-scope projects. Falls back to the legacy single `designerEmail`
-  // field for projects that haven't been migrated to `assignedScopes` yet, so
-  // existing single-designer projects render exactly as before.
+  const projectHasDesignerName = useCallback((project: any, designerName: string): boolean => {
+    if (project.designerEmail && formatIndianName(getEmployeeName(project.designerEmail)) === designerName) {
+      return true;
+    }
+    if (project.assignedScopes && typeof project.assignedScopes === 'object') {
+      return Object.values(project.assignedScopes).some(
+        (email: any) => email && formatIndianName(getEmployeeName(email)) === designerName
+      );
+    }
+    return false;
+  }, [getEmployeeName]);
+
   const getScopeDesignerSummary = useCallback((project: any): string => {
     const assignedScopes = project?.assignedScopes;
     if (assignedScopes && typeof assignedScopes === 'object' && Object.keys(assignedScopes).length > 0) {
@@ -810,12 +826,11 @@ export default function DashboardPage() {
 
       if (groupsByDesigner.size > 0) {
         return Array.from(groupsByDesigner.entries())
-          .map(([email, scopeLabels]) => `${scopeLabels.join(' & ')}: ${toTitleCase(getEmployeeName(email))}`)
+          .map(([email, scopeLabels]) => `${scopeLabels.join(' & ')}: ${formatIndianName(getEmployeeName(email))}`)
           .join(' | ');
       }
     }
-    // Legacy single-scope project: one designer for the whole project.
-    return toTitleCase(getEmployeeName(project?.designerEmail));
+    return formatIndianName(getEmployeeName(project?.designerEmail));
   }, [getEmployeeName]);
 
   const getStatusBadge = (status: string) => {
@@ -825,82 +840,24 @@ export default function DashboardPage() {
       case 'approved':
       case 'completed':
       case 'finished':
-        return <div className={`${baseClasses} bg-emerald-500/10 text-emerald-400 border-emerald-500/30`}>Approved</div>;
+        return <div className={`${baseClasses} bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30`}>Approved</div>;
       case 'in_progress':
       case 'pending_design_approval':
       case 'active':
-        return <div className={`${baseClasses} bg-amber-500/10 text-amber-400 border-amber-500/30`}>In Progress</div>;
+        return <div className={`${baseClasses} bg-amber-500/10 text-amber-600 dark:text-amber-400 border-amber-500/30`}>In Progress</div>;
       case 'in_revision':
         return <div className={`${baseClasses} bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30`}>In Revision</div>;
       case 'not_started':
       case 'rejected':
       case 'cancelled':
-        return <div className={`${baseClasses} bg-rose-500/10 text-rose-400 border-rose-500/30`}>Not Started</div>;
+        return <div className={`${baseClasses} bg-rose-500/10 text-rose-600 dark:text-rose-400 border-rose-500/30`}>Not Started</div>;
       default:
-        return <div className={`${baseClasses} bg-gray-500/10 text-gray-400 border-gray-500/30`}>{status || 'Unknown'}</div>;
+        return <div className={`${baseClasses} bg-gray-100 dark:bg-gray-500/10 text-gray-700 dark:text-gray-400 border-gray-300 dark:border-gray-500/30`}>{status || 'Unknown'}</div>;
     }
   };
 
   const getProjectPaymentStatus = useCallback((project: any): { status: 'pending' | 'sent' | 'partially_paid' | 'paid'; label: string } => {
-    if (!project) {
-      return { status: 'pending', label: 'Payment Pending' };
-    }
-
-    // Direct status on project record has immediate precedence
-    const explicitStatus = String(project.paymentStatus || project.payment_status || project.invoiceStatus || '').toLowerCase().trim();
-    if (explicitStatus === 'paid' || explicitStatus === 'cleared') {
-      return { status: 'paid', label: 'Paid' };
-    }
-    if (explicitStatus === 'partially paid' || explicitStatus === 'partially_paid' || explicitStatus === 'partial') {
-      return { status: 'partially_paid', label: 'Partially Paid' };
-    }
-    if (explicitStatus === 'sent' || explicitStatus === 'invoiced') {
-      return { status: 'sent', label: 'Invoice Sent' };
-    }
-    if (explicitStatus === 'pending' || explicitStatus === 'unpaid' || explicitStatus === 'due') {
-      return { status: 'pending', label: 'Payment Pending' };
-    }
-
-    if (!invoices || invoices.length === 0) {
-      return { status: 'pending', label: 'Payment Pending' };
-    }
-
-    const projId = project.id ? String(project.id).trim().toLowerCase() : '';
-    const projName = String(project.projectName || project.name || '').trim().toLowerCase();
-
-    // Find all invoices that include this project
-    const matchingInvoices = invoices.filter((inv) => {
-      if (projId && (inv.projectId === projId || (Array.isArray(inv.projectIds) && inv.projectIds.includes(projId)))) {
-        return true;
-      }
-      if (!inv.rows || !Array.isArray(inv.rows)) return false;
-      return inv.rows.some((row: any) => {
-        const rowProjId = row.projectId ? String(row.projectId).trim().toLowerCase() : '';
-        const rowDesc = String(row.desc || row.projectName || '').trim().toLowerCase();
-        if (projId && (rowProjId === projId || String(row.id).toLowerCase() === projId)) return true;
-        if (projName && rowDesc && (rowDesc === projName || rowDesc.includes(projName) || projName.includes(rowDesc))) return true;
-        return false;
-      });
-    });
-
-    if (matchingInvoices.length === 0) {
-      return { status: 'pending', label: 'Payment Pending' };
-    }
-
-    // Check invoice statuses with precedence: paid > partially paid > sent > draft/pending
-    const hasPaid = matchingInvoices.some((inv) => String(inv.status || '').toLowerCase().trim() === 'paid');
-    if (hasPaid) return { status: 'paid', label: 'Paid' };
-
-    const hasPartiallyPaid = matchingInvoices.some((inv) => {
-      const s = String(inv.status || '').toLowerCase().trim();
-      return s === 'partially paid' || s === 'partially_paid' || s === 'partial';
-    });
-    if (hasPartiallyPaid) return { status: 'partially_paid', label: 'Partially Paid' };
-
-    const hasSent = matchingInvoices.some((inv) => String(inv.status || '').toLowerCase().trim() === 'sent');
-    if (hasSent) return { status: 'sent', label: 'Invoice Sent' };
-
-    return { status: 'pending', label: 'Payment Pending' };
+    return resolveProjectPaymentStatus(project, invoices);
   }, [invoices]);
 
   const getPaymentStatusBadge = (paymentInfo: { status: string; label: string }) => {
@@ -908,13 +865,13 @@ export default function DashboardPage() {
     switch (paymentInfo.status) {
       case 'paid':
         return (
-          <div className={`${baseClasses} bg-emerald-500/10 border border-emerald-500/30 text-emerald-400`}>
+          <div className={`${baseClasses} bg-emerald-500/10 border border-emerald-500/30 text-emerald-600 dark:text-emerald-400`}>
             {paymentInfo.label}
           </div>
         );
       case 'partially_paid':
         return (
-          <div className={`${baseClasses} bg-amber-500/10 border border-amber-500/30 text-amber-400`}>
+          <div className={`${baseClasses} bg-amber-500/10 border border-amber-500/30 text-amber-600 dark:text-amber-400`}>
             {paymentInfo.label}
           </div>
         );
@@ -927,17 +884,13 @@ export default function DashboardPage() {
       case 'pending':
       default:
         return (
-          <div className={`${baseClasses} bg-red-900/20 border border-red-500/60 text-red-400`}>
+          <div className={`${baseClasses} bg-rose-500/10 border border-rose-500/30 text-rose-600 dark:text-rose-400`}>
             {paymentInfo.label}
           </div>
         );
     }
   };
 
-  const formatCurrency = (val: number) =>
-    new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(val);
-
-  // Dynamic Available Years from Projects
   const availableYears = useMemo(() => {
     const yearsSet = new Set<number>();
     const currentYear = new Date().getFullYear();
@@ -949,7 +902,6 @@ export default function DashboardPage() {
     return Array.from(yearsSet).sort((a, b) => b - a);
   }, [financialProjects]);
 
-  // Synchronized Filtered Financial Projects
   const filteredFinancialProjects = useMemo(() => {
     return financialProjects.filter((project) => {
       if (selectedMonth === 'all' && selectedYear === 'all') {
@@ -969,9 +921,6 @@ export default function DashboardPage() {
     });
   }, [financialProjects, selectedMonth, selectedYear]);
 
-  // Column-header filter option lists -- derived from the full project set
-  // (not the time-filtered one) so the available options stay stable
-  // regardless of which Month/Year is currently selected.
   const projectClientOptions = useMemo(() => {
     const set = new Set<string>();
     financialProjects.forEach((p) => {
@@ -997,37 +946,19 @@ export default function DashboardPage() {
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [financialProjects]);
 
-  // Designer names across both the legacy single-designer field and every
-  // split-scope assignment, so filtering by a designer catches a project
-  // regardless of which assignment style it uses.
   const projectDesignerOptions = useMemo(() => {
     const set = new Set<string>();
     financialProjects.forEach((p) => {
-      if (p.designerEmail) set.add(toTitleCase(getEmployeeName(p.designerEmail)));
+      if (p.designerEmail) set.add(formatIndianName(getEmployeeName(p.designerEmail)));
       if (p.assignedScopes && typeof p.assignedScopes === 'object') {
         Object.values(p.assignedScopes).forEach((email: any) => {
-          if (email) set.add(toTitleCase(getEmployeeName(email)));
+          if (email) set.add(formatIndianName(getEmployeeName(email)));
         });
       }
     });
     return Array.from(set).sort((a, b) => a.localeCompare(b));
   }, [financialProjects, getEmployeeName]);
 
-  const projectHasDesignerName = (project: any, designerName: string): boolean => {
-    if (project.designerEmail && toTitleCase(getEmployeeName(project.designerEmail)) === designerName) {
-      return true;
-    }
-    if (project.assignedScopes && typeof project.assignedScopes === 'object') {
-      return Object.values(project.assignedScopes).some(
-        (email: any) => email && toTitleCase(getEmployeeName(email)) === designerName
-      );
-    }
-    return false;
-  };
-
-  // Final Projects Directory rows: time filter (above) -> column filters ->
-  // search -> sort newest-first by the same projectDate/date/createdAt
-  // priority used everywhere else.
   const projectsDirectoryFilteredSorted = useMemo(() => {
     const query = projectSearchQuery.trim().toLowerCase();
     const rows = filteredFinancialProjects.filter((project) => {
@@ -1063,9 +994,9 @@ export default function DashboardPage() {
       const dA = getProjectDate(a);
       const dB = getProjectDate(b);
       if (!dA && !dB) return 0;
-      if (!dA) return 1; // undated projects sort to the bottom
+      if (!dA) return 1;
       if (!dB) return -1;
-      return dB.getTime() - dA.getTime(); // newest first
+      return dB.getTime() - dA.getTime();
     });
   }, [
     filteredFinancialProjects,
@@ -1074,21 +1005,7 @@ export default function DashboardPage() {
     projectStatusFilter,
     projectDesignerFilter,
     projectSearchQuery,
-    getEmployeeName
-  ]);
-
-  // Reset to page 1 whenever any active filter or search term changes, so
-  // the user is never left staring at an out-of-range empty page.
-  useEffect(() => {
-    setProjectsDirectoryPage(1);
-  }, [
-    selectedMonth,
-    selectedYear,
-    projectClientFilter,
-    projectScopeFilter,
-    projectStatusFilter,
-    projectDesignerFilter,
-    projectSearchQuery
+    projectHasDesignerName
   ]);
 
   const projectsDirectoryTotalPages = Math.max(1, Math.ceil(projectsDirectoryFilteredSorted.length / PROJECTS_DIRECTORY_PAGE_SIZE));
@@ -1098,10 +1015,7 @@ export default function DashboardPage() {
     return projectsDirectoryFilteredSorted.slice(start, start + PROJECTS_DIRECTORY_PAGE_SIZE);
   }, [projectsDirectoryFilteredSorted, projectsDirectoryPageSafe]);
 
-
-  // Enterprise Financial Metrics Engine
-  // Map "Total Expenses" to Employee Project Commissions
-  // Strict formula: Net Profit = (Total YTD Revenue) - (Total Commission Expenses)
+  // Enterprise Financial Metrics Engine (Consolidated Projects + Solarithm Flow Treasury)
   const financialMetrics = useMemo(() => {
     const now = new Date();
     const currentMonth = now.getMonth();
@@ -1120,16 +1034,15 @@ export default function DashboardPage() {
 
     const clientRevenueMap: Record<string, { revenue: number; projectCount: number }> = {};
 
+    // 1. Project Invoiced Revenue & Commission Outflows
     filteredFinancialProjects.forEach((p) => {
-      const cost = Number(p.calculatedCost || p.cost || p.amount || p.totalCost || 0);
+      const cost = safeNumber(p.calculatedCost ?? p.cost ?? p.amount ?? p.totalCost);
+      const desComm = safeNumber(p.designerCommission);
+      const salesComm = safeNumber(p.salesCommission);
+      const totalCommExp = safeNumber(p.totalCommissionExpense ?? (desComm + salesComm));
       
-      // Sum up all employee commission values assigned to this project
-      const desComm = Number(p.designerCommission || 0);
-      const salesComm = Number(p.salesCommission || 0);
-      const totalCommExp = Number(p.totalCommissionExpense ?? (desComm + salesComm));
-      
-      const projectRevenue = isNaN(cost) ? 0 : cost;
-      const projectExpense = isNaN(totalCommExp) ? 0 : totalCommExp;
+      const projectRevenue = cost;
+      const projectExpense = totalCommExp;
 
       const d = getProjectDate(p);
       const projYear = d ? d.getFullYear() : currentYear;
@@ -1139,8 +1052,8 @@ export default function DashboardPage() {
       totalRevenueAllTime += projectRevenue;
       totalExpensesAllTime += projectExpense;
 
-      // Project belongs to targetYear or current calendar year
       const isTargetYear = selectedYear !== 'all' ? (projYear === targetYear) : (projYear === currentYear);
+
       if (isTargetYear) {
         yearlyRevenue += projectRevenue;
         yearlyExpenses += projectExpense;
@@ -1148,13 +1061,13 @@ export default function DashboardPage() {
         if (projQuarter === currentQuarter) {
           quarterlyExpenses += projectExpense;
         }
+
         if (projMonth === currentMonth) {
           monthlyRevenue += projectRevenue;
           monthlyExpenses += projectExpense;
         }
       }
 
-      // Track Client Volume
       const clientName = p.clientName || p.matchedClient?.companyName || 'Unknown Client';
       if (!clientRevenueMap[clientName]) {
         clientRevenueMap[clientName] = { revenue: 0, projectCount: 0 };
@@ -1163,7 +1076,57 @@ export default function DashboardPage() {
       clientRevenueMap[clientName].projectCount += 1;
     });
 
-    // If target year had 0 data because projects lack dates or belong to all years, ensure YTD reflects total available
+    // 2. Solarithm Flow: Operational Expenses Outflows (/expenses)
+    operationalExpenses.forEach((exp: any) => {
+      const amount = Number(exp.amount) || Number(exp.total) || Number(exp.value) || 0;
+      if (amount <= 0) return;
+
+      const d = parseSafeDate(exp.date || exp.expenseDate || exp.createdAt || exp.timestamp);
+      const expYear = d ? d.getFullYear() : currentYear;
+      const expMonth = d ? d.getMonth() : currentMonth;
+      const expQuarter = d ? Math.floor(expMonth / 3) : currentQuarter;
+
+      totalExpensesAllTime += amount;
+
+      const isTargetYear = selectedYear !== 'all' ? (expYear === targetYear) : (expYear === currentYear);
+      if (isTargetYear) {
+        yearlyExpenses += amount;
+
+        if (expQuarter === currentQuarter) {
+          quarterlyExpenses += amount;
+        }
+
+        if (expMonth === currentMonth) {
+          monthlyExpenses += amount;
+        }
+      }
+    });
+
+    // 3. Solarithm Flow: Direct Revenue Inflows (/incomes)
+    // Filter out entries with linkedInvoiceId to prevent double-counting invoice settlements
+    operationalIncomes.forEach((inc: any) => {
+      if (inc.linkedInvoiceId || inc.invoiceId) return;
+
+      const amount = Number(inc.amount) || Number(inc.total) || Number(inc.value) || 0;
+      if (amount <= 0) return;
+
+      const d = parseSafeDate(inc.date || inc.incomeDate || inc.createdAt || inc.timestamp);
+      const incYear = d ? d.getFullYear() : currentYear;
+      const incMonth = d ? d.getMonth() : currentMonth;
+
+      totalRevenueAllTime += amount;
+
+      const isTargetYear = selectedYear !== 'all' ? (incYear === targetYear) : (incYear === currentYear);
+      if (isTargetYear) {
+        yearlyRevenue += amount;
+
+        if (incMonth === currentMonth) {
+          monthlyRevenue += amount;
+        }
+      }
+    });
+
+    // Handle fallback scenarios when filtering by all years
     if (yearlyRevenue === 0 && totalRevenueAllTime > 0 && selectedYear === 'all') {
       yearlyRevenue = totalRevenueAllTime;
     }
@@ -1171,11 +1134,10 @@ export default function DashboardPage() {
       yearlyExpenses = totalExpensesAllTime;
     }
 
-    // Incorporate salaryHistory commissions if project-level commission wasn't attached
     if (yearlyExpenses === 0 && salaryHistory.length > 0) {
       salaryHistory.forEach((rec: any) => {
-        const comm = Number(rec.incentive || rec.commission || rec.incentiveAmount || 0);
-        if (!isNaN(comm) && comm > 0) {
+        const comm = safeNumber(rec.incentive ?? rec.commission ?? rec.incentiveAmount);
+        if (comm > 0) {
           yearlyExpenses += comm;
           totalExpensesAllTime += comm;
         }
@@ -1189,9 +1151,8 @@ export default function DashboardPage() {
       }
     });
 
-    // Net Profit strictly calculated as: (Total YTD Revenue) - (Total Commission Expenses)
+    // Net Profit = (Total Invoiced Revenue + Direct Inflows) - (Commissions + Operational Expenses)
     const netProfitYearly = yearlyRevenue - yearlyExpenses;
-
     const projectCount = filteredFinancialProjects.length;
     const avgCostPerProject = projectCount > 0 ? totalRevenueAllTime / projectCount : 0;
     const avgExpensePerProject = projectCount > 0 ? totalExpensesAllTime / projectCount : 0;
@@ -1213,7 +1174,7 @@ export default function DashboardPage() {
       avgCostPerProject,
       avgExpensePerProject,
     };
-  }, [filteredFinancialProjects, clients, salaryHistory, selectedYear]);
+  }, [filteredFinancialProjects, operationalExpenses, operationalIncomes, clients, salaryHistory, selectedYear]);
 
   const currentMonthName = new Date().toLocaleString('default', { month: 'short' });
   const currentYearNum = new Date().getFullYear();
@@ -1245,27 +1206,24 @@ export default function DashboardPage() {
     }
   }, [expensePeriod, financialMetrics, currentMonthName, currentYearNum, currentQuarterNum, selectedYear]);
 
-  // Master Overview Invoice Metrics Engine: Dynamically syncs with projects & billing
   const invoiceMetrics = useMemo(() => {
     const now = new Date();
     const curMonth = now.getMonth();
     const curYear = now.getFullYear();
 
-    // 1. Calculate from Invoices array
     const unpaidInvoices = invoices.filter(
       (inv) => String(inv.status || '').toLowerCase().trim() !== 'paid'
     );
     const invoiceReceivables = unpaidInvoices.reduce((acc, inv) => {
-      const val = Number(inv.totals?.payable ?? inv.payable ?? inv.total ?? 0);
-      return acc + (isNaN(val) ? 0 : val);
+      const val = safeNumber(inv.totals?.payable ?? inv.payable ?? inv.total);
+      return acc + val;
     }, 0);
 
-    // 2. Calculate from Projects array (sum projects marked Pending, Unpaid, or Partial)
     let projectReceivables = 0;
     let pendingProjectsCount = 0;
 
     financialProjects.forEach((proj) => {
-      const cost = Number(proj.calculatedCost || proj.cost || proj.amount || 0);
+      const cost = safeNumber(proj.calculatedCost ?? proj.cost ?? proj.amount);
       const paymentInfo = getProjectPaymentStatus(proj);
 
       if (paymentInfo.status === 'paid') {
@@ -1274,13 +1232,11 @@ export default function DashboardPage() {
         projectReceivables += cost * 0.5;
         pendingProjectsCount += 1;
       } else {
-        // Pending, sent, or unpaid
         projectReceivables += cost;
         pendingProjectsCount += 1;
       }
     });
 
-    // If invoices exist and contain receivables, use that. Otherwise use projectReceivables.
     const outstandingReceivables = invoiceReceivables > 0 
       ? invoiceReceivables 
       : (projectReceivables > 0 ? projectReceivables : 0);
@@ -1289,7 +1245,6 @@ export default function DashboardPage() {
       ? unpaidInvoices.length 
       : pendingProjectsCount;
 
-    // Monthly invoices / project volume
     const thisMonthInvoices = invoices.filter((inv) => {
       const d = parseSafeDate(inv.invDate || inv.date || inv.createdAt);
       return d && !isNaN(d.getTime()) && d.getMonth() === curMonth && d.getFullYear() === curYear;
@@ -1314,7 +1269,6 @@ export default function DashboardPage() {
     };
   }, [invoices, financialProjects, getProjectPaymentStatus]);
 
-  // Master Overview Payment Pipeline Project Counters
   const paymentPipelineMetrics = useMemo(() => {
     let pending = 0;
     let sent = 0;
@@ -1343,8 +1297,6 @@ export default function DashboardPage() {
     };
   }, [projects, getProjectPaymentStatus]);
 
-  // Master Insights - Revenue Breakdown (Cleared vs Uncleared)
-  // Dynamically calculated from billing invoices, with project payment status fallback
   const revenueBreakdown = useMemo(() => {
     let clearedRevenue = 0;
     let unclearedRevenue = 0;
@@ -1353,8 +1305,7 @@ export default function DashboardPage() {
 
     if (invoices.length > 0) {
       invoices.forEach((inv) => {
-        const val = Number(inv.totals?.payable ?? inv.payable ?? inv.total ?? 0);
-        const amount = isNaN(val) ? 0 : val;
+        const amount = safeNumber(inv.totals?.payable ?? inv.payable ?? inv.total);
         const status = String(inv.status || '').toLowerCase().trim();
 
         if (status === 'paid') {
@@ -1367,10 +1318,9 @@ export default function DashboardPage() {
       });
     }
 
-    // If invoices have 0 revenue recorded, derive dynamically from project pipeline
     if (clearedRevenue === 0 && unclearedRevenue === 0 && financialProjects.length > 0) {
       financialProjects.forEach((proj) => {
-        const cost = Number(proj.calculatedCost || proj.cost || proj.amount || 0);
+        const cost = safeNumber(proj.calculatedCost ?? proj.cost ?? proj.amount);
         const paymentInfo = getProjectPaymentStatus(proj);
         if (paymentInfo.status === 'paid') {
           clearedRevenue += cost;
@@ -1396,7 +1346,6 @@ export default function DashboardPage() {
     };
   }, [invoices, financialProjects, getProjectPaymentStatus]);
 
-  // Master Insights - Monthly Chart Data (Jan - Dec)
   const monthlyChartData = useMemo(() => {
     const currentYear = new Date().getFullYear();
     const targetYear = selectedYear !== 'all' ? Number(selectedYear) : currentYear;
@@ -1413,11 +1362,11 @@ export default function DashboardPage() {
       const projMonth = d ? d.getMonth() : 0;
 
       if (selectedYear === 'all' || projYear === targetYear) {
-        const cost = Number(p.calculatedCost || p.cost || p.amount || 0);
-        const exp = Number(p.totalCommissionExpense ?? (Number(p.designerCommission || 0) + Number(p.salesCommission || 0)));
+        const cost = safeNumber(p.calculatedCost ?? p.cost ?? p.amount);
+        const exp = safeNumber(p.totalCommissionExpense ?? (safeNumber(p.designerCommission) + safeNumber(p.salesCommission)));
 
-        monthMap[projMonth].revenue += (isNaN(cost) ? 0 : cost);
-        monthMap[projMonth].expenses += (isNaN(exp) ? 0 : exp);
+        monthMap[projMonth].revenue += cost;
+        monthMap[projMonth].expenses += exp;
       }
     });
 
@@ -1428,7 +1377,6 @@ export default function DashboardPage() {
     }));
   }, [financialProjects, selectedYear]);
 
-  // Master Insights - Star Client (Highest Project Revenue)
   const starClient = useMemo(() => {
     const currentYear = new Date().getFullYear();
     const targetYear = selectedYear !== 'all' ? Number(selectedYear) : currentYear;
@@ -1440,12 +1388,12 @@ export default function DashboardPage() {
       const projYear = d ? d.getFullYear() : currentYear;
 
       if (selectedYear === 'all' || projYear === targetYear) {
-        const cost = Number(p.calculatedCost || p.cost || p.amount || 0);
+        const cost = safeNumber(p.calculatedCost ?? p.cost ?? p.amount);
         const clientName = p.clientName || p.matchedClient?.companyName || 'Unknown Client';
         if (!clientRevenueMap[clientName]) {
           clientRevenueMap[clientName] = { name: clientName, revenue: 0, projectCount: 0 };
         }
-        clientRevenueMap[clientName].revenue += (isNaN(cost) ? 0 : cost);
+        clientRevenueMap[clientName].revenue += cost;
         clientRevenueMap[clientName].projectCount += 1;
       }
     });
@@ -1460,7 +1408,6 @@ export default function DashboardPage() {
     return top;
   }, [financialProjects, selectedYear]);
 
-  // Master Insights - Top Performer (Employee grouped by salesPerson & designer)
   const topPerformers = useMemo(() => {
     const currentYear = new Date().getFullYear();
     const currentMonth = new Date().getMonth();
@@ -1479,7 +1426,7 @@ export default function DashboardPage() {
     const addCommission = (email: string | undefined | null, amount: number, isCurrentMonth: boolean, isCurrentYear: boolean, role: string) => {
       if (!email || amount <= 0) return;
       const cleanEmail = email.trim().toLowerCase();
-      const empName = getEmployeeName(email);
+      const empName = formatIndianName(getEmployeeName(email));
 
       if (!employeeEarnings[cleanEmail]) {
         employeeEarnings[cleanEmail] = {
@@ -1508,25 +1455,24 @@ export default function DashboardPage() {
       const isYear = selectedYear === 'all' ? true : (projYear === targetYear);
       const isMonth = selectedMonth === 'all' ? true : (projMonth === targetMonth);
 
-      const desComm = Number(p.designerCommission || 0);
-      const salesComm = Number(p.salesCommission || 0);
+      const desComm = safeNumber(p.designerCommission);
+      const salesComm = safeNumber(p.salesCommission);
 
       const designerEmail = p.designerEmail;
       const salesPersonEmail = p.salesPersonEmail || p.matchedClient?.salesPersonEmail;
 
-      if (designerEmail && !isNaN(desComm) && desComm > 0) {
+      if (designerEmail && desComm > 0) {
         addCommission(designerEmail, desComm, isMonth, isYear, 'Designer');
       }
-      if (salesPersonEmail && !isNaN(salesComm) && salesComm > 0) {
+      if (salesPersonEmail && salesComm > 0) {
         addCommission(salesPersonEmail, salesComm, isMonth, isYear, 'Sales');
       }
     });
 
-    // Also parse salaryHistory if present
     if (salaryHistory.length > 0) {
       salaryHistory.forEach((rec: any) => {
         const empEmail = rec.employeeEmail || rec.email || rec.employeeId;
-        const comm = Number(rec.incentive || rec.commission || 0);
+        const comm = safeNumber(rec.incentive ?? rec.commission);
         if (empEmail && comm > 0) {
           addCommission(empEmail, comm, true, true, rec.role || 'Consultant');
         }
@@ -1542,27 +1488,24 @@ export default function DashboardPage() {
     };
   }, [financialProjects, salaryHistory, selectedMonth, selectedYear, getEmployeeName]);
 
-  // Reusable Time Filter Controls
-  const renderTimeFilterControls = (idPrefix: string) => {
-    const selectedMonthLabel = MONTH_OPTIONS.find(m => m.value === selectedMonth)?.label || 'All Months';
+    const renderTimeFilterControls = (idPrefix: string) => {
+    const selectedMonthLabel = MONTH_OPTIONS.find(m => m.value === selectedMonth)?.label || "All Months";
     return (
-      <div className="flex flex-wrap items-center gap-2.5">
-        <div className="flex items-center text-xs text-gray-500 dark:text-gray-400 font-medium">
-          <Filter className="w-3.5 h-3.5 mr-1.5 text-[#D4AF37]" />
-          <span>Timeline:</span>
-        </div>
-        
+      <div className="flex flex-wrap items-center gap-2">
         {/* Month Dropdown */}
-        <div className="flex items-center space-x-1.5 bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/50 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors">
-          <Calendar className="w-3.5 h-3.5 text-[#D4AF37]" />
+        <div className="flex items-center space-x-1.5 bg-white dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors shadow-xs">
+          <Calendar className="w-3.5 h-3.5 text-[#D4AF37] shrink-0" />
           <select
             id={`${idPrefix}-month-select`}
             value={selectedMonth}
-            onChange={(e) => setSelectedMonth(e.target.value)}
-            className="bg-transparent text-xs text-gray-700 dark:text-gray-200 focus:outline-none cursor-pointer pr-1"
+            onChange={(e) => {
+              setSelectedMonth(e.target.value);
+              setProjectsDirectoryPage(1);
+            }}
+            className="bg-transparent text-xs text-gray-800 dark:text-gray-200 focus:outline-none cursor-pointer pr-1 font-medium"
           >
             {MONTH_OPTIONS.map((m) => (
-              <option key={m.value} value={m.value} className="bg-white dark:bg-[#1E1E1E] text-gray-700 dark:text-gray-200">
+              <option key={m.value} value={m.value} className="bg-white dark:bg-[#1E1E1E] text-gray-800 dark:text-gray-200">
                 {m.label}
               </option>
             ))}
@@ -1570,17 +1513,19 @@ export default function DashboardPage() {
         </div>
 
         {/* Year Dropdown */}
-        <div className="flex items-center space-x-1.5 bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/50 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors">
-          <span className="text-xs text-gray-500 dark:text-gray-400 font-medium">Yr:</span>
+        <div className="flex items-center space-x-1.5 bg-white dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-lg px-2.5 py-1.5 focus-within:border-[#D4AF37] transition-colors shadow-xs">
           <select
             id={`${idPrefix}-year-select`}
             value={selectedYear}
-            onChange={(e) => setSelectedYear(e.target.value)}
-            className="bg-transparent text-xs text-gray-700 dark:text-gray-200 focus:outline-none cursor-pointer pr-1"
+            onChange={(e) => {
+              setSelectedYear(e.target.value);
+              setProjectsDirectoryPage(1);
+            }}
+            className="bg-transparent text-xs text-gray-800 dark:text-gray-200 focus:outline-none cursor-pointer pr-1 font-medium"
           >
-            <option value="all" className="bg-white dark:bg-[#1E1E1E] text-gray-700 dark:text-gray-200">All Years</option>
+            <option value="all" className="bg-white dark:bg-[#1E1E1E] text-gray-800 dark:text-gray-200">All Years</option>
             {availableYears.map((yr) => (
-              <option key={yr} value={String(yr)} className="bg-white dark:bg-[#1E1E1E] text-gray-700 dark:text-gray-200">
+              <option key={yr} value={String(yr)} className="bg-white dark:bg-[#1E1E1E] text-gray-800 dark:text-gray-200">
                 {yr}
               </option>
             ))}
@@ -1588,56 +1533,31 @@ export default function DashboardPage() {
         </div>
 
         {/* Active Filter Indicator & Reset */}
-        {(selectedMonth !== 'all' || selectedYear !== 'all') && (
+        {(selectedMonth !== "all" || selectedYear !== "all") && (
           <button
             id={`${idPrefix}-reset-btn`}
             onClick={() => {
-              setSelectedMonth('all');
-              setSelectedYear('all');
+              setSelectedMonth("all");
+              setSelectedYear("all");
+              setProjectsDirectoryPage(1);
             }}
-            className="flex items-center space-x-1 px-2 py-1.5 rounded-lg text-xs font-medium text-amber-600 dark:text-amber-400/90 hover:text-amber-500 dark:hover:text-amber-300 hover:bg-gray-100 dark:hover:bg-[#2A2A2A] transition-colors border border-gray-300 dark:border-[#444]"
-            title={`Showing: ${selectedMonthLabel} ${selectedYear !== 'all' ? selectedYear : ''}. Click to clear filter`}
+            className="flex items-center space-x-1 px-2.5 py-1.5 rounded-lg text-xs font-medium text-amber-600 dark:text-amber-400 hover:text-amber-700 dark:hover:text-amber-300 hover:bg-amber-50 dark:hover:bg-[#252525] transition-colors border border-amber-300 dark:border-amber-500/30 cursor-pointer shadow-xs"
+            title={`Showing: ${selectedMonthLabel} ${selectedYear !== "all" ? selectedYear : ""}. Click to clear filter`}
           >
             <RotateCcw className="w-3 h-3" />
-            <span>Clear Filter</span>
+            <span>Reset</span>
           </button>
         )}
       </div>
     );
   };
 
-  // When the session ends (manual sign-out, idle expiry, or a denied
-  // account), drop all in-memory dashboard data and UI state. This component
-  // stays mounted behind the login screen, so without this the previous
-  // session's projects, invoices, payroll and client data would remain in
-  // React state (inspectable via devtools) and a re-login would land in
-  // whatever tab or open edit modal was showing.
-  useEffect(() => {
-    if (authStatus !== 'unauthenticated' && authStatus !== 'unauthorized') return;
-    setProjects([]);
-    setClients([]);
-    setPricingRules([]);
-    setCommissionRules([]);
-    setUsers([]);
-    setAuditLogs([]);
-    setProposals([]);
-    setInvoices([]);
-    setSalaryHistory([]);
-    setEditingProject(null);
-    setIsEditProjectModalOpen(false);
-    setActiveTab('Dashboard');
-  }, [authStatus]);
-
-  // Auth gate. Every hook above has already run (hook order must never
-  // change between renders), so this is safe as an early return. Nothing
-  // below -- no tab, no route, no view -- renders unless the signed-in user
-  // has been verified against Firestore as an Executive Owner.
   if (authStatus === 'loading') {
     return (
-      <div className="min-h-screen bg-[#121212] flex items-center justify-center">
+      <div className="min-h-screen bg-white dark:bg-[#121212] flex items-center justify-center transition-colors">
         <div className="flex flex-col items-center gap-3">
           <span className="h-8 w-8 border-2 border-[#D4AF37]/30 border-t-[#D4AF37] rounded-full animate-spin" />
-          <span className="text-xs text-gray-500 tracking-wider uppercase">Verifying session...</span>
+          <span className="text-xs text-gray-500 dark:text-gray-400 tracking-wider uppercase">Verifying session...</span>
         </div>
       </div>
     );
@@ -1648,57 +1568,55 @@ export default function DashboardPage() {
   }
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden bg-white dark:bg-[#121212] text-gray-900 dark:text-white transition-colors">
+    <div className="flex flex-col h-screen overflow-hidden bg-gray-50 dark:bg-[#121212] text-gray-900 dark:text-white transition-colors">
       {/* Global Header */}
-      <header className="py-3.5 flex items-center justify-between px-6 bg-white dark:bg-[#1E1E1E] border-b border-gray-200 dark:border-[#333333] shrink-0 z-10 transition-colors">
-        {/* Header Lockup (Left Side) */}
+      <header className="py-3 flex items-center justify-between px-6 bg-white dark:bg-[#1E1E1E] border-b border-gray-200 dark:border-[#333333] shrink-0 z-10 transition-colors shadow-sm">
         <div className="flex items-center space-x-3.5">
-          <div className="h-10 w-10 rounded-xl bg-gray-100 dark:bg-[#252525] border border-gray-200 dark:border-[#333333] flex items-center justify-center shrink-0 shadow-sm">
+          <div className="h-9 w-9 rounded-xl bg-gray-100 dark:bg-[#252525] border border-gray-200 dark:border-[#333333] flex items-center justify-center shrink-0 shadow-sm">
             <LayoutGrid className="h-5 w-5 text-[#D4AF37]" />
           </div>
           <div className="flex flex-col hidden sm:flex">
-            <span className="text-xl font-bold text-gray-900 dark:text-white tracking-tight">Solarithm Insight</span>
-            <span className="text-xs text-gray-500 dark:text-gray-400">Executive Project & Financial Management Console</span>
+            <span className="text-lg font-bold text-gray-900 dark:text-white tracking-tight">Solarithm Insight</span>
+            <span className="text-[11px] text-gray-500 dark:text-gray-400">Executive Project & Financial Management Console</span>
           </div>
         </div>
 
-        {/* Header Right Side */}
-        <div className="flex items-center space-x-4">
-          <div className="hidden md:block relative w-64 lg:w-96 mr-4">
+        <div className="flex items-center space-x-3">
+          <div className="hidden md:block relative w-64 lg:w-80 mr-2">
             <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-              <Search className="h-5 w-5 text-gray-400 dark:text-gray-500" />
+              <Search className="h-4 w-4 text-gray-400" />
             </div>
             <input
               type="text"
-              className="block w-full pl-10 pr-3 py-2 border border-gray-300 dark:border-[#333333] rounded-md leading-5 bg-gray-50 dark:bg-[#121212] text-gray-700 dark:text-gray-300 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-1 focus:ring-[#D4AF37] focus:border-[#D4AF37] sm:text-sm transition-colors"
-              placeholder="Search..."
+              className="block w-full pl-9 pr-3 py-1.5 border border-gray-300 dark:border-[#333333] rounded-lg text-xs bg-gray-50 dark:bg-[#121212] text-gray-900 dark:text-gray-200 placeholder-gray-400 focus:outline-none focus:border-[#D4AF37] transition-colors"
+              placeholder="Search console..."
             />
           </div>
           <button
             onClick={toggleTheme}
-            className="text-gray-500 dark:text-gray-400 hover:text-[#D4AF37] dark:hover:text-[#D4AF37] transition-colors"
+            className="p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-[#D4AF37] hover:bg-gray-100 dark:hover:bg-[#252525] transition-colors"
             title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
           >
-            {theme === 'dark' ? <Sun className="w-6 h-6" /> : <Moon className="w-6 h-6" />}
+            {theme === 'dark' ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
           </button>
           <button 
             onClick={() => setActiveTab('Settings')}
-            className={`transition-colors ${activeTab === 'Settings' ? 'text-[#D4AF37]' : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'}`}
+            className={`p-1.5 rounded-lg transition-colors ${activeTab === 'Settings' ? 'text-[#D4AF37] bg-[#D4AF37]/10' : 'text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-[#252525]'}`}
             title="Global Company Settings"
           >
-            <Settings className="w-6 h-6" />
+            <Settings className="w-5 h-5" />
           </button>
-          <button className="text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white relative">
-            <Bell className="w-6 h-6" />
-            <span className="absolute top-0 right-0 block h-2 w-2 rounded-full bg-[#D4AF37] ring-2 ring-white dark:ring-[#1E1E1E]"></span>
+          <button className="p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-[#252525] relative">
+            <Bell className="w-5 h-5" />
+            <span className="absolute top-1 right-1 block h-2 w-2 rounded-full bg-[#D4AF37]"></span>
           </button>
 
           {/* Authenticated Owner Profile & Sign Out */}
-          <div className="flex items-center gap-3 pl-2 border-l border-gray-200 dark:border-[#333333]">
+          <div className="flex items-center gap-2.5 pl-3 border-l border-gray-200 dark:border-[#333333]">
             <div className="hidden lg:flex flex-col text-right">
               <div className="flex items-center justify-end gap-1.5">
                 <span className="text-xs font-semibold text-gray-900 dark:text-white">
-                  {executiveProfile?.name || executiveProfile?.email?.split('@')[0] || 'Owner'}
+                  {formatIndianName(executiveProfile?.name || 'Owner')}
                 </span>
                 <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30 uppercase tracking-wider flex items-center gap-1">
                   <ShieldCheck className="w-3 h-3 text-[#D4AF37]" />
@@ -1714,17 +1632,15 @@ export default function DashboardPage() {
               className="h-8 w-8 rounded-full bg-[#D4AF37] flex items-center justify-center text-black font-bold text-xs shrink-0 shadow-sm uppercase"
               title={executiveProfile?.email || 'Owner'}
             >
-              {executiveProfile?.name 
-                ? executiveProfile.name.split(' ').map((n: string) => n[0]).join('').slice(0, 2)
-                : (executiveProfile?.email?.[0] || 'OW')}
+              {getFirstName(executiveProfile?.name || 'Owner').slice(0, 2).toUpperCase()}
             </div>
 
             <button
-              onClick={handleSignOut}
-              className="p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-red-500 dark:hover:text-red-400 hover:bg-gray-100 dark:hover:bg-[#252525] transition-colors cursor-pointer"
+              onClick={handleSignOutAndReset}
+              className="p-1.5 rounded-lg text-gray-500 dark:text-gray-400 hover:text-rose-500 hover:bg-gray-100 dark:hover:bg-[#252525] transition-colors cursor-pointer"
               title="Sign Out of Master Dashboard"
             >
-              <LogOut className="w-5 h-5" />
+              <LogOut className="w-4 h-4" />
             </button>
           </div>
         </div>
@@ -1732,1685 +1648,719 @@ export default function DashboardPage() {
 
       <div className="flex flex-1 overflow-hidden">
         {/* Sidebar */}
-        <aside className="w-64 bg-white dark:bg-[#1E1E1E] border-r border-gray-200 dark:border-[#333333] hidden md:flex flex-col transition-colors">
+        <aside className="w-64 bg-white dark:bg-[#1E1E1E] border-r border-gray-200 dark:border-[#333333] hidden md:flex flex-col transition-colors shrink-0">
           <nav className="flex-1 overflow-y-auto py-4">
-          <ul className="space-y-1.5 px-3">
-            <li>
-              <a 
-                href="#" 
-                onClick={(e) => { e.preventDefault(); setActiveTab('Dashboard'); }}
-                className={`flex items-center px-3 py-2.5 rounded-lg font-medium transition-colors ${
-                  activeTab === 'Dashboard' 
-                    ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37] shadow-sm' 
-                    : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100/60 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
-                }`}
-              >
-                <LayoutGrid className="w-5 h-5 mr-3 text-[#D4AF37]" />
-                Dashboard
-              </a>
-            </li>
-            {stats.map((item) => (
-              <li key={item.name}>
+            <ul className="space-y-1.5 px-3">
+              <li>
                 <a 
                   href="#" 
-                  onClick={(e) => { e.preventDefault(); setActiveTab(item.name); }}
-                  className={`flex items-center px-3 py-2.5 rounded-lg font-medium transition-colors ${
-                    activeTab === item.name 
-                      ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37] shadow-sm' 
-                      : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100/60 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
+                  onClick={(e) => { e.preventDefault(); setActiveTab('Dashboard'); }}
+                  className={`flex items-center px-3 py-2.5 rounded-lg font-medium text-xs transition-colors ${
+                    activeTab === 'Dashboard' 
+                      ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37] shadow-sm font-semibold' 
+                      : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
                   }`}
                 >
-                  <item.icon className={`w-5 h-5 mr-3 ${activeTab === item.name ? 'text-[#D4AF37]' : ''}`} />
-                  {item.name}
+                  <LayoutGrid className="w-4 h-4 mr-3 text-[#D4AF37]" />
+                  Dashboard
                 </a>
               </li>
-            ))}
-          </ul>
-        </nav>
-        <div className="p-4 border-t border-gray-200 dark:border-[#333333]">
-          <button 
-            onClick={() => setActiveTab('Settings')}
-            className={`flex items-center w-full px-3 py-2.5 rounded-lg font-medium transition-colors ${
-              activeTab === 'Settings' 
-                ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37]' 
-                : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100/60 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
-            }`}
-          >
-            <Settings className={`w-5 h-5 mr-3 ${activeTab === 'Settings' ? 'text-[#D4AF37]' : ''}`} />
-            Company Settings
-          </button>
-        </div>
-      </aside>
+              {stats.map((item) => (
+                <li key={item.name}>
+                  <a 
+                    href="#" 
+                    onClick={(e) => { e.preventDefault(); setActiveTab(item.name); }}
+                    className={`flex items-center px-3 py-2.5 rounded-lg font-medium text-xs transition-colors ${
+                      activeTab === item.name 
+                        ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37] shadow-sm font-semibold' 
+                        : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
+                    }`}
+                  >
+                    <item.icon className={`w-4 h-4 mr-3 ${activeTab === item.name ? 'text-[#D4AF37]' : ''}`} />
+                    {item.name}
+                  </a>
+                </li>
+              ))}
+            </ul>
+          </nav>
+          <div className="p-3 border-t border-gray-200 dark:border-[#333333]">
+            <button 
+              onClick={() => setActiveTab('Settings')}
+              className={`flex items-center w-full px-3 py-2 rounded-lg font-medium text-xs transition-colors ${
+                activeTab === 'Settings' 
+                  ? 'bg-gray-100 dark:bg-[#252525] text-gray-900 dark:text-white border-l-2 border-[#D4AF37] font-semibold' 
+                  : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-[#252525]/60 hover:text-gray-900 dark:hover:text-white'
+              }`}
+            >
+              <Settings className={`w-4 h-4 mr-3 ${activeTab === 'Settings' ? 'text-[#D4AF37]' : ''}`} />
+              Company Settings
+            </button>
+          </div>
+        </aside>
 
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        {/* Dashboard Content */}
-        <div className="flex-1 overflow-y-auto p-6 lg:p-8">
-          {activeTab === 'Dashboard' && (
-            <div className="w-full space-y-8">
-              <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-                <div>
-                  <h2 className="text-2xl font-bold mb-1 text-gray-900 dark:text-white">Master Overview</h2>
-                  <p className="text-gray-500 dark:text-gray-400">Financial health, cash flow projections, and project operations summary.</p>
-                </div>
-                {renderTimeFilterControls('dashboard-header')}
-              </div>
-
-              {/* Enterprise Financial KPI Cards Grid */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
-                {/* 1. Projects & Clients */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Projects</span>
-                    <div className="p-2 rounded-lg bg-[#121212] text-[#D4AF37]">
-                      <FolderKanban className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className="flex items-baseline space-x-2">
-                      <span className="text-2xl font-bold text-white">{financialMetrics.totalProjectsCount}</span>
-                      <span className="text-xs text-gray-400">Projects</span>
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>Approved Clients:</span>
-                      <span className="font-semibold text-gray-200">{financialMetrics.totalApprovedClients}</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 2. Monthly Revenue */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">{currentMonthName} Revenue</span>
-                    <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-400">
-                      <TrendingUp className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className="text-2xl font-bold text-emerald-400 font-mono">
-                      {formatCurrency(financialMetrics.monthlyRevenue)}
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>Run Rate:</span>
-                      <span className="font-medium text-gray-300">{financialMetrics.monthlyRevenue > 0 ? 'Active' : 'No billings'}</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 3. Yearly Revenue */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">{currentYearNum} YTD Revenue</span>
-                    <div className="p-2 rounded-lg bg-[#121212] text-[#D4AF37]">
-                      <DollarSign className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className="text-2xl font-bold text-white font-mono">
-                      {formatCurrency(financialMetrics.yearlyRevenue)}
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>All-Time Total:</span>
-                      <span className="font-mono text-gray-300">{formatCurrency(financialMetrics.totalRevenueAllTime)}</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 4. Total Expenses with Toggle */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Total Expenses</span>
-                    <div className="p-2 rounded-lg bg-rose-500/10 text-rose-400">
-                      <Receipt className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-2">
-                    <div className="text-2xl font-bold text-rose-400 font-mono">
-                      {formatCurrency(currentExpenseValue.value)}
-                    </div>
-                    {/* Period Toggles */}
-                    <div className="mt-2 flex items-center space-x-1 border-t border-[#2A2A2A] pt-2">
-                      {(['monthly', 'quarterly', 'yearly', 'all'] as const).map((period) => (
-                        <button
-                          key={period}
-                          onClick={() => setExpensePeriod(period)}
-                          className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors uppercase ${
-                            expensePeriod === period
-                              ? 'bg-[#D4AF37] text-black font-bold'
-                              : 'bg-[#121212] text-gray-400 hover:text-white'
-                          }`}
-                        >
-                          {period === 'monthly' ? 'M' : period === 'quarterly' ? 'Q' : period === 'yearly' ? 'Y' : 'All'}
-                        </button>
-                      ))}
-                      <span className="text-[10px] text-gray-500 ml-auto truncate pl-1">{currentExpenseValue.label}</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 5. Net Profit / Loss */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Net Profit (YTD)</span>
-                    <div className={`p-2 rounded-lg ${financialMetrics.netProfitYearly >= 0 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'}`}>
-                      <Scale className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className={`text-2xl font-bold font-mono ${financialMetrics.netProfitYearly >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {formatCurrency(financialMetrics.netProfitYearly)}
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>Status:</span>
-                      <span className={`font-semibold ${financialMetrics.netProfitYearly >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        {financialMetrics.netProfitYearly >= 0 ? 'Profitable' : 'Loss'}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 6. Payment Pipeline */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all flex flex-col justify-between">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Payment Pipeline</span>
-                    <div className="p-2 rounded-lg bg-[#121212] text-[#D4AF37]">
-                      <CreditCard className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-2.5">
-                    <div className="grid grid-cols-2 gap-1.5">
-                      {/* Pending */}
-                      <div className="bg-[#141414] border border-rose-500/30 rounded-lg px-2 py-1.5 flex items-center justify-between">
-                        <span className="text-[11px] font-medium text-rose-400">Pending</span>
-                        <span className="text-xs font-bold text-white font-mono">{paymentPipelineMetrics.pending}</span>
-                      </div>
-                      {/* Sent */}
-                      <div className="bg-[#141414] border border-yellow-400/30 rounded-lg px-2 py-1.5 flex items-center justify-between">
-                        <span className="text-[11px] font-medium text-yellow-400">Sent</span>
-                        <span className="text-xs font-bold text-white font-mono">{paymentPipelineMetrics.sent}</span>
-                      </div>
-                      {/* Partially Paid */}
-                      <div className="bg-[#141414] border border-amber-500/30 rounded-lg px-2 py-1.5 flex items-center justify-between">
-                        <span className="text-[11px] font-medium text-amber-400">Partial</span>
-                        <span className="text-xs font-bold text-white font-mono">{paymentPipelineMetrics.partiallyPaid}</span>
-                      </div>
-                      {/* Paid */}
-                      <div className="bg-[#141414] border border-[#D4AF37]/40 rounded-lg px-2 py-1.5 flex items-center justify-between">
-                        <span className="text-[11px] font-medium text-[#D4AF37]">Paid</span>
-                        <span className="text-xs font-bold text-white font-mono">{paymentPipelineMetrics.paid}</span>
-                      </div>
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>Total Projects:</span>
-                      <span className="font-mono text-gray-200 font-semibold">{paymentPipelineMetrics.total} Total</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 7. Avg Cost per Project */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Avg Cost / Project</span>
-                    <div className="p-2 rounded-lg bg-[#121212] text-[#D4AF37]">
-                      <PieChart className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className="text-2xl font-bold text-white font-mono">
-                      {formatCurrency(financialMetrics.avgCostPerProject)}
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>Across Projects:</span>
-                      <span className="font-mono text-gray-300">{financialMetrics.totalProjectsCount} Total</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 8. Avg Expense per Project */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Avg Expense / Project</span>
-                    <div className="p-2 rounded-lg bg-[#121212] text-gray-300">
-                      <Calendar className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className="text-2xl font-bold text-white font-mono">
-                      {formatCurrency(financialMetrics.avgExpensePerProject)}
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>Across Projects:</span>
-                      <span className="font-mono text-gray-300">{financialMetrics.totalProjectsCount} Total</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 9. Outstanding Receivables */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Outstanding Receivables</span>
-                    <div className="p-2 rounded-lg bg-amber-500/10 text-amber-400">
-                      <Clock className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className="text-2xl font-bold text-amber-400 font-mono">
-                      {formatCurrency(invoiceMetrics.outstandingReceivables)}
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>Pending Receivables:</span>
-                      <span className="font-semibold text-amber-400">{invoiceMetrics.outstandingCount} Unpaid</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 10. Invoice Volume */}
-                <div className="bg-[#1E1E1E] border border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-5 transition-all">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold uppercase tracking-wider text-gray-400">Invoice Volume</span>
-                    <div className="p-2 rounded-lg bg-[#121212] text-[#D4AF37]">
-                      <FileText className="w-5 h-5" />
-                    </div>
-                  </div>
-                  <div className="mt-3">
-                    <div className="flex items-baseline space-x-2">
-                      <span className="text-2xl font-bold text-white font-mono">{invoiceMetrics.invoicesThisMonthCount}</span>
-                      <span className="text-xs text-gray-400">This Month</span>
-                    </div>
-                    <div className="mt-2 text-xs text-gray-400 flex items-center justify-between border-t border-[#2A2A2A] pt-2">
-                      <span>All-Time Invoices:</span>
-                      <span className="font-semibold text-gray-200">{invoiceMetrics.totalInvoicesCount} Total</span>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Master Insights Analytics Grid */}
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
-                {/* Panel 1: Cash Flow Projection (Col-Span 2) */}
-                <div className="bg-[#1E1E1E] rounded-xl p-6 border border-[#333333] hover:border-[#D4AF37]/40 transition-all lg:col-span-2 flex flex-col justify-between">
-                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4">
-                    <div>
-                      <div className="flex items-center space-x-2">
-                        <LineChart className="w-5 h-5 text-[#D4AF37]" />
-                        <h3 className="text-lg font-medium text-white">Cash Flow Projection</h3>
-                      </div>
-                      <p className="text-xs text-gray-400 mt-0.5">12-Month Revenue & Commission Expense Comparison</p>
-                    </div>
-                    <div className="flex items-center space-x-4 text-xs font-mono">
-                      <div className="flex items-center space-x-1.5">
-                        <span className="w-3 h-3 rounded-sm bg-[#D4AF37] inline-block shadow-sm"></span>
-                        <span className="text-gray-300">Revenue</span>
-                      </div>
-                      <div className="flex items-center space-x-1.5">
-                        <span className="w-3 h-3 rounded-sm bg-[#E57373] inline-block shadow-sm"></span>
-                        <span className="text-gray-300">Expenses</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="w-full h-72 pt-2">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={monthlyChartData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
-                        <defs>
-                          <linearGradient id="colorRevenue" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="#D4AF37" stopOpacity={0.4} />
-                            <stop offset="95%" stopColor="#D4AF37" stopOpacity={0.0} />
-                          </linearGradient>
-                          <linearGradient id="colorExpenses" x1="0" y1="0" x2="0" y2="1">
-                            <stop offset="5%" stopColor="#E57373" stopOpacity={0.35} />
-                            <stop offset="95%" stopColor="#E57373" stopOpacity={0.0} />
-                          </linearGradient>
-                        </defs>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#2A2A2A" vertical={false} />
-                        <XAxis
-                          dataKey="name"
-                          stroke="#666666"
-                          tick={{ fill: '#888888', fontSize: 11 }}
-                          tickLine={{ stroke: '#333333' }}
-                        />
-                        <YAxis
-                          stroke="#666666"
-                          tick={{ fill: '#888888', fontSize: 11 }}
-                          tickLine={{ stroke: '#333333' }}
-                          tickFormatter={(val: number) => {
-                            if (val === 0) return '₹0';
-                            if (Math.abs(val) >= 10000000) return `₹${(val / 10000000).toFixed(1)}Cr`;
-                            if (Math.abs(val) >= 100000) return `₹${(val / 100000).toFixed(1)}L`;
-                            if (Math.abs(val) >= 1000) return `₹${(val / 1000).toFixed(0)}k`;
-                            return `₹${val}`;
-                          }}
-                        />
-                        <Tooltip
-                          content={({ active, payload, label }) => {
-                            if (active && payload && payload.length) {
-                              const rev = Number(payload[0]?.value || 0);
-                              const exp = Number(payload[1]?.value || 0);
-                              const margin = rev - exp;
-                              return (
-                                <div className="bg-[#181818] border border-[#3A3A3A] p-3 rounded-lg shadow-xl text-xs space-y-1.5 font-mono">
-                                  <div className="font-bold text-gray-200 border-b border-[#2E2E2E] pb-1">
-                                    {label} Financials
-                                  </div>
-                                  <div className="flex justify-between items-center space-x-4 text-[#D4AF37]">
-                                    <span>Revenue:</span>
-                                    <span className="font-semibold">{formatCurrency(rev)}</span>
-                                  </div>
-                                  <div className="flex justify-between items-center space-x-4 text-[#E57373]">
-                                    <span>Expenses:</span>
-                                    <span className="font-semibold">{formatCurrency(exp)}</span>
-                                  </div>
-                                  <div className="flex justify-between items-center space-x-4 border-t border-[#2E2E2E] pt-1 text-emerald-400 font-semibold">
-                                    <span>Net Margin:</span>
-                                    <span>{formatCurrency(margin)}</span>
-                                  </div>
-                                </div>
-                              );
-                            }
-                            return null;
-                          }}
-                        />
-                        <Area
-                          type="monotone"
-                          dataKey="revenue"
-                          stroke="#D4AF37"
-                          strokeWidth={2.5}
-                          fillOpacity={1}
-                          fill="url(#colorRevenue)"
-                          name="Revenue"
-                        />
-                        <Area
-                          type="monotone"
-                          dataKey="expenses"
-                          stroke="#E57373"
-                          strokeWidth={2}
-                          fillOpacity={1}
-                          fill="url(#colorExpenses)"
-                          name="Expenses"
-                        />
-                      </AreaChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-
-                {/* Panel 2: Revenue Breakdown (Col-Span 1) */}
-                <div className="bg-[#1E1E1E] rounded-xl p-6 border border-[#333333] hover:border-[#D4AF37]/40 transition-all flex flex-col justify-between">
+        {/* Main Content Area */}
+        <main className="flex-1 flex flex-col min-w-0 overflow-hidden bg-gray-50 dark:bg-[#121212] transition-colors">
+          <div className="flex-1 overflow-y-auto p-6 lg:p-8">
+            {activeTab === 'Dashboard' && (
+              <div className="w-full space-y-8">
+                <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
                   <div>
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center space-x-2">
-                        <Receipt className="w-5 h-5 text-[#D4AF37]" />
-                        <h3 className="text-lg font-medium text-white">Revenue Breakdown</h3>
-                      </div>
-                      <span className="text-xs bg-[#121212] border border-[#333333] px-2.5 py-0.5 rounded-full text-gray-400 font-mono">
-                        Invoice Status
-                      </span>
-                    </div>
+                    <h2 className="text-xl font-bold mb-0.5 text-gray-900 dark:text-white">Master Overview</h2>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">Financial health, cash flow projections, and project operations summary.</p>
+                  </div>
+                  {renderTimeFilterControls('dashboard-header')}
+                </div>
 
-                    {/* Total Revenue Display */}
-                    <div className="mt-2 p-4 rounded-lg bg-[#141414] border border-[#2A2A2A]">
-                      <div className="text-xs uppercase tracking-wider text-gray-400 font-semibold">
-                        Total Invoiced Revenue
-                      </div>
-                      <div className="text-2xl font-bold text-white font-mono mt-1">
-                        {formatCurrency(revenueBreakdown.totalRevenue)}
+                {/* Enterprise Financial KPI Cards Grid (UIX-01 Light/Dark Contrast Enforced) */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {/* 1. Projects & Clients */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Projects</span>
+                      <div className="p-2 rounded-lg bg-gray-100 dark:bg-[#121212] text-[#D4AF37]">
+                        <FolderKanban className="w-4 h-4" />
                       </div>
                     </div>
-
-                    {/* Visual Segmented Progress Bar */}
-                    {(() => {
-                      const total = revenueBreakdown.totalRevenue;
-                      const clearedPct = total > 0 ? Math.round((revenueBreakdown.clearedRevenue / total) * 100) : 0;
-                      const unclearedPct = total > 0 ? 100 - clearedPct : 0;
-
-                      return (
-                        <div className="mt-4 space-y-2">
-                          <div className="flex justify-between text-xs text-gray-400 font-mono">
-                            <span className="text-emerald-400 font-medium">Cleared: {clearedPct}%</span>
-                            <span className="text-amber-400 font-medium">Uncleared: {unclearedPct}%</span>
-                          </div>
-                          <div className="w-full h-3 bg-[#121212] rounded-full overflow-hidden flex border border-[#2A2A2A]">
-                            <div
-                              className="bg-emerald-500 h-full transition-all duration-500 rounded-l-full"
-                              style={{ width: `${clearedPct}%` }}
-                              title={`Cleared: ${clearedPct}%`}
-                            />
-                            <div
-                              className="bg-[#D4AF37] h-full transition-all duration-500 rounded-r-full"
-                              style={{ width: `${unclearedPct}%` }}
-                              title={`Uncleared: ${unclearedPct}%`}
-                            />
-                          </div>
-                        </div>
-                      );
-                    })()}
-
-                    {/* Detailed Dual-Stat Comparison */}
-                    <div className="mt-4 space-y-2.5">
-                      {/* Cleared Revenue Stat */}
-                      <div className="p-3 rounded-lg bg-[#181818] border border-[#2A2A2A] flex items-center justify-between">
-                        <div className="flex items-center space-x-2.5">
-                          <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-sm" />
-                          <div>
-                            <div className="text-xs font-semibold text-gray-200">Cleared Revenue</div>
-                            <div className="text-xs text-gray-400">{revenueBreakdown.paidCount} Paid Invoices</div>
-                          </div>
-                        </div>
-                        <div className="text-right">
-                          <div className="text-sm font-bold text-emerald-400 font-mono">
-                            {formatCurrency(revenueBreakdown.clearedRevenue)}
-                          </div>
-                        </div>
+                    <div className="mt-2">
+                      <div className="flex items-baseline space-x-2">
+                        <span className="text-2xl font-bold text-gray-900 dark:text-white">{financialMetrics.totalProjectsCount}</span>
+                        <span className="text-xs text-gray-500 dark:text-gray-400">Projects</span>
                       </div>
-
-                      {/* Uncleared Revenue Stat */}
-                      <div className="p-3 rounded-lg bg-[#181818] border border-[#2A2A2A] flex items-center justify-between">
-                        <div className="flex items-center space-x-2.5">
-                          <div className="w-2.5 h-2.5 rounded-full bg-amber-400 shadow-sm" />
-                          <div>
-                            <div className="text-xs font-semibold text-gray-200">Uncleared Revenue</div>
-                            <div className="text-xs text-gray-400">{revenueBreakdown.pendingCount} Pending / Draft</div>
-                          </div>
-                        </div>
-                        <div className="text-right">
-                          <div className="text-sm font-bold text-amber-400 font-mono">
-                            {formatCurrency(revenueBreakdown.unclearedRevenue)}
-                          </div>
-                        </div>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        <span>Approved Clients:</span>
+                        <span className="font-semibold text-gray-800 dark:text-gray-200">{financialMetrics.totalApprovedClients}</span>
                       </div>
                     </div>
                   </div>
 
-                  <div className="mt-3 pt-3 border-t border-[#2A2A2A] flex items-center justify-between text-xs text-gray-400">
-                    <span>Collection Efficiency:</span>
-                    <span className="font-semibold text-emerald-400 font-mono">
-                      {revenueBreakdown.totalRevenue > 0
-                        ? `${Math.round((revenueBreakdown.clearedRevenue / revenueBreakdown.totalRevenue) * 100)}% Collected`
-                        : 'No Billings'}
-                    </span>
+                  {/* 2. Monthly Revenue */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{currentMonthName} Revenue</span>
+                      <div className="p-2 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+                        <TrendingUp className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className="text-2xl font-bold text-emerald-600 dark:text-emerald-400 font-mono">
+                        {formatCurrency(financialMetrics.monthlyRevenue)}
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        <span>Run Rate:</span>
+                        <span className="font-medium text-gray-700 dark:text-gray-300">{financialMetrics.monthlyRevenue > 0 ? 'Active' : 'No billings'}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 3. Yearly Revenue */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">{currentYearNum} YTD Revenue</span>
+                      <div className="p-2 rounded-lg bg-gray-100 dark:bg-[#121212] text-[#D4AF37]">
+                        <DollarSign className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className="text-2xl font-bold text-gray-900 dark:text-white font-mono">
+                        {formatCurrency(financialMetrics.yearlyRevenue)}
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        <span>All-Time Total:</span>
+                        <span className="font-mono text-gray-700 dark:text-gray-300">{formatCurrency(financialMetrics.totalRevenueAllTime)}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 4. Total Expenses with Toggle */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Total Expenses</span>
+                      <div className="p-2 rounded-lg bg-rose-500/10 text-rose-600 dark:text-rose-400">
+                        <Receipt className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className="text-2xl font-bold text-rose-600 dark:text-rose-400 font-mono">
+                        {formatCurrency(currentExpenseValue.value)}
+                      </div>
+                      <div className="mt-2 flex items-center space-x-1 border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        {(['monthly', 'quarterly', 'yearly', 'all'] as const).map((period) => (
+                          <button
+                            key={period}
+                            onClick={() => setExpensePeriod(period)}
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-medium transition-colors uppercase ${
+                              expensePeriod === period
+                                ? 'bg-[#D4AF37] text-black font-bold'
+                                : 'bg-gray-100 dark:bg-[#121212] text-gray-600 dark:text-gray-400 hover:text-black dark:hover:text-white'
+                            }`}
+                          >
+                            {period === 'monthly' ? 'M' : period === 'quarterly' ? 'Q' : period === 'yearly' ? 'Y' : 'All'}
+                          </button>
+                        ))}
+                        <span className="text-[10px] text-gray-500 ml-auto truncate pl-1">{currentExpenseValue.label}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 5. Net Profit / Loss */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Net Profit (YTD)</span>
+                      <div className={`p-2 rounded-lg ${financialMetrics.netProfitYearly >= 0 ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-rose-500/10 text-rose-600 dark:text-rose-400'}`}>
+                        <Scale className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className={`text-2xl font-bold font-mono ${financialMetrics.netProfitYearly >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                        {formatCurrency(financialMetrics.netProfitYearly)}
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        <span>Status:</span>
+                        <span className={`font-semibold ${financialMetrics.netProfitYearly >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600 dark:text-rose-400'}`}>
+                          {financialMetrics.netProfitYearly >= 0 ? 'Profitable' : 'Loss'}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 6. Payment Pipeline */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm flex flex-col justify-between">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Payment Pipeline</span>
+                      <div className="p-2 rounded-lg bg-gray-100 dark:bg-[#121212] text-[#D4AF37]">
+                        <CreditCard className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <div className="bg-gray-50 dark:bg-[#141414] border border-rose-500/30 rounded-lg px-2 py-1 flex items-center justify-between">
+                          <span className="text-[10px] font-medium text-rose-600 dark:text-rose-400">Pending</span>
+                          <span className="text-xs font-bold text-gray-900 dark:text-white font-mono">{paymentPipelineMetrics.pending}</span>
+                        </div>
+                        <div className="bg-gray-50 dark:bg-[#141414] border border-amber-500/30 rounded-lg px-2 py-1 flex items-center justify-between">
+                          <span className="text-[10px] font-medium text-amber-600 dark:text-amber-400">Sent</span>
+                          <span className="text-xs font-bold text-gray-900 dark:text-white font-mono">{paymentPipelineMetrics.sent}</span>
+                        </div>
+                        <div className="bg-gray-50 dark:bg-[#141414] border border-amber-500/30 rounded-lg px-2 py-1 flex items-center justify-between">
+                          <span className="text-[10px] font-medium text-amber-600 dark:text-amber-400">Partial</span>
+                          <span className="text-xs font-bold text-gray-900 dark:text-white font-mono">{paymentPipelineMetrics.partiallyPaid}</span>
+                        </div>
+                        <div className="bg-gray-50 dark:bg-[#141414] border border-[#D4AF37]/40 rounded-lg px-2 py-1 flex items-center justify-between">
+                          <span className="text-[10px] font-medium text-[#D4AF37]">Paid</span>
+                          <span className="text-xs font-bold text-gray-900 dark:text-white font-mono">{paymentPipelineMetrics.paid}</span>
+                        </div>
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        <span>Total Projects:</span>
+                        <span className="font-mono text-gray-800 dark:text-gray-200 font-semibold">{paymentPipelineMetrics.total} Total</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 7. Avg Cost per Project */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Avg Cost / Project</span>
+                      <div className="p-2 rounded-lg bg-gray-100 dark:bg-[#121212] text-[#D4AF37]">
+                        <PieChart className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className="text-2xl font-bold text-gray-900 dark:text-white font-mono">
+                        {formatCurrency(financialMetrics.avgCostPerProject)}
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        <span>Across Projects:</span>
+                        <span className="font-mono text-gray-700 dark:text-gray-300">{financialMetrics.totalProjectsCount} Total</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 8. Outstanding Receivables */}
+                  <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 rounded-xl p-4 transition-all shadow-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Outstanding Receivables</span>
+                      <div className="p-2 rounded-lg bg-amber-500/10 text-amber-600 dark:text-amber-400">
+                        <Clock className="w-4 h-4" />
+                      </div>
+                    </div>
+                    <div className="mt-2">
+                      <div className="text-2xl font-bold text-amber-600 dark:text-amber-400 font-mono">
+                        {formatCurrency(invoiceMetrics.outstandingReceivables)}
+                      </div>
+                      <div className="mt-2 text-xs text-gray-500 dark:text-gray-400 flex items-center justify-between border-t border-gray-100 dark:border-[#2A2A2A] pt-2">
+                        <span>Pending Receivables:</span>
+                        <span className="font-semibold text-amber-600 dark:text-amber-400">{invoiceMetrics.outstandingCount} Unpaid</span>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                {/* Panel 3: Team & Client Insights (Col-Span 3) */}
-                <div className="lg:col-span-3 grid grid-cols-1 md:grid-cols-2 gap-6">
-                  {/* Card A: Star Client */}
-                  <div className="bg-[#1E1E1E] rounded-xl p-6 border border-[#333333] hover:border-[#D4AF37]/60 transition-all relative overflow-hidden flex flex-col justify-between">
-                    <div className="absolute -right-8 -top-8 w-32 h-32 bg-[#D4AF37]/5 rounded-full blur-2xl pointer-events-none" />
-                    
-                    <div>
-                      <div className="flex items-center justify-between mb-4">
-                        <div className="flex items-center space-x-2.5">
-                          <div className="p-2 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30">
-                            <Trophy className="w-5 h-5" />
-                          </div>
-                          <div>
-                            <span className="text-xs font-semibold uppercase tracking-wider text-[#D4AF37]">
-                              Star Client
-                            </span>
-                            <h4 className="text-xs text-gray-400">Top Revenue Contributing Account</h4>
-                          </div>
+                {/* Master Insights Analytics Grid */}
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mt-6">
+                  {/* Panel 1: Cash Flow Projection */}
+                  <div className="bg-white dark:bg-[#1E1E1E] rounded-xl p-5 border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/40 transition-all lg:col-span-2 flex flex-col justify-between shadow-sm">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-4">
+                      <div>
+                        <div className="flex items-center space-x-2">
+                          <LineChart className="w-4 h-4 text-[#D4AF37]" />
+                          <h3 className="text-base font-semibold text-gray-900 dark:text-white">Cash Flow Projection</h3>
                         </div>
-                        <span className="text-xs bg-[#121212] border border-[#333333] px-2.5 py-0.5 rounded-full text-gray-400 font-mono">
-                          Annual Rank #1
-                        </span>
+                        <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">12-Month Revenue & Commission Expense Comparison</p>
                       </div>
-
-                      <div className="mt-2">
-                        <div className="text-xl font-bold text-white tracking-wide">
-                          {toTitleCase(starClient.name)}
+                      <div className="flex items-center space-x-4 text-xs font-mono">
+                        <div className="flex items-center space-x-1.5">
+                          <span className="w-3 h-3 rounded-sm bg-[#D4AF37] inline-block shadow-sm"></span>
+                          <span className="text-gray-600 dark:text-gray-300">Revenue</span>
                         </div>
-                        <div className="mt-3 flex items-baseline space-x-2">
-                          <span className="text-2xl font-bold text-[#D4AF37] font-mono">
-                            {formatCurrency(starClient.revenue)}
-                          </span>
-                          <span className="text-xs text-gray-400">Total Value</span>
+                        <div className="flex items-center space-x-1.5">
+                          <span className="w-3 h-3 rounded-sm bg-[#E57373] inline-block shadow-sm"></span>
+                          <span className="text-gray-600 dark:text-gray-300">Expenses</span>
                         </div>
                       </div>
                     </div>
 
-                    <div className="mt-4 pt-3 border-t border-[#2A2A2A] flex items-center justify-between text-xs text-gray-400">
-                      <span>Delivered Projects:</span>
-                      <span className="font-semibold text-gray-200 font-mono">
-                        {starClient.projectCount} {starClient.projectCount === 1 ? 'Project' : 'Projects'}
+                    <div className="w-full h-72 min-h-[288px] min-w-0 pt-2">
+                      <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={260}>
+                        <AreaChart data={monthlyChartData} margin={{ top: 10, right: 10, left: -15, bottom: 0 }}>
+                          <defs>
+                            <linearGradient id="colorRevenue" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#D4AF37" stopOpacity={0.4} />
+                              <stop offset="95%" stopColor="#D4AF37" stopOpacity={0.0} />
+                            </linearGradient>
+                            <linearGradient id="colorExpenses" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#E57373" stopOpacity={0.35} />
+                              <stop offset="95%" stopColor="#E57373" stopOpacity={0.0} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke={theme === 'dark' ? '#2A2A2A' : '#E5E7EB'} vertical={false} />
+                          <XAxis
+                            dataKey="name"
+                            stroke="#888888"
+                            tick={{ fill: theme === 'dark' ? '#888888' : '#6B7280', fontSize: 11 }}
+                            tickLine={{ stroke: theme === 'dark' ? '#333333' : '#E5E7EB' }}
+                          />
+                          <YAxis
+                            stroke="#888888"
+                            tick={{ fill: theme === 'dark' ? '#888888' : '#6B7280', fontSize: 11 }}
+                            tickLine={{ stroke: theme === 'dark' ? '#333333' : '#E5E7EB' }}
+                            tickFormatter={(val: number) => {
+                              if (val === 0) return '₹0';
+                              if (Math.abs(val) >= 10000000) return `₹${(val / 10000000).toFixed(1)}Cr`;
+                              if (Math.abs(val) >= 100000) return `₹${(val / 100000).toFixed(1)}L`;
+                              if (Math.abs(val) >= 1000) return `₹${(val / 1000).toFixed(0)}k`;
+                              return `₹${val}`;
+                            }}
+                          />
+                          <Tooltip
+                            content={({ active, payload, label }) => {
+                              if (active && payload && payload.length) {
+                                const rev = Number(payload[0]?.value || 0);
+                                const exp = Number(payload[1]?.value || 0);
+                                const margin = rev - exp;
+                                return (
+                                  <div className="bg-white dark:bg-[#181818] border border-gray-200 dark:border-[#3A3A3A] p-3 rounded-lg shadow-xl text-xs space-y-1.5 font-mono">
+                                    <div className="font-bold text-gray-900 dark:text-gray-200 border-b border-gray-100 dark:border-[#2E2E2E] pb-1">
+                                      {label} Financials
+                                    </div>
+                                    <div className="flex justify-between items-center space-x-4 text-[#D4AF37]">
+                                      <span>Revenue:</span>
+                                      <span className="font-semibold">{formatCurrency(rev)}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center space-x-4 text-rose-500 dark:text-[#E57373]">
+                                      <span>Expenses:</span>
+                                      <span className="font-semibold">{formatCurrency(exp)}</span>
+                                    </div>
+                                    <div className="flex justify-between items-center space-x-4 border-t border-gray-100 dark:border-[#2E2E2E] pt-1 text-emerald-600 dark:text-emerald-400 font-semibold">
+                                      <span>Net Margin:</span>
+                                      <span>{formatCurrency(margin)}</span>
+                                    </div>
+                                  </div>
+                                );
+                              }
+                              return null;
+                            }}
+                          />
+                          <Area
+                            type="monotone"
+                            dataKey="revenue"
+                            stroke="#D4AF37"
+                            strokeWidth={2.5}
+                            fillOpacity={1}
+                            fill="url(#colorRevenue)"
+                            name="Revenue"
+                          />
+                          <Area
+                            type="monotone"
+                            dataKey="expenses"
+                            stroke="#E57373"
+                            strokeWidth={2}
+                            fillOpacity={1}
+                            fill="url(#colorExpenses)"
+                            name="Expenses"
+                          />
+                        </AreaChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  {/* Panel 2: Revenue Breakdown */}
+                  <div className="bg-white dark:bg-[#1E1E1E] rounded-xl p-5 border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/40 transition-all flex flex-col justify-between shadow-sm">
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <div className="flex items-center space-x-2">
+                          <Receipt className="w-4 h-4 text-[#D4AF37]" />
+                          <h3 className="text-base font-semibold text-gray-900 dark:text-white">Revenue Breakdown</h3>
+                        </div>
+                        <span className="text-[11px] bg-gray-100 dark:bg-[#121212] border border-gray-200 dark:border-[#333333] px-2 py-0.5 rounded-full text-gray-600 dark:text-gray-400 font-mono">
+                          Invoice Status
+                        </span>
+                      </div>
+
+                      <div className="mt-2 p-3.5 rounded-lg bg-gray-50 dark:bg-[#141414] border border-gray-200 dark:border-[#2A2A2A]">
+                        <div className="text-[11px] uppercase tracking-wider text-gray-500 dark:text-gray-400 font-semibold">
+                          Total Invoiced Revenue
+                        </div>
+                        <div className="text-2xl font-bold text-gray-900 dark:text-white font-mono mt-1">
+                          {formatCurrency(revenueBreakdown.totalRevenue)}
+                        </div>
+                      </div>
+
+                      {/* Segmented Progress */}
+                      {(() => {
+                        const total = revenueBreakdown.totalRevenue;
+                        const clearedPct = total > 0 ? Math.round((revenueBreakdown.clearedRevenue / total) * 100) : 0;
+                        const unclearedPct = total > 0 ? 100 - clearedPct : 0;
+
+                        return (
+                          <div className="mt-4 space-y-2">
+                            <div className="flex justify-between text-xs font-mono">
+                              <span className="text-emerald-600 dark:text-emerald-400 font-medium">Cleared: {clearedPct}%</span>
+                              <span className="text-amber-600 dark:text-amber-400 font-medium">Uncleared: {unclearedPct}%</span>
+                            </div>
+                            <div className="w-full h-2.5 bg-gray-200 dark:bg-[#121212] rounded-full overflow-hidden flex border border-gray-300 dark:border-[#2A2A2A]">
+                              <div
+                                className="bg-emerald-500 h-full transition-all duration-500 rounded-l-full"
+                                style={{ width: `${clearedPct}%` }}
+                              />
+                              <div
+                                className="bg-[#D4AF37] h-full transition-all duration-500 rounded-r-full"
+                                style={{ width: `${unclearedPct}%` }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })()}
+
+                      <div className="mt-4 space-y-2">
+                        <div className="p-2.5 rounded-lg bg-gray-50 dark:bg-[#181818] border border-gray-200 dark:border-[#2A2A2A] flex items-center justify-between">
+                          <div className="flex items-center space-x-2">
+                            <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-sm" />
+                            <div>
+                              <div className="text-xs font-semibold text-gray-800 dark:text-gray-200">Cleared Revenue</div>
+                              <div className="text-[11px] text-gray-500 dark:text-gray-400">{revenueBreakdown.paidCount} Paid Invoices</div>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xs font-bold text-emerald-600 dark:text-emerald-400 font-mono">
+                              {formatCurrency(revenueBreakdown.clearedRevenue)}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="p-2.5 rounded-lg bg-gray-50 dark:bg-[#181818] border border-gray-200 dark:border-[#2A2A2A] flex items-center justify-between">
+                          <div className="flex items-center space-x-2">
+                            <div className="w-2 h-2 rounded-full bg-amber-500 shadow-sm" />
+                            <div>
+                              <div className="text-xs font-semibold text-gray-800 dark:text-gray-200">Uncleared Revenue</div>
+                              <div className="text-[11px] text-gray-500 dark:text-gray-400">{revenueBreakdown.pendingCount} Pending / Draft</div>
+                            </div>
+                          </div>
+                          <div className="text-right">
+                            <div className="text-xs font-bold text-amber-600 dark:text-amber-400 font-mono">
+                              {formatCurrency(revenueBreakdown.unclearedRevenue)}
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 pt-3 border-t border-gray-100 dark:border-[#2A2A2A] flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                      <span>Collection Efficiency:</span>
+                      <span className="font-semibold text-emerald-600 dark:text-emerald-400 font-mono">
+                        {revenueBreakdown.totalRevenue > 0
+                          ? `${Math.round((revenueBreakdown.clearedRevenue / revenueBreakdown.totalRevenue) * 100)}% Collected`
+                          : 'No Billings'}
                       </span>
                     </div>
                   </div>
 
-                  {/* Card B: Top Performer (Employee of the Year/Month) */}
-                  <div className="bg-[#1E1E1E] rounded-xl p-6 border border-[#333333] hover:border-[#D4AF37]/60 transition-all relative overflow-hidden flex flex-col justify-between">
-                    <div className="absolute -right-8 -top-8 w-32 h-32 bg-[#D4AF37]/5 rounded-full blur-2xl pointer-events-none" />
-
-                    <div>
-                      <div className="flex items-center justify-between mb-4">
-                        <div className="flex items-center space-x-2.5">
-                          <div className="p-2 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30">
-                            <Star className="w-5 h-5" />
+                  {/* Panel 3: Star Client & Top Performer */}
+                  <div className="lg:col-span-3 grid grid-cols-1 md:grid-cols-2 gap-4">
+                    {/* Star Client Card */}
+                    <div className="bg-white dark:bg-[#1E1E1E] rounded-xl p-5 border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 transition-all shadow-sm flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between mb-3">
+                          <div className="flex items-center space-x-2.5">
+                            <div className="p-2 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30">
+                              <Trophy className="w-4 h-4" />
+                            </div>
+                            <div>
+                              <span className="text-[11px] font-semibold uppercase tracking-wider text-[#D4AF37]">
+                                Star Client
+                              </span>
+                              <h4 className="text-xs text-gray-500 dark:text-gray-400">Top Revenue Account</h4>
+                            </div>
                           </div>
-                          <div>
-                            <span className="text-xs font-semibold uppercase tracking-wider text-[#D4AF37]">
-                              Top Performer
+                          <span className="text-[11px] bg-gray-100 dark:bg-[#121212] border border-gray-200 dark:border-[#333333] px-2 py-0.5 rounded-full text-gray-600 dark:text-gray-400 font-mono">
+                            Rank #1
+                          </span>
+                        </div>
+
+                        <div className="mt-2">
+                          <div className="text-lg font-bold text-gray-900 dark:text-white tracking-wide">
+                            {toTitleCase(starClient.name)}
+                          </div>
+                          <div className="mt-2 flex items-baseline space-x-2">
+                            <span className="text-xl font-bold text-[#D4AF37] font-mono">
+                              {formatCurrency(starClient.revenue)}
                             </span>
-                            <h4 className="text-xs text-gray-400">Commission Growth Leader</h4>
+                            <span className="text-xs text-gray-500 dark:text-gray-400">Total Invoiced</span>
                           </div>
                         </div>
-                        <span className="text-xs bg-[#121212] border border-[#333333] px-2.5 py-0.5 rounded-full text-gray-400 font-mono">
-                          {topPerformers.topPerformer?.role || 'Team Lead'}
-                        </span>
                       </div>
 
-                      <div className="mt-2">
-                        <div className="text-xl font-bold text-white tracking-wide">
-                          {topPerformers.topPerformer ? toTitleCase(topPerformers.topPerformer.name) : 'No Commissions Logged'}
-                        </div>
-                        <div className="mt-3 flex items-baseline space-x-2">
-                          <span className="text-2xl font-bold text-[#D4AF37] font-mono">
-                            {formatCurrency(topPerformers.topPerformer?.totalEarnedYear || 0)}
-                          </span>
-                          <span className="text-xs text-gray-400">Total Earned</span>
-                        </div>
+                      <div className="mt-4 pt-3 border-t border-gray-100 dark:border-[#2A2A2A] flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                        <span>Delivered Projects:</span>
+                        <span className="font-semibold text-gray-800 dark:text-gray-200 font-mono">
+                          {starClient.projectCount} {starClient.projectCount === 1 ? 'Project' : 'Projects'}
+                        </span>
                       </div>
                     </div>
 
-                    <div className="mt-4 pt-3 border-t border-[#2A2A2A] flex items-center justify-between text-xs text-gray-400">
-                      <span>Projects & Pace:</span>
-                      <span className="font-semibold text-gray-200 font-mono">
-                        {topPerformers.topPerformer?.projectCount || 0} Projects • {formatCurrency(topPerformers.topPerformer?.totalEarnedMonth || 0)} this month
-                      </span>
+                    {/* Top Performer Card */}
+                    <div className="bg-white dark:bg-[#1E1E1E] rounded-xl p-5 border border-gray-200 dark:border-[#333333] hover:border-[#D4AF37]/60 transition-all shadow-sm flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-center justify-between mb-3">
+                          <div className="flex items-center space-x-2.5">
+                            <div className="p-2 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30">
+                              <Star className="w-4 h-4" />
+                            </div>
+                            <div>
+                              <span className="text-[11px] font-semibold uppercase tracking-wider text-[#D4AF37]">
+                                Top Performer
+                              </span>
+                              <h4 className="text-xs text-gray-500 dark:text-gray-400">Commission Growth Leader</h4>
+                            </div>
+                          </div>
+                          <span className="text-[11px] bg-gray-100 dark:bg-[#121212] border border-gray-200 dark:border-[#333333] px-2 py-0.5 rounded-full text-gray-600 dark:text-gray-400 font-mono">
+                            {topPerformers.topPerformer?.role || 'Team Lead'}
+                          </span>
+                        </div>
+
+                        <div className="mt-2">
+                          <div className="text-lg font-bold text-gray-900 dark:text-white tracking-wide">
+                            {topPerformers.topPerformer ? formatIndianName(topPerformers.topPerformer.name) : 'No Commissions Logged'}
+                          </div>
+                          <div className="mt-2 flex items-baseline space-x-2">
+                            <span className="text-xl font-bold text-[#D4AF37] font-mono">
+                              {formatCurrency(topPerformers.topPerformer?.totalEarnedYear || 0)}
+                            </span>
+                            <span className="text-xs text-gray-500 dark:text-gray-400">Earned This Year</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 pt-3 border-t border-gray-100 dark:border-[#2A2A2A] flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+                        <span>Projects & Pace:</span>
+                        <span className="font-semibold text-gray-800 dark:text-gray-200 font-mono">
+                          {topPerformers.topPerformer?.projectCount || 0} Projects • {formatCurrency(topPerformers.topPerformer?.totalEarnedMonth || 0)} this month
+                        </span>
+                      </div>
                     </div>
                   </div>
                 </div>
               </div>
-            </div>
-          )}
-          {activeTab === 'Clients' && (() => {
-            const formatAddressToString = (addr: any): string => {
-              if (!addr) return '';
-              if (typeof addr === 'string') return addr.trim();
-              if (typeof addr === 'object' && addr !== null) {
-                const parts = [
-                  addr.line1 || addr.addressLine1 || addr.street || addr.streetAddress,
-                  addr.line2 || addr.addressLine2,
-                  addr.landmark,
-                  typeof addr.city === 'string' ? addr.city : (addr.city?.name || addr.city?.city),
-                  typeof addr.state === 'string' ? addr.state : (addr.state?.name || addr.state?.state),
-                  addr.pinCode || addr.pincode || addr.zipCode || addr.postalCode,
-                  addr.country
-                ].filter(Boolean);
-                if (parts.length > 0) return parts.join(', ');
+            )}
 
-                const textVals = Object.values(addr)
-                  .map(v => (typeof v === 'string' ? v.trim() : typeof v === 'number' ? String(v) : ''))
-                  .filter(Boolean);
-                if (textVals.length > 0) return textVals.join(', ');
-              }
-              return String(addr || '');
-            };
-
-            const getClientFullAddress = (client: any): string => {
-              if (!client) return '—';
-
-              if (client.billingAddress) {
-                const formatted = formatAddressToString(client.billingAddress);
-                if (formatted) return formatted;
-              }
-              if (client.fullAddress) {
-                const formatted = formatAddressToString(client.fullAddress);
-                if (formatted) return formatted;
-              }
-              if (client.address) {
-                const formatted = formatAddressToString(client.address);
-                if (formatted) return formatted;
-              }
-              if (client.streetAddress) {
-                const formatted = formatAddressToString(client.streetAddress);
-                if (formatted) return formatted;
-              }
-
-              const parts = [
-                client.addressLine1,
-                client.addressLine2,
-                typeof client.city === 'string' ? client.city : (client.city?.name || client.city?.city),
-                typeof client.state === 'string' ? client.state : (client.state?.name || client.state?.state),
-                client.pinCode || client.pincode || client.zipCode || client.postalCode
-              ].filter(Boolean);
-
-              if (parts.length > 0) return parts.join(', ');
-
-              if (client.city) {
-                const cityStr = typeof client.city === 'string' ? client.city : (client.city?.name || client.city?.city);
-                if (cityStr) return cityStr;
-              }
-              return '—';
-            };
-
-            const safeRenderString = (val: any, fallback = '—'): string => {
-              if (val === null || val === undefined) return fallback;
-              if (typeof val === 'string') return val.trim() || fallback;
-              if (typeof val === 'number') return String(val);
-              if (typeof val === 'boolean') return val ? 'Yes' : 'No';
-              if (typeof val === 'object') {
-                if (val.line1 !== undefined || val.line2 !== undefined || val.pinCode !== undefined || val.pincode !== undefined || val.street !== undefined) {
-                  return formatAddressToString(val) || fallback;
-                }
-                if (val.name) return String(val.name);
-                if (val.label) return String(val.label);
-                if (val.value) return String(val.value);
-                if (val.title) return String(val.title);
-                if (val.email) return String(val.email);
-                if (val.phone) return String(val.phone);
-                if (val.city) return typeof val.city === 'string' ? val.city : (val.city?.name || fallback);
-                
-                const textVals = Object.values(val)
-                  .map(v => (typeof v === 'string' ? v.trim() : typeof v === 'number' ? String(v) : ''))
-                  .filter(Boolean);
-                if (textVals.length > 0) return textVals.join(', ');
-                return fallback;
-              }
-              return String(val) || fallback;
-            };
-
-            const getSalespersonName = (emailOrVal: string | undefined): string => {
-              if (!emailOrVal) return '—';
-              const val = String(emailOrVal).trim();
-              const lower = val.toLowerCase();
-              
-              const matchedUser = users.find(u => 
-                (u.email && u.email.toLowerCase() === lower) ||
-                (u.id && u.id.toLowerCase() === lower) ||
-                (u.name && u.name.toLowerCase() === lower) ||
-                (u.displayName && u.displayName.toLowerCase() === lower) ||
-                (u.employeeName && u.employeeName.toLowerCase() === lower) ||
-                (u.empId && u.empId.toLowerCase() === lower)
-              );
-
-              if (matchedUser) {
-                return matchedUser.name || matchedUser.displayName || matchedUser.employeeName || toTitleCase(matchedUser.email?.split('@')[0] || val);
-              }
-
-              if (val.includes('@')) {
-                const namePart = val.split('@')[0].replace(/[._-]/g, ' ');
-                return toTitleCase(namePart);
-              }
-
-              return toTitleCase(val);
-            };
-
-            const approvedClients = clients.filter(
-              (c) => c.status === CLIENT_STATUS.APPROVED || c.status?.toLowerCase() === 'approved'
-            );
-
-            const filteredApprovedClients = approvedClients.filter(c => {
-              if (!clientSearchTerm.trim()) return true;
-              const q = clientSearchTerm.toLowerCase().trim();
-              const company = safeRenderString(c.companyName, '').toLowerCase();
-              const person = safeRenderString(c.contactPerson, '').toLowerCase();
-              const city = safeRenderString(typeof c.city === 'object' ? (c.city?.name || c.city?.city) : c.city, '').toLowerCase();
-              const gstin = safeRenderString(c.gstin || c.gst || c.gstNumber, '').toLowerCase();
-              const sp = getSalespersonName(c.salesPersonEmail || c.salesPerson).toLowerCase();
-              const phone = safeRenderString(c.phone || c.mobile || c.contactPhone, '').toLowerCase();
-              const email = safeRenderString(c.email || c.contactEmail, '').toLowerCase();
-              const addr = getClientFullAddress(c).toLowerCase();
-              return company.includes(q) || person.includes(q) || city.includes(q) || gstin.includes(q) || sp.includes(q) || phone.includes(q) || email.includes(q) || addr.includes(q);
-            });
-
-            return (
+            {/* Other Tabs */}
+            {(activeTab === 'Clients' || activeTab.toLowerCase() === 'clients') && (
               <div className="w-full space-y-6">
-                {/* Header and Search Controls */}
                 <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
                   <div className="flex items-center space-x-3">
                     <div className="p-2 rounded-lg bg-[#D4AF37]/10 text-[#D4AF37] border border-[#D4AF37]/30">
                       <Briefcase className="w-5 h-5" />
                     </div>
                     <div>
-                      <h3 className="text-xl font-bold text-white tracking-wide">Approved Clients Directory</h3>
-                      <p className="text-xs text-gray-400 mt-0.5">
+                      <h3 className="text-lg font-bold text-gray-900 dark:text-white tracking-wide">Approved Clients Directory</h3>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
                         Verified enterprise client profiles, commercial taxation details, and assigned sales representatives.
                       </p>
                     </div>
                   </div>
 
-                  <div className="flex items-center space-x-3">
-                    <div className="relative">
-                      <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                      <input
-                        type="text"
-                        value={clientSearchTerm}
-                        onChange={(e) => setClientSearchTerm(e.target.value)}
-                        placeholder="Search company, contact, city, GSTIN, sales person..."
-                        className="bg-[#1E1E1E] border border-[#333333] rounded-lg pl-9 pr-4 py-2 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-[#D4AF37] w-64 sm:w-80"
-                      />
-                      {clientSearchTerm && (
-                        <button
-                          onClick={() => setClientSearchTerm('')}
-                          className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white text-xs"
-                        >
-                          ✕
-                        </button>
-                      )}
-                    </div>
+                  <div className="relative">
+                    <Search className="w-4 h-4 text-gray-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={clientSearchTerm}
+                      onChange={(e) => setClientSearchTerm(e.target.value)}
+                      placeholder="Search company, contact, city, GSTIN..."
+                      className="bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] rounded-lg pl-9 pr-4 py-2 text-xs text-gray-900 dark:text-white placeholder-gray-400 focus:outline-none focus:border-[#D4AF37] w-64 sm:w-80"
+                    />
                   </div>
                 </div>
 
-                {/* Table Container with Responsive Horizontal Scrolling */}
-                <div className="bg-[#1E1E1E] rounded-xl shadow-2xl p-6 border border-[#333333] overflow-hidden">
-                  <div className="flex items-center justify-between mb-4">
-                    <div className="flex items-center space-x-2">
-                      <span className="text-xs font-bold uppercase tracking-wider text-gray-300">
-                        Client Roster
-                      </span>
-                      <span className="px-2 py-0.5 rounded-full bg-[#121212] border border-[#333333] text-[11px] font-mono font-semibold text-[#D4AF37]">
-                        {filteredApprovedClients.length} of {approvedClients.length} Active
-                      </span>
-                    </div>
-                  </div>
-
-                  {filteredApprovedClients.length === 0 ? (
-                    <div className="text-center py-12 border border-dashed border-[#333333] rounded-xl bg-[#141414]">
-                      <Briefcase className="mx-auto h-12 w-12 text-gray-500 mb-3 opacity-60" />
-                      <h4 className="text-sm font-semibold text-gray-300">
-                        {clientSearchTerm ? 'No matching clients found' : 'No approved clients yet'}
-                      </h4>
-                      <p className="text-xs text-gray-500 mt-1 max-w-sm mx-auto">
-                        {clientSearchTerm
-                          ? 'Try modifying your search query to locate registered accounts.'
-                          : 'Populate your Firebase connection to see real client profiles.'}
-                      </p>
-                    </div>
-                  ) : (
-                    <div className="overflow-x-auto whitespace-nowrap scrollbar-thin scrollbar-thumb-[#333333] scrollbar-track-transparent">
-                      <table className="w-full text-left text-xs whitespace-nowrap">
-                        <thead>
-                          <tr className="text-gray-400 text-[11px] uppercase border-b border-[#333333]">
-                            <th className="pb-3.5 px-4 font-semibold">Company Name</th>
-                            <th className="pb-3.5 px-4 font-semibold">Contact Person</th>
-                            <th className="pb-3.5 px-4 font-semibold">Phone</th>
-                            <th className="pb-3.5 px-4 font-semibold">Email</th>
-                            <th className="pb-3.5 px-4 font-semibold">City</th>
-                            <th className="pb-3.5 px-4 font-semibold">GSTIN</th>
-                            <th className="pb-3.5 px-4 font-semibold">Full Address</th>
-                            <th className="pb-3.5 px-4 font-semibold">Pricing Tier</th>
-                            <th className="pb-3.5 px-4 font-semibold">Sales Person</th>
-                            <th className="pb-3.5 px-4 font-semibold text-center">Status</th>
+                <div className="bg-white dark:bg-[#1E1E1E] rounded-xl shadow-sm p-5 border border-gray-200 dark:border-[#333333] overflow-hidden">
+                  <div className="overflow-x-auto whitespace-nowrap">
+                    <table className="w-full text-left text-xs whitespace-nowrap">
+                      <thead>
+                        <tr className="text-gray-500 dark:text-gray-400 text-[11px] uppercase border-b border-gray-200 dark:border-[#333333]">
+                          <th className="pb-3 px-4 font-semibold">Company Name</th>
+                          <th className="pb-3 px-4 font-semibold">Contact Person</th>
+                          <th className="pb-3 px-4 font-semibold">Phone</th>
+                          <th className="pb-3 px-4 font-semibold">Email</th>
+                          <th className="pb-3 px-4 font-semibold">City</th>
+                          <th className="pb-3 px-4 font-semibold">GSTIN</th>
+                          <th className="pb-3 px-4 font-semibold">Pricing Tier</th>
+                          <th className="pb-3 px-4 font-semibold text-center">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100 dark:divide-[#2A2A2A]">
+                        {clients.map((client, idx) => (
+                          <tr key={client.id || idx} className="hover:bg-gray-50 dark:hover:bg-[#252525] transition-colors">
+                            <td className="py-3 px-4 font-bold text-[#D4AF37]">{toTitleCase(client.companyName)}</td>
+                            <td className="py-3 px-4 text-gray-800 dark:text-gray-200">{formatIndianName(client.contactPerson || '—')}</td>
+                            <td className="py-3 px-4 font-mono text-gray-600 dark:text-gray-400">{client.phone || client.mobile || '—'}</td>
+                            <td className="py-3 px-4 font-mono text-gray-600 dark:text-gray-400 text-[11px]">{client.email || '—'}</td>
+                            <td className="py-3 px-4 text-gray-700 dark:text-gray-300">{toTitleCase(client.city || '—')}</td>
+                            <td className="py-3 px-4 font-mono text-gray-700 dark:text-gray-300">{client.gstin || '—'}</td>
+                            <td className="py-3 px-4">
+                              <span className="px-2 py-0.5 rounded text-[11px] font-semibold bg-gray-100 dark:bg-[#121212] border border-gray-200 dark:border-[#333333] text-gray-700 dark:text-gray-300">
+                                {client.pricingCategory || 'T1'}
+                              </span>
+                            </td>
+                            <td className="py-3 px-4 text-center">
+                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+                                Approved
+                              </span>
+                            </td>
                           </tr>
-                        </thead>
-                        <tbody className="divide-y divide-[#2A2A2A]">
-                          {filteredApprovedClients.map((client, index) => {
-                            const salesPersonName = getSalespersonName(client.salesPersonEmail || client.salesPerson || client.salesPersonName);
-                            const fullAddress = getClientFullAddress(client);
-                            const companyVal = safeRenderString(client.companyName);
-                            const contactPersonVal = safeRenderString(client.contactPerson);
-                            const phoneVal = safeRenderString(client.phone || client.mobile || client.contactPhone);
-                            const emailVal = safeRenderString(client.email || client.contactEmail);
-                            const cityVal = safeRenderString(typeof client.city === 'object' ? (client.city?.name || client.city?.city) : client.city);
-                            const gstinVal = safeRenderString(client.gstin || client.gst || client.gstNumber);
-                            const pricingTier = safeRenderString(client.pricingCategory || client.pricingTier, 'Standard');
-
-                            return (
-                              <tr key={client.id ? `${client.id}-${index}` : `client-${index}`} className="hover:bg-[#252525] transition-colors group">
-                                {/* Company Name */}
-                                <td className="py-3.5 px-4 font-bold text-[#D4AF37] group-hover:text-[#F3E5AB] transition-colors">
-                                  {companyVal}
-                                </td>
-
-                                {/* Contact Person */}
-                                <td className="py-3.5 px-4 text-gray-200 font-medium">
-                                  {contactPersonVal}
-                                </td>
-
-                                {/* Phone */}
-                                <td className="py-3.5 px-4 font-mono text-gray-300">
-                                  {phoneVal}
-                                </td>
-
-                                {/* Email */}
-                                <td className="py-3.5 px-4 font-mono text-gray-300 text-[11px]">
-                                  {emailVal}
-                                </td>
-
-                                {/* City */}
-                                <td className="py-3.5 px-4 text-gray-200 font-medium">
-                                  {cityVal}
-                                </td>
-
-                                {/* GSTIN */}
-                                <td className="py-3.5 px-4 font-mono text-gray-300 text-[11px]">
-                                  {gstinVal !== '—' ? (
-                                    <span className="px-2 py-0.5 rounded bg-[#141414] border border-[#333333] text-gray-300 font-mono">
-                                      {gstinVal}
-                                    </span>
-                                  ) : (
-                                    <span className="text-gray-500 italic">Unassigned</span>
-                                  )}
-                                </td>
-
-                                {/* Full Address */}
-                                <td className="py-3.5 px-4 text-gray-300 max-w-xs truncate" title={fullAddress}>
-                                  {fullAddress}
-                                </td>
-
-                                {/* Pricing Tier */}
-                                <td className="py-3.5 px-4">
-                                  <span className="bg-[#121212] px-2.5 py-1 rounded text-xs font-semibold border border-[#333333] text-gray-200">
-                                    {pricingTier}
-                                  </span>
-                                </td>
-
-                                {/* Sales Person (Clean Employee Name) */}
-                                <td className="py-3.5 px-4 text-gray-200 font-medium">
-                                  <div className="flex items-center space-x-1.5">
-                                    <div className="w-1.5 h-1.5 rounded-full bg-[#D4AF37]"></div>
-                                    <span className="text-white font-semibold">{salesPersonName}</span>
-                                  </div>
-                                </td>
-
-                                {/* Status */}
-                                <td className="py-3.5 px-4 text-center">
-                                  <span className="inline-flex items-center space-x-1 text-emerald-400 bg-emerald-500/10 px-2.5 py-1 rounded-full text-xs font-semibold border border-emerald-500/20 shadow-sm">
-                                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                                    <span>Approved</span>
-                                  </span>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-          {activeTab === 'Pricing Rules' && (() => {
-            // Derived unique values for cascading dropdowns
-            const uniqueCategories = Array.from(new Set(pricingRules.map(rule => rule.category || 'Standard'))).filter(Boolean);
-            
-            const availableScopes = Array.from(new Set(pricingRules
-              .filter(rule => (rule.category || 'Standard') === selectedCategory)
-              .map(rule => rule.scope)
-            )).filter(Boolean);
-            
-            const availableSubServices = Array.from(new Set(pricingRules
-              .filter(rule => 
-                (rule.category || 'Standard') === selectedCategory && 
-                rule.scope === selectedScope
-              )
-              .map(rule => rule.subService)
-            )).filter(Boolean);
-
-            // Filter the final table data based on all three selections
-            const filteredRules = pricingRules
-              .filter(rule => 
-                (rule.category || 'Standard') === selectedCategory &&
-                rule.scope === selectedScope &&
-                rule.subService === selectedSubService
-              )
-              .flatMap(rule => rule.capacityRows || []);
-
-            return (
-              <div className="w-full space-y-8">
-                <div className="bg-[#1E1E1E] rounded-xl shadow-2xl p-6 overflow-x-auto border border-[#333333]">
-                  <div className="flex justify-between items-center mb-6">
-                    <h3 className="text-lg font-medium">Pricing Matrix Directory</h3>
-                  </div>
-
-                  {/* Cascading Filter Bar */}
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6 bg-[#1A1A1A] p-4 rounded-lg border border-[#333333]">
-                    <div>
-                      <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">Category / Tier</label>
-                      <select
-                        value={selectedCategory}
-                        onChange={(e) => {
-                          setSelectedCategory(e.target.value);
-                          setSelectedScope(''); // Reset dependent filters
-                          setSelectedSubService('');
-                        }}
-                        className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none"
-                      >
-                        <option value="">Select Category</option>
-                        {uniqueCategories.map(cat => (
-                          <option key={cat} value={cat}>{cat}</option>
                         ))}
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">Scope of Work</label>
-                      <select
-                        value={selectedScope}
-                        onChange={(e) => {
-                          setSelectedScope(e.target.value);
-                          setSelectedSubService(''); // Reset dependent filter
-                        }}
-                        disabled={!selectedCategory}
-                        className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        <option value="">Select Scope</option>
-                        {availableScopes.map(scope => (
-                          <option key={scope} value={scope}>{scope}</option>
-                        ))}
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider mb-2">Sub-Service</label>
-                      <select
-                        value={selectedSubService}
-                        onChange={(e) => setSelectedSubService(e.target.value)}
-                        disabled={!selectedScope}
-                        className="w-full bg-[#121212] border border-[#333333] rounded-lg px-3 py-2 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none disabled:opacity-50 disabled:cursor-not-allowed"
-                      >
-                        <option value="">Select Sub-Service</option>
-                        {availableSubServices.map(sub => (
-                          <option key={sub} value={sub}>{sub}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  
-                  {!(selectedCategory && selectedScope && selectedSubService) ? (
-                    <div className="text-center py-12 border border-dashed border-[#333333] rounded-lg bg-[#1A1A1A]">
-                      <Tags className="mx-auto h-12 w-12 text-[#D4AF37]/50 mb-4" />
-                      <h4 className="text-lg font-medium text-gray-300">Drill Down Required</h4>
-                      <p className="text-gray-500 mt-2 max-w-md mx-auto">Please select a Category, Scope, and Sub-Service to view reference pricing.</p>
-                    </div>
-                  ) : filteredRules.length === 0 ? (
-                    <div className="text-center py-10 border border-dashed border-[#333333] rounded-lg">
-                      <h4 className="text-lg font-medium text-gray-300">No matching rules found</h4>
-                      <p className="text-gray-500 mt-1">There are no pricing tiers defined for this specific combination.</p>
-                    </div>
-                  ) : (
-                    <table className="w-full text-left whitespace-nowrap min-w-[600px]">
-                      <thead>
-                        <tr className="text-gray-400 text-sm uppercase border-b border-[#333333]">
-                          <th className="pb-3 px-4 font-semibold">Capacity Range</th>
-                          <th className="pb-3 px-4 font-semibold">Price Type</th>
-                          <th className="pb-3 px-4 font-semibold">Unit</th>
-                          <th className="pb-3 px-4 font-semibold text-right">Price</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#333333]">
-                        {filteredRules.map((row: any, index: number) => {
-                          const formatCurrency = (val: number) =>
-                            new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(val);
-                          
-                          const price = Number(row.price) || 0;
-
-                          return (
-                            <tr key={index} className="hover:bg-[#2A2A2A] transition-colors">
-                              <td className="py-4 px-4 font-medium text-[#D4AF37]">{row.capacityRange || 'N/A'}</td>
-                              <td className="py-4 px-4 text-gray-200">{row.priceType || 'N/A'}</td>
-                              <td className="py-4 px-4 text-gray-200">{row.unit || 'N/A'}</td>
-                              <td className="py-4 px-4 text-right text-gray-200 font-mono">
-                                {formatCurrency(price)}
-                              </td>
-                            </tr>
-                          );
-                        })}
                       </tbody>
                     </table>
-                  )}
+                  </div>
                 </div>
               </div>
-            );
-          })()}
-          {activeTab === 'Projects' && (() => {
-            return (
-              <div className="w-full space-y-8">
-                <div className="bg-white dark:bg-[#1E1E1E] rounded-xl shadow-2xl p-6 overflow-x-auto border border-gray-200 dark:border-[#333333] transition-colors">
-                  <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-4">
-                    <div className="flex items-center space-x-3">
-                      <h3 className="text-lg font-medium text-gray-900 dark:text-white">Projects Directory</h3>
-                      <span className="text-xs bg-gray-100 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] px-2.5 py-0.5 rounded-full text-gray-500 dark:text-gray-400 font-mono">
-                        {projectsDirectoryFilteredSorted.length} of {financialProjects.length} projects
-                      </span>
-                    </div>
-                    {renderTimeFilterControls('projects-directory')}
-                  </div>
+            )}
 
-                  <div className="flex items-center gap-2 mb-6">
-                    <div className="flex items-center flex-1 max-w-xs bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/50 focus-within:border-[#D4AF37] rounded-lg px-2.5 py-1.5 transition-colors">
-                      <Search className="w-3.5 h-3.5 text-gray-400 dark:text-gray-500 mr-1.5 flex-shrink-0" />
-                      <input
-                        type="text"
-                        value={projectSearchQuery}
-                        onChange={(e) => setProjectSearchQuery(e.target.value)}
-                        placeholder="Search project, client, scope..."
-                        className="bg-transparent text-xs text-gray-700 dark:text-gray-200 focus:outline-none w-full placeholder:text-gray-400 dark:placeholder:text-gray-500"
-                      />
-                    </div>
-                    {(projectClientFilter !== 'all' || projectScopeFilter !== 'all' || projectStatusFilter !== 'all' || projectDesignerFilter !== 'all' || projectSearchQuery.trim() !== '') && (
-                      <button
-                        onClick={() => {
-                          setProjectClientFilter('all');
-                          setProjectScopeFilter('all');
-                          setProjectStatusFilter('all');
-                          setProjectDesignerFilter('all');
-                          setProjectSearchQuery('');
-                        }}
-                        className="flex items-center space-x-1 px-2 py-1.5 rounded-lg text-xs font-medium text-amber-600 dark:text-amber-400/90 hover:text-amber-500 dark:hover:text-amber-300 hover:bg-gray-100 dark:hover:bg-[#2A2A2A] transition-colors border border-gray-300 dark:border-[#444]"
-                      >
-                        <RotateCcw className="w-3 h-3" />
-                        <span>Clear Column Filters</span>
-                      </button>
-                    )}
-                  </div>
-                  
-                  {financialProjects.length === 0 ? (
-                    <div className="text-center py-10 border border-dashed border-gray-300 dark:border-[#333333] rounded-lg">
-                      <FolderKanban className="mx-auto h-12 w-12 text-gray-400 dark:text-gray-500 mb-4" />
-                      <h4 className="text-lg font-medium text-gray-700 dark:text-gray-300">No active projects found</h4>
-                      <p className="text-gray-500 dark:text-gray-500 mt-1">Populate your Firebase connection to see real projects.</p>
-                    </div>
-                  ) : projectsDirectoryFilteredSorted.length === 0 ? (
-                    <div className="text-center py-10 border border-dashed border-gray-300 dark:border-[#333333] rounded-lg">
-                      <Calendar className="mx-auto h-12 w-12 text-[#D4AF37]/50 mb-4" />
-                      <h4 className="text-lg font-medium text-gray-700 dark:text-gray-300">No projects match the selected filters</h4>
-                      <p className="text-gray-500 mt-1">
-                        No project records found for the chosen month/year/column filters or search.
-                      </p>
-                      <button
-                        onClick={() => {
-                          setSelectedMonth('all');
-                          setSelectedYear('all');
-                          setProjectClientFilter('all');
-                          setProjectScopeFilter('all');
-                          setProjectStatusFilter('all');
-                          setProjectDesignerFilter('all');
-                          setProjectSearchQuery('');
-                        }}
-                        className="mt-4 inline-flex items-center space-x-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#D4AF37] text-black hover:bg-[#c49f2c] transition-colors shadow-sm"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                        <span>Reset All Filters</span>
-                      </button>
-                    </div>
-                  ) : (
-                    <table className="w-full text-left whitespace-nowrap">
-                      <thead>
-                        <tr className="text-gray-500 dark:text-gray-400 text-sm uppercase border-b border-gray-200 dark:border-[#333333]">
-                          <th className="pb-3 px-4 font-semibold">Project Name</th>
-                          <th className="pb-3 px-4 font-semibold">
-                            <div className="flex items-center gap-1">
-                              <span>Client</span>
-                              <select
-                                value={projectClientFilter}
-                                onChange={(e) => setProjectClientFilter(e.target.value)}
-                                onClick={(e) => e.stopPropagation()}
-                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectClientFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
-                              >
-                                <option value="all">All</option>
-                                {projectClientOptions.map((c) => (
-                                  <option key={c} value={c}>{c}</option>
-                                ))}
-                              </select>
-                            </div>
-                          </th>
-                          <th className="pb-3 px-4 font-semibold">Capacity</th>
-                          <th className="pb-3 px-4 font-semibold">Date</th>
-                          <th className="pb-3 px-4 font-semibold">
-                            <div className="flex items-center gap-1">
-                              <span>Scope</span>
-                              <select
-                                value={projectScopeFilter}
-                                onChange={(e) => setProjectScopeFilter(e.target.value)}
-                                onClick={(e) => e.stopPropagation()}
-                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectScopeFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
-                              >
-                                <option value="all">All</option>
-                                {projectScopeOptions.map((s) => (
-                                  <option key={s} value={s}>{toTitleCase(s)}</option>
-                                ))}
-                              </select>
-                            </div>
-                          </th>
-                          <th className="pb-3 px-4 font-semibold">Sub-Service</th>
-                          <th className="pb-3 px-4 font-semibold">
-                            <div className="flex items-center gap-1">
-                              <span>Designer(s)</span>
-                              <select
-                                value={projectDesignerFilter}
-                                onChange={(e) => setProjectDesignerFilter(e.target.value)}
-                                onClick={(e) => e.stopPropagation()}
-                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectDesignerFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
-                              >
-                                <option value="all">All</option>
-                                {projectDesignerOptions.map((d) => (
-                                  <option key={d} value={d}>{d}</option>
-                                ))}
-                              </select>
-                            </div>
-                          </th>
-                          <th className="pb-3 px-4 font-semibold">Sales Person</th>
-                          <th className="pb-3 px-4 font-semibold text-right">Cost</th>
-                          <th className="pb-3 px-4 font-semibold text-right">Des. Comm</th>
-                          <th className="pb-3 px-4 font-semibold text-right">Sales Comm</th>
-                          <th className="pb-3 px-4 font-semibold text-right">Balance</th>
-                          <th className="pb-3 px-4 font-semibold text-center">
-                            <div className="flex items-center justify-center gap-1">
-                              <span>Status</span>
-                              <select
-                                value={projectStatusFilter}
-                                onChange={(e) => setProjectStatusFilter(e.target.value)}
-                                onClick={(e) => e.stopPropagation()}
-                                className={`bg-white dark:bg-[#121212] border rounded text-[10px] normal-case font-normal py-0.5 px-1 focus:outline-none cursor-pointer ${projectStatusFilter !== 'all' ? 'border-[#D4AF37] text-[#D4AF37]' : 'border-gray-300 dark:border-[#333333] text-gray-500 dark:text-gray-400'}`}
-                              >
-                                <option value="all">All</option>
-                                {projectStatusOptions.map((s) => (
-                                  <option key={s} value={s}>{toTitleCase(s)}</option>
-                                ))}
-                              </select>
-                            </div>
-                          </th>
-                          <th className="pb-3 px-4 font-semibold text-center">Payment Status</th>
-                          <th className="pb-3 px-4 font-semibold text-right">Actions</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-200 dark:divide-[#333333]">
-                        {projectsDirectoryPageRows.map((project) => {
-                          const d = getProjectDate(project);
-                          const dateText = d ? `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}` : 'N/A';
+            {(activeTab === 'Projects' || activeTab.toLowerCase() === 'projects') && (
+              <ProjectsDirectory
+                projects={financialProjects.length > 0 ? financialProjects : (projects || [])}
+                clients={clients || []}
+                users={users || []}
+                invoices={invoices || []}
+                onUpdateProject={handleUpdateProject}
+                onDeleteProject={handleDeleteProjectDirectly}
+                renderTimeFilterControls={renderTimeFilterControls}
+              />
+            )}
 
-                          const clientName = project.clientName || project.matchedClient?.companyName || 'N/A';
-                          
-                          const cost = project.calculatedCost || project.cost || 0;
-                          const desComm = project.designerCommission || 0;
-                          const salesComm = project.salesCommission || 0;
-                          const balance = cost - (desComm + salesComm);
-                          const paymentInfo = getProjectPaymentStatus(project);
+            {(activeTab === 'Billing' || activeTab.toLowerCase() === 'billing') && (
+              <BillingModule clients={clients || []} projects={financialProjects.length > 0 ? financialProjects : (projects || [])} pricingRules={pricingRules || []} />
+            )}
 
-                          return (
-                            <tr key={project.id} className="hover:bg-gray-50 dark:hover:bg-[#252525]/50 transition-colors">
-                              <td className="py-4 px-4 font-medium text-gray-900 dark:text-white">
-                                {toTitleCase(project.projectName || 'Untitled')}
-                              </td>
-                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(clientName)}</td>
-                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">
-                                {project.plantCapacity ? `${project.plantCapacity} ${project.capacityUnit || 'KW'}` : 'N/A'}
-                              </td>
-                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{dateText}</td>
-                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(project.scopeOfWork || 'N/A')}</td>
-                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(project.subService || 'N/A')}</td>
-                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">
-                                {project.assignedScopes && Object.keys(project.assignedScopes).length > 0 ? (
-                                  <span className="text-xs" title={getScopeDesignerSummary(project)}>
-                                    {getScopeDesignerSummary(project).split(' | ').map((line, i) => (
-                                      <span key={i} className="block whitespace-nowrap">
-                                        <span className="text-[#D4AF37]">{line.split(':')[0]}:</span>
-                                        <span className="text-gray-700 dark:text-gray-200">{line.split(':').slice(1).join(':')}</span>
-                                      </span>
-                                    ))}
-                                  </span>
-                                ) : (
-                                  getScopeDesignerSummary(project)
-                                )}
-                              </td>
-                              <td className="py-4 px-4 text-gray-700 dark:text-gray-200">{toTitleCase(getEmployeeName(project.salesPersonEmail || project.matchedClient?.salesPersonEmail))}</td>
-                              <td className="py-4 px-4 text-right text-gray-700 dark:text-gray-200 font-mono">
-                                {formatCurrency(cost)}
-                              </td>
-                              <td className="py-4 px-4 text-right text-gray-700 dark:text-gray-200 font-mono">
-                                {formatCurrency(desComm)}
-                              </td>
-                              <td className="py-4 px-4 text-right text-gray-700 dark:text-gray-200 font-mono">
-                                {formatCurrency(salesComm)}
-                              </td>
-                              <td className="py-4 px-4 text-right font-mono font-medium text-gray-900 dark:text-white">
-                                {formatCurrency(balance)}
-                              </td>
-                              <td className="py-4 px-4 flex justify-center">
-                                {getStatusBadge(project.status)}
-                              </td>
-                              <td className="py-4 px-4 text-center">
-                                <div className="flex justify-center">
-                                  {getPaymentStatusBadge(paymentInfo)}
-                                </div>
-                              </td>
-                              <td className="py-4 px-4 text-right">
-                                <div className="flex items-center justify-end gap-3">
-                                  <button 
-                                    onClick={() => {
-                                      setEditingProject(project);
-                                      setIsEditProjectModalOpen(true);
-                                    }}
-                                    className="text-[#D4AF37] hover:text-[#f2c94c] transition-colors font-medium text-sm"
-                                  >
-                                    Edit
-                                  </button>
-                                  <button
-                                    onClick={() => {
-                                      setDeleteProjectError(null);
-                                      setProjectPendingDeletion(project);
-                                    }}
-                                    title="Permanently delete this project"
-                                    className="text-gray-400 hover:text-red-500 dark:text-gray-500 dark:hover:text-red-400 transition-colors"
-                                  >
-                                    <Trash2 className="w-4 h-4" />
-                                  </button>
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  )}
+            {(activeTab === 'Salary Studio' || activeTab.toLowerCase() === 'salary studio' || activeTab.toLowerCase() === 'salary') && (
+              <SalaryStudio 
+                users={users || []} 
+                projects={financialProjects.length > 0 ? financialProjects : (projects || [])} 
+                commissionRules={commissionRules || []}
+                onNavigateToGlobalSettings={() => setActiveTab('Settings')}
+              />
+            )}
 
-                  {projectsDirectoryFilteredSorted.length > 0 && (
-                    <div className="flex flex-col sm:flex-row items-center justify-between gap-3 mt-5 pt-4 border-t border-gray-200 dark:border-[#333333] text-xs">
-                      <div className="text-gray-500 dark:text-gray-400">
-                        Showing <span className="text-gray-800 dark:text-gray-200 font-semibold">{(projectsDirectoryPageSafe - 1) * PROJECTS_DIRECTORY_PAGE_SIZE + 1}
-                        </span>–<span className="text-gray-800 dark:text-gray-200 font-semibold">
-                          {Math.min(projectsDirectoryPageSafe * PROJECTS_DIRECTORY_PAGE_SIZE, projectsDirectoryFilteredSorted.length)}
-                        </span> of <span className="text-gray-800 dark:text-gray-200 font-semibold">{projectsDirectoryFilteredSorted.length}</span> projects
-                      </div>
-                      <div className="flex items-center gap-3">
-                        <button
-                          onClick={() => setProjectsDirectoryPage((p) => Math.max(1, p - 1))}
-                          disabled={projectsDirectoryPageSafe <= 1}
-                          className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-[#333333] text-gray-600 dark:text-gray-300 hover:border-[#D4AF37]/50 hover:text-[#D4AF37] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-gray-300 dark:disabled:hover:border-[#333333] disabled:hover:text-gray-600 dark:disabled:hover:text-gray-300 transition-colors font-medium"
-                        >
-                          Previous
-                        </button>
-                        <span className="text-gray-500 dark:text-gray-400 font-mono">
-                          Page <span className="text-[#D4AF37] font-semibold">{projectsDirectoryPageSafe}</span> of {projectsDirectoryTotalPages}
-                        </span>
-                        <button
-                          onClick={() => setProjectsDirectoryPage((p) => Math.min(projectsDirectoryTotalPages, p + 1))}
-                          disabled={projectsDirectoryPageSafe >= projectsDirectoryTotalPages}
-                          className="px-3 py-1.5 rounded-lg border border-gray-300 dark:border-[#333333] text-gray-600 dark:text-gray-300 hover:border-[#D4AF37]/50 hover:text-[#D4AF37] disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:border-gray-300 dark:disabled:hover:border-[#333333] disabled:hover:text-gray-600 dark:disabled:hover:text-gray-300 transition-colors font-medium"
-                        >
-                          Next
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-          {activeTab === 'Proposals' && (() => {
-            return (
-              <div className="w-full space-y-8">
-                <div className="bg-[#1E1E1E] rounded-xl shadow-2xl p-6 overflow-x-auto border border-[#333333]">
-                  <div className="flex justify-between items-center mb-6">
-                    <h3 className="text-lg font-medium">Proposals Directory</h3>
-                  </div>
-                  
-                  {proposals.length === 0 ? (
-                    <div className="text-center py-10 border border-dashed border-[#333333] rounded-lg">
-                      <FileText className="mx-auto h-12 w-12 text-gray-500 mb-4" />
-                      <h4 className="text-lg font-medium text-gray-300">No proposals found</h4>
-                      <p className="text-gray-500 mt-1">Populate your Firebase connection to see real proposals.</p>
-                    </div>
-                  ) : (
-                    <table className="w-full text-left whitespace-nowrap table-fixed">
-                      <thead>
-                        <tr className="text-gray-400 text-sm uppercase border-b border-[#333333]">
-                          <th className="pb-3 px-4 font-semibold w-1/4">Proposal Number</th>
-                          <th className="pb-3 px-4 font-semibold w-1/4">Pricing Category / Tier</th>
-                          <th className="pb-3 px-4 font-semibold w-1/4">Date Created</th>
-                          <th className="pb-3 px-4 font-semibold w-1/4">Status</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-[#333333]">
-                        {proposals.map((prop) => {
-                          const dateVal = prop.createdAt || prop.dateCreated || prop.date;
-                          const dateText = formatSafeDate(dateVal) || 'N/A';
+            {(activeTab === 'Pricing Rules' || activeTab.toLowerCase() === 'pricing' || activeTab.toLowerCase() === 'pricing rules') && (
+              <PricingRulesView 
+                pricingRules={pricingRules || []}
+                commissionRules={commissionRules || []}
+                clients={clients || []}
+                projects={financialProjects.length > 0 ? financialProjects : (projects || [])}
+                onNavigateToProposals={() => setActiveTab('Proposals')}
+                onNavigateToProjects={() => setActiveTab('Projects')}
+              />
+            )}
 
-                          const pricingTierDisplay = toTitleCase(prop.pricingCategory || prop.pricingTier || prop.tier || 'N/A');
+            {(activeTab === 'Proposals' || activeTab.toLowerCase() === 'proposals') && (
+              <ProposalsView 
+                proposals={proposals || []}
+                clients={clients || []}
+                projects={financialProjects.length > 0 ? financialProjects : (projects || [])}
+                pricingRules={pricingRules || []}
+                onNavigateToProjects={() => setActiveTab('Projects')}
+                onNavigateToBilling={() => setActiveTab('Billing')}
+                onNavigateToPricing={() => setActiveTab('Pricing Rules')}
+              />
+            )}
 
-                          const statusStr = (prop.status || 'pending').toLowerCase();
-                          let badgeColors = 'text-gray-400 bg-gray-500/10 border-gray-500/20';
-                          if (statusStr === 'accepted' || statusStr === 'approved' || statusStr === 'won') {
-                            badgeColors = 'text-green-500 bg-green-500/10 border-green-500/20';
-                          } else if (statusStr === 'rejected' || statusStr === 'lost') {
-                            badgeColors = 'text-red-500 bg-red-500/10 border-red-500/20';
-                          } else if (statusStr === 'pending' || statusStr === 'draft' || statusStr === 'sent') {
-                            badgeColors = 'text-yellow-500 bg-yellow-500/10 border-yellow-500/20';
-                          }
+            {(activeTab === 'Employees' || activeTab.toLowerCase() === 'employees') && (
+              <EmployeeDirectory
+                users={users || []}
+                setUsers={setUsers}
+                clients={clients || []}
+                projects={financialProjects.length > 0 ? financialProjects : (projects || [])}
+                onNavigateToSalaryStudio={() => setActiveTab('Salary Studio')}
+              />
+            )}
 
-                          return (
-                            <tr key={prop.id} className="hover:bg-[#2A2A2A] transition-colors">
-                              <td className="py-4 px-4 font-medium text-[#D4AF37] w-1/4">
-                                {prop.proposalNumber || prop.id || 'N/A'}
-                              </td>
-                              <td className="py-4 px-4 text-gray-200 w-1/4">
-                                {pricingTierDisplay}
-                              </td>
-                              <td className="py-4 px-4 text-gray-200 w-1/4">{dateText}</td>
-                              <td className="py-4 px-4 w-1/4">
-                                <span className={`px-2.5 py-1 rounded text-xs font-medium border ${badgeColors}`}>
-                                  {toTitleCase(prop.status || 'Pending')}
-                                </span>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-          {(activeTab === 'Employees' || activeTab === 'Users') && (
-            <EmployeeDirectory
-              users={users}
-              setUsers={setUsers}
-              clients={clients}
-              projects={financialProjects.length > 0 ? financialProjects : projects}
-              onNavigateToSalaryStudio={() => setActiveTab('Salary Studio')}
-            />
-          )}
-          {activeTab === 'Billing' && (
-            <BillingModule clients={clients} projects={financialProjects.length > 0 ? financialProjects : projects} />
-          )}
-          {activeTab === 'Salary Studio' && (
-            <SalaryStudio 
-              users={users} 
-              projects={financialProjects.length > 0 ? financialProjects : projects} 
-              commissionRules={commissionRules}
-              onNavigateToGlobalSettings={() => setActiveTab('Settings')}
-            />
-          )}
-          {activeTab === 'Settings' && (
-            <CompanySettingsView onNavigateToBilling={() => setActiveTab('Billing')} />
-          )}
-        </div>
-      </main>
+            {(activeTab === 'Settings' || activeTab.toLowerCase() === 'settings') && (
+              <CompanySettingsView onNavigateToBilling={() => setActiveTab('Billing')} />
+            )}
+          </div>
+        </main>
       </div>
 
       {/* Edit Project Modal */}
       {isEditProjectModalOpen && editingProject && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-          <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl shadow-2xl w-full max-w-2xl overflow-hidden flex flex-col max-h-[90vh]">
-            <div className="px-6 py-4 border-b border-[#333333] flex justify-between items-center">
-              <h3 className="text-lg font-medium text-white">Edit Project</h3>
-              <button 
-                onClick={() => { setIsEditProjectModalOpen(false); setEditingProject(null); }}
-                className="text-gray-400 hover:text-white transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            
-                        <div className="p-6 overflow-y-auto flex-1 space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Project Name</label>
-                  <input 
-                    type="text" 
-                    value={editingProject.projectName || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, projectName: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors"
-                    placeholder="Enter project name"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Client Name</label>
-                  <input 
-                    type="text" 
-                    value={editingProject.clientName || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, clientName: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors"
-                    placeholder="Enter client name"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Capacity</label>
-                  <input 
-                    type="text" 
-                    value={editingProject.systemCapacity || editingProject.capacity || editingProject.plantCapacity || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, systemCapacity: e.target.value, capacity: e.target.value, plantCapacity: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors"
-                    placeholder="e.g. 5kW"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Status</label>
-                  <select 
-                    value={editingProject.status || 'Active'}
-                    onChange={(e) => setEditingProject({ ...editingProject, status: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none"
-                  >
-                    <option value="Active">Active</option>
-                    <option value="On Hold">On Hold</option>
-                    <option value="Completed">Completed</option>
-                    <option value="Cancelled">Cancelled</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Project Date</label>
-                  <input 
-                    type="date" 
-                    value={formatSafeDate(editingProject.createdAt || editingProject.date || editingProject.dateCreated, 'input')}
-                    onChange={(e) => { 
-                      const val = e.target.value; 
-                      if (val) { 
-                        const timeVal = new Date(val).getTime();
-                        if (!isNaN(timeVal)) {
-                          setEditingProject({ ...editingProject, createdAt: timeVal, date: val });
-                        }
-                      } else {
-                        setEditingProject({ ...editingProject, createdAt: null, date: null });
-                      }
-                    }}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Scope of Work</label>
-                  <select 
-                    value={editingProject.scopeOfWork || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, scopeOfWork: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none"
-                  >
-                    <option value="">Select Scope</option>
-                    <option value="Domestic">Domestic</option>
-                    <option value="Commercial">Commercial</option>
-                    <option value="Industrial">Industrial</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Sub-Service</label>
-                  <select 
-                    value={editingProject.subService || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, subService: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none"
-                  >
-                    <option value="">Select Sub-Service</option>
-                    <option value="Standard">Standard</option>
-                    <option value="Premium">Premium</option>
-                    <option value="Custom">Custom</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Pricing Tier</label>
-                  <select 
-                    value={editingProject.pricingCategory || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, pricingCategory: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none"
-                  >
-                    <option value="">Select Tier</option>
-                    <option value="T1">T1</option>
-                    <option value="T2">T2</option>
-                    <option value="T3">T3</option>
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Designer Email</label>
-                  <select 
-                    value={editingProject.designerEmail || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, designerEmail: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none"
-                  >
-                    <option value="">Select a Designer</option>
-                    {availableDesigners.map(user => (
-                      <option key={user.id} value={user.email}>
-                        {user.name || user.email}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Sales Person Email</label>
-                  <select 
-                    value={editingProject.salesPersonEmail || editingProject.matchedClient?.salesPersonEmail || ''}
-                    onChange={(e) => setEditingProject({ ...editingProject, salesPersonEmail: e.target.value })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors appearance-none"
-                  >
-                    <option value="">Select a Sales Person</option>
-                    {availableSales.map(user => (
-                      <option key={user.id} value={user.email}>
-                        {user.name || user.email}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Final Cost (₹)</label>
-                  <input 
-                    type="number" 
-                    value={editingProject.calculatedCost || 0}
-                    onChange={(e) => setEditingProject({ ...editingProject, calculatedCost: Number(e.target.value) })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Designer Comm. (₹)</label>
-                  <input 
-                    type="number" 
-                    value={editingProject.designerCommission || 0}
-                    onChange={(e) => setEditingProject({ ...editingProject, designerCommission: Number(e.target.value) })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-400 mb-1">Sales Comm. (₹)</label>
-                  <input 
-                    type="number" 
-                    value={editingProject.salesCommission || 0}
-                    onChange={(e) => setEditingProject({ ...editingProject, salesCommission: Number(e.target.value) })}
-                    className="w-full bg-[#121212] border border-[#333333] rounded-lg px-4 py-2.5 text-white focus:outline-none focus:border-[#D4AF37] transition-colors"
-                  />
-                </div>
-              </div>
-            </div>
-            <div className="px-6 py-4 border-t border-[#333333] flex justify-end space-x-3 bg-[#1A1A1A]">
-              <button 
-                onClick={() => { setIsEditProjectModalOpen(false); setEditingProject(null); }}
-                className="px-4 py-2 rounded-lg bg-[#252525] hover:bg-[#2A2A2A] text-gray-300 border border-[#333333] transition-colors font-medium text-sm"
-              >
-                Cancel
-              </button>
-              <button 
-                onClick={handleUpdateProject}
-                className="px-4 py-2 rounded-lg bg-[#D4AF37] hover:bg-[#c49f2c] text-black transition-colors font-semibold text-sm shadow-md shadow-[#D4AF37]/20"
-              >
-                Save Changes
-              </button>
-            </div>
-          </div>
-        </div>
+        <EditProjectModal
+          isOpen={isEditProjectModalOpen}
+          project={editingProject}
+          clients={clients}
+          users={users}
+          onClose={() => {
+            setIsEditProjectModalOpen(false);
+            setEditingProject(null);
+          }}
+          onSave={handleUpdateProject}
+          isSaving={false}
+        />
       )}
 
-      {/* Delete Project Confirmation Modal */}
+      {/* Delete Confirmation Modal */}
       {projectPendingDeletion && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-          <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl shadow-2xl w-full max-w-md overflow-hidden">
-            <div className="px-6 py-5">
-              <div className="flex items-start gap-3">
-                <div className="p-2 rounded-full bg-red-500/10 border border-red-500/30 shrink-0">
-                  <AlertTriangle className="w-5 h-5 text-red-500" />
-                </div>
-                <div className="flex-1">
-                  <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-1.5">
-                    Delete Project
-                  </h3>
-                  <p className="text-sm text-gray-600 dark:text-gray-300 leading-relaxed">
-                    Are you sure you want to permanently delete project{' '}
-                    <span className="font-semibold text-gray-900 dark:text-white">
-                      {toTitleCase(projectPendingDeletion.projectName || 'Untitled')}
-                    </span>
-                    ? This action will completely remove it from the central database.
-                  </p>
-                </div>
+          <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl shadow-2xl w-full max-w-sm overflow-hidden p-5">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="p-2 rounded-full bg-rose-500/10 text-rose-500">
+                <AlertTriangle className="w-5 h-5" />
               </div>
-
-              {deleteProjectError && (
-                <div className="mt-4 p-2.5 rounded-lg bg-red-500/10 border border-red-500/30 text-red-500 dark:text-red-400 text-xs">
-                  {deleteProjectError}
-                </div>
-              )}
+              <h3 className="text-sm font-bold text-gray-900 dark:text-white">Delete Project</h3>
             </div>
-            <div className="px-6 py-4 bg-gray-50 dark:bg-[#181818] border-t border-gray-200 dark:border-[#333333] flex justify-end gap-3">
+            <p className="text-xs text-gray-600 dark:text-gray-400 mb-4">
+              Are you sure you want to permanently delete <span className="font-semibold text-gray-900 dark:text-white">{toTitleCase(projectPendingDeletion.projectName)}</span>?
+            </p>
+            <div className="flex justify-end gap-2">
               <button
-                onClick={() => {
-                  setProjectPendingDeletion(null);
-                  setDeleteProjectError(null);
-                }}
-                disabled={isDeletingProject}
-                className="px-4 py-2 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#2A2A2A] transition-colors font-medium text-sm disabled:opacity-50"
+                onClick={() => setProjectPendingDeletion(null)}
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold text-gray-600 dark:text-gray-400"
               >
                 Cancel
               </button>
               <button
                 onClick={handleConfirmDeleteProject}
                 disabled={isDeletingProject}
-                className="px-4 py-2 rounded-lg bg-red-600 hover:bg-red-700 text-white transition-colors font-semibold text-sm shadow-md shadow-red-600/20 disabled:opacity-50 flex items-center gap-2"
+                className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600 hover:bg-rose-700 text-white"
               >
-                {isDeletingProject && (
-                  <span className="h-3.5 w-3.5 border-2 border-white/40 border-t-white rounded-full animate-spin" />
-                )}
-                {isDeletingProject ? 'Deleting...' : 'Delete Permanently'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Global App Settings Modal */}
-      {isSettingsModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
-          <div className="bg-[#1E1E1E] border border-[#333333] rounded-xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col max-h-[90vh]">
-            <div className="px-6 py-4 border-b border-[#333333] flex justify-between items-center">
-              <h3 className="text-lg font-medium text-white flex items-center">
-                <Settings className="w-5 h-5 mr-2 text-[#D4AF37]" />
-                Global App Settings
-              </h3>
-              <button 
-                onClick={() => setIsSettingsModalOpen(false)}
-                className="text-gray-400 hover:text-white transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            
-            <div className="p-6 overflow-y-auto flex-1 space-y-6">
-              <div className="text-center py-8">
-                <p className="text-gray-400 text-sm">Additional global settings will be available in a future update.</p>
-                <p className="text-gray-500 text-xs mt-2">Note: Branding and logo configuration are now centrally managed in the Admin Console.</p>
-              </div>
-            </div>
-            
-            <div className="px-6 py-4 border-t border-[#333333] flex justify-end bg-[#1A1A1A]">
-              <button 
-                onClick={() => setIsSettingsModalOpen(false)}
-                className="px-4 py-2 rounded-lg bg-[#D4AF37] hover:bg-[#c49f2c] text-black transition-colors font-semibold shadow-md shadow-[#D4AF37]/20 w-full"
-              >
-                Done
+                {isDeletingProject ? 'Deleting...' : 'Delete'}
               </button>
             </div>
           </div>

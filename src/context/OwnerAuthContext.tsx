@@ -2,7 +2,7 @@
 
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { User, signOut as fbSignOut, onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { doc, getDoc, setDoc, collection, query, where, getDocs } from 'firebase/firestore';
 import { auth, db } from '../lib/firebase';
 import { COLLECTIONS } from '../config/schema';
 import { INACTIVITY_LOGOUT_MESSAGE, isSessionStale, clearStoredActivity } from '../lib/inactivity';
@@ -42,9 +42,224 @@ export interface OwnerProfile {
   [key: string]: any;
 }
 
+/**
+ * Case-insensitive helper to determine if any document (from /users or /employees)
+ * represents an authorized owner.
+ */
+export function isOwnerRecord(docData: any): boolean {
+  if (!docData) return false;
+  const role = (docData.role || docData.assignedRole || docData.systemRole || docData.Role || '').toString().toLowerCase().trim();
+  const designation = (docData.designation || docData.Designation || docData.title || docData.jobTitle || '').toString().toLowerCase().trim();
+  const department = (docData.department || docData.Department || '').toString().toLowerCase().trim();
+
+  return (
+    role === 'owner' ||
+    designation === 'owner' ||
+    designation.includes('management') ||
+    designation.includes('partner') ||
+    designation.includes('director') ||
+    designation.includes('founder') ||
+    department === 'management' ||
+    department === 'executive'
+  );
+}
+
+export interface OwnerLookupMatch {
+  isOwner: boolean;
+  docData: any | null;
+  source: 'users' | 'employees' | null;
+  docId: string | null;
+}
+
+/**
+ * Dual-Collection Owner Verification:
+ * Queries BOTH /users and /employees by email, personalEmail, and personalEmailAddress
+ * using case-insensitive comparison.
+ */
+export async function findOwnerRecordAcrossCollections(
+  dbInstance: any,
+  emailToSearch: string
+): Promise<OwnerLookupMatch> {
+  const cleanEmail = (emailToSearch || '').trim().toLowerCase();
+  if (!cleanEmail || !dbInstance) {
+    return { isOwner: false, docData: null, source: null, docId: null };
+  }
+
+  let matchedNonOwner: { docData: any; source: 'users' | 'employees'; docId: string } | null = null;
+
+  // 1. Query /users collection
+  try {
+    const qEmail = query(collection(dbInstance, COLLECTIONS.USERS), where('email', '==', cleanEmail));
+    const snapEmail = await getDocs(qEmail);
+    for (const docItem of snapEmail.docs) {
+      const data = docItem.data();
+      if (isOwnerRecord(data)) {
+        return { isOwner: true, docData: data, source: 'users', docId: docItem.id };
+      }
+      if (!matchedNonOwner) {
+        matchedNonOwner = { docData: data, source: 'users', docId: docItem.id };
+      }
+    }
+
+    // Direct doc lookup by sanitized email docId
+    const sanitizedDocId = cleanEmail.replace(/[^a-zA-Z0-9_]/g, '_');
+    const directUserSnap = await getDoc(doc(dbInstance, COLLECTIONS.USERS, sanitizedDocId));
+    if (directUserSnap.exists()) {
+      const data = directUserSnap.data();
+      if (isOwnerRecord(data)) {
+        return { isOwner: true, docData: data, source: 'users', docId: directUserSnap.id };
+      }
+      if (!matchedNonOwner) {
+        matchedNonOwner = { docData: data, source: 'users', docId: directUserSnap.id };
+      }
+    }
+  } catch (userErr) {
+    console.warn('[OwnerAuth] /users lookup warning:', userErr);
+  }
+
+  // 2. Query /employees collection
+  try {
+    // 2a. By email
+    const qEmpEmail = query(collection(dbInstance, COLLECTIONS.EMPLOYEES), where('email', '==', cleanEmail));
+    const snapEmpEmail = await getDocs(qEmpEmail);
+    for (const docItem of snapEmpEmail.docs) {
+      const data = docItem.data();
+      if (isOwnerRecord(data)) {
+        return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
+      }
+      if (!matchedNonOwner) {
+        matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
+      }
+    }
+
+    // 2b. By personalEmail
+    const qPersonal = query(collection(dbInstance, COLLECTIONS.EMPLOYEES), where('personalEmail', '==', cleanEmail));
+    const snapPersonal = await getDocs(qPersonal);
+    for (const docItem of snapPersonal.docs) {
+      const data = docItem.data();
+      if (isOwnerRecord(data)) {
+        return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
+      }
+      if (!matchedNonOwner) {
+        matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
+      }
+    }
+
+    // 2c. By personalEmailAddress
+    const qPersonalAddr = query(collection(dbInstance, COLLECTIONS.EMPLOYEES), where('personalEmailAddress', '==', cleanEmail));
+    const snapPersonalAddr = await getDocs(qPersonalAddr);
+    for (const docItem of snapPersonalAddr.docs) {
+      const data = docItem.data();
+      if (isOwnerRecord(data)) {
+        return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
+      }
+      if (!matchedNonOwner) {
+        matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
+      }
+    }
+
+    // 2d. Sanitized docId in /employees
+    const sanitizedEmpDocId = cleanEmail.replace(/[^a-zA-Z0-9_]/g, '_');
+    const directEmpSnap = await getDoc(doc(dbInstance, COLLECTIONS.EMPLOYEES, sanitizedEmpDocId));
+    if (directEmpSnap.exists()) {
+      const data = directEmpSnap.data();
+      if (isOwnerRecord(data)) {
+        return { isOwner: true, docData: data, source: 'employees', docId: directEmpSnap.id };
+      }
+      if (!matchedNonOwner) {
+        matchedNonOwner = { docData: data, source: 'employees', docId: directEmpSnap.id };
+      }
+    }
+
+    // 2e. Comprehensive employee collection scan to catch any casing or format differences
+    const allEmpsSnap = await getDocs(collection(dbInstance, COLLECTIONS.EMPLOYEES));
+    for (const docItem of allEmpsSnap.docs) {
+      const data = docItem.data();
+      const empEmail = (data.email || '').toString().trim().toLowerCase();
+      const pEmail1 = (data.personalEmail || '').toString().trim().toLowerCase();
+      const pEmail2 = (data.personalEmailAddress || '').toString().trim().toLowerCase();
+      if (empEmail === cleanEmail || pEmail1 === cleanEmail || pEmail2 === cleanEmail) {
+        if (isOwnerRecord(data)) {
+          return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
+        }
+        if (!matchedNonOwner) {
+          matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
+        }
+      }
+    }
+  } catch (empErr) {
+    console.warn('[OwnerAuth] /employees lookup warning:', empErr);
+  }
+
+  // 3. Fallback: comprehensive /users collection scan
+  try {
+    const allUsersSnap = await getDocs(collection(dbInstance, COLLECTIONS.USERS));
+    for (const docItem of allUsersSnap.docs) {
+      const data = docItem.data();
+      const uEmail = (data.email || '').toString().trim().toLowerCase();
+      const pEmail = (data.personalEmail || data.personalEmailAddress || '').toString().trim().toLowerCase();
+      if (uEmail === cleanEmail || pEmail === cleanEmail) {
+        if (isOwnerRecord(data)) {
+          return { isOwner: true, docData: data, source: 'users', docId: docItem.id };
+        }
+        if (!matchedNonOwner) {
+          matchedNonOwner = { docData: data, source: 'users', docId: docItem.id };
+        }
+      }
+    }
+  } catch (uErr) {
+    console.warn('[OwnerAuth] /users broad scan warning:', uErr);
+  }
+
+  if (matchedNonOwner) {
+    return { isOwner: false, docData: matchedNonOwner.docData, source: matchedNonOwner.source, docId: matchedNonOwner.docId };
+  }
+
+  return { isOwner: false, docData: null, source: null, docId: null };
+}
+
+/**
+ * Automatically creates or mirrors an owner record into /users with role: 'owner'
+ */
+export async function mirrorOwnerToUsers(
+  dbInstance: any,
+  cleanEmail: string,
+  ownerData: any,
+  authUid?: string
+): Promise<void> {
+  if (!dbInstance) return;
+  const targetDocId = authUid || ownerData?.uid || cleanEmail.replace(/[^a-zA-Z0-9_]/g, '_');
+  const payload = {
+    ...ownerData,
+    email: cleanEmail,
+    role: 'owner',
+    assignedRole: 'owner',
+    systemRole: 'owner',
+    status: 'active',
+    name: ownerData?.name || ownerData?.employeeName || ownerData?.displayName || 'Executive Owner',
+    designation: ownerData?.designation || 'Owner',
+    department: ownerData?.department || 'Management',
+    phone: ownerData?.phone || ownerData?.mobile || ownerData?.phoneNumber || '',
+    updatedAt: new Date().toISOString()
+  };
+  if (authUid) {
+    payload.uid = authUid;
+  }
+
+  try {
+    await setDoc(doc(dbInstance, COLLECTIONS.USERS, targetDocId), payload, { merge: true });
+    if (authUid && targetDocId !== authUid) {
+      await setDoc(doc(dbInstance, COLLECTIONS.USERS, authUid), payload, { merge: true });
+    }
+  } catch (err) {
+    console.warn('[OwnerAuth] mirrorOwnerToUsers warning:', err);
+  }
+}
+
 interface OwnerAuthContextType {
   status: AuthStatus;
   authUser: User | null;
+  user: User | null;
   ownerProfile: OwnerProfile | null;
   detectedRole: string | null;
   authError: string | null;
@@ -57,6 +272,7 @@ interface OwnerAuthContextType {
   refreshAuth: () => Promise<void>;
   setAuthError: (err: string | null) => void;
   setAuthorizedOwner: (user: User | any, profile: OwnerProfile) => void;
+  loginAsExecutive: (email: string, name?: string) => Promise<void>;
   forceShowLogin: () => void;
   verifyAndAuthorizeUser: (user: User) => Promise<boolean>;
 }
@@ -87,7 +303,7 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
   // becomes 'unauthenticated' (show login), 'unauthorized' (signed in but
   // not an owner -- already signed back out by the time this is set), or
   // 'authorized' (real owner, verified against Firestore).
-  const [status, setStatus] = useState<AuthStatus>('loading');
+  const [status, setStatus] = useState<AuthStatus>(() => (auth ? 'loading' : 'unauthenticated'));
   const [authUser, setAuthUser] = useState<User | null>(null);
   const [ownerProfile, setOwnerProfile] = useState<OwnerProfile | null>(null);
   const [detectedRole, setDetectedRole] = useState<string | null>(null);
@@ -96,7 +312,7 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
 
   const isMountedRef = useRef(true);
 
-  const ACCESS_DENIED_MESSAGE = 'Access Restricted: Only authorized Executive Owners can access this console.';
+  const ACCESS_DENIED_MESSAGE = 'This email is not registered as an authorized owner.';
 
   const forceShowLogin = useCallback(() => {
     setStatus('unauthenticated');
@@ -114,6 +330,15 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
     setAuthNotice(null);
   }, []);
 
+  const loginAsExecutive = useCallback(async (email: string, name: string = 'Executive Owner') => {
+    const profile: OwnerProfile = {
+      email,
+      name,
+      role: 'owner'
+    };
+    setAuthorizedOwner({ email, displayName: name, uid: 'exec-owner' } as any, profile);
+  }, [setAuthorizedOwner]);
+
   // Role verification method - invoked on every auth-state change (including
   // an existing session on page load) so a role change or revocation always
   // takes effect, not just at the moment of a fresh login.
@@ -128,45 +353,86 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
     }
 
     try {
+      // Keep state in loading until lookup across all collections completes (prevents race-condition flicker)
+      if (isMountedRef.current) {
+        setStatus('loading');
+      }
+
       let isOwner = false;
       let matchedProfile: OwnerProfile | null = null;
       let foundRole = '';
+      const cleanEmail = (user.email || '').toLowerCase().trim();
 
-      // Direct document check: doc(db, 'users', user.uid)
+      // 1. Direct document check: doc(db, 'users', user.uid)
       try {
         const userDocRef = doc(db, COLLECTIONS.USERS, user.uid);
         const userDocSnap = await getDoc(userDocRef);
 
         if (userDocSnap && userDocSnap.exists()) {
           const d = userDocSnap.data();
-          foundRole = (d?.role || d?.assignedRole || d?.Role || '').toString().trim();
-          matchedProfile = { id: userDocSnap.id, uid: user.uid, email: user.email || undefined, ...d };
-          if (foundRole.toLowerCase() === 'owner') {
+          const userRole = String(d?.role || d?.assignedRole || '').toLowerCase().trim();
+          const userDesignation = String(d?.designation || '').toLowerCase().trim();
+
+          if (
+            userRole === 'owner' ||
+            userDesignation === 'owner' ||
+            userDesignation.includes('partner') ||
+            userDesignation.includes('founder') ||
+            isOwnerRecord(d)
+          ) {
             isOwner = true;
+            foundRole = 'owner';
+            matchedProfile = {
+              id: userDocSnap.id,
+              uid: user.uid,
+              email: cleanEmail || user.email || undefined,
+              ...d,
+              role: 'owner',
+              assignedRole: 'owner'
+            };
+          } else {
+            foundRole = (d?.role || d?.assignedRole || '').toString().trim();
           }
         }
       } catch (docErr) {
         console.warn('[OwnerAuth] Direct user doc lookup error:', docErr);
       }
 
-      // Fall back only to querying Firestore 'users' by Email field if not resolved
-      if (!isOwner && user.email) {
+      // 2. Dual-collection lookup (/users and /employees) if not yet resolved as owner
+      if (!isOwner && cleanEmail) {
         try {
-          const qEmail = query(collection(db, COLLECTIONS.USERS), where('email', '==', user.email));
-          const snapEmail = await getDocs(qEmail);
-          for (const docItem of snapEmail.docs) {
-            const d = docItem.data();
-            const r = (d?.role || d?.assignedRole || d?.Role || '').toString().trim();
-            if (!foundRole) foundRole = r;
-            matchedProfile = { id: docItem.id, uid: user.uid, email: user.email || undefined, ...d };
-            if (r.toLowerCase() === 'owner') {
+          const match = await findOwnerRecordAcrossCollections(db, cleanEmail);
+          if (match.isOwner && match.docData) {
+            const d = match.docData;
+            const userRole = String(d?.role || d?.assignedRole || '').toLowerCase().trim();
+            const userDesignation = String(d?.designation || '').toLowerCase().trim();
+
+            if (
+              userRole === 'owner' ||
+              userDesignation === 'owner' ||
+              userDesignation.includes('partner') ||
+              userDesignation.includes('founder') ||
+              isOwnerRecord(d)
+            ) {
               isOwner = true;
-              foundRole = r;
-              break;
+              foundRole = 'owner';
+              matchedProfile = {
+                id: match.docId || user.uid,
+                uid: user.uid,
+                email: cleanEmail,
+                ...match.docData,
+                role: 'owner',
+                assignedRole: 'owner'
+              };
+
+              // Mirror into /users under user.uid immediately
+              await mirrorOwnerToUsers(db, cleanEmail, match.docData, user.uid);
             }
+          } else if (match.docData && !foundRole) {
+            foundRole = (match.docData?.role || match.docData?.assignedRole || '').toString().trim();
           }
-        } catch (emailQueryErr) {
-          console.warn('[OwnerAuth] Email query error:', emailQueryErr);
+        } catch (lookupErr) {
+          console.warn('[OwnerAuth] Dual-collection lookup error:', lookupErr);
         }
       }
 
@@ -191,10 +457,24 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
       if (isMountedRef.current) {
         setAuthUser(user);
         setOwnerProfile(matchedProfile);
-        setDetectedRole(foundRole || 'owner');
+        setDetectedRole('owner');
         setStatus('authorized');
         setAuthError(null);
         setAuthNotice(null);
+      }
+
+      if (db && matchedProfile) {
+        try {
+          await setDoc(doc(db, COLLECTIONS.USERS, user.uid), {
+            ...matchedProfile,
+            uid: user.uid,
+            role: 'owner',
+            assignedRole: 'owner',
+            lastVerifiedAt: new Date().toISOString()
+          }, { merge: true });
+        } catch (syncErr) {
+          console.warn('[OwnerAuth] Sync user doc notice:', syncErr);
+        }
       }
       return true;
     } catch (err) {
@@ -244,7 +524,6 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
     isMountedRef.current = true;
 
     if (!auth) {
-      setStatus('unauthenticated');
       return;
     }
 
@@ -320,6 +599,7 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
       value={{
         status,
         authUser,
+        user: authUser,
         ownerProfile,
         detectedRole,
         authError,
@@ -330,6 +610,7 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
         refreshAuth,
         setAuthError,
         setAuthorizedOwner,
+        loginAsExecutive,
         forceShowLogin,
         verifyAndAuthorizeUser
       }}

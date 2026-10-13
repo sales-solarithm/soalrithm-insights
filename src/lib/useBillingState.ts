@@ -31,6 +31,7 @@ import {
   defaultCompanySettings,
   COMPANY_STORAGE_KEYS
 } from './useCompanySettings';
+import { syncInvoiceProjectsToFirestore } from './projectSync';
 
 export function blankInvoice(settings: InvoiceSettings, companyOverride?: CompanySettings): InvoiceData {
   const company = companyOverride || getInitialCompanySettings();
@@ -42,7 +43,7 @@ export function blankInvoice(settings: InvoiceSettings, companyOverride?: Compan
     invDate: todayISO(),
     invDue: addDaysISO(todayISO(), 7),
     quotNo: '',
-    status: 'draft',
+    status: 'PENDING',
     amountReceived: 0,
     clientId: null,
     client: { name: '', phone: '', gstin: '', address: '' },
@@ -125,6 +126,11 @@ export function useBillingState() {
   const [isDirty, setIsDirty] = useState<boolean>(false);
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
   const hasMigratedRef = useRef(false);
+  const invoicesRef = useRef<InvoiceData[]>(invoices);
+
+  useEffect(() => {
+    invoicesRef.current = invoices;
+  }, [invoices]);
 
   // Firestore is now the source of truth for invoices. On first load, any
   // invoice that only ever existed in this browser's localStorage is
@@ -287,6 +293,13 @@ export function useBillingState() {
       console.error('Error updating invoice status in Firestore:', e)
     );
 
+    const matchingInv = invoicesRef.current.find((x) => x.id === id);
+    if (matchingInv) {
+      syncInvoiceProjectsToFirestore({ ...matchingInv, status: newStatus }, newStatus).catch((e) =>
+        console.warn('Error syncing projects in updateInvoiceStatus:', e)
+      );
+    }
+
     // Also sync currentInvoice if the currently open invoice is being edited
     setCurrentInvoice((curr) => {
       if (curr.id === id) {
@@ -329,7 +342,7 @@ export function useBillingState() {
         const payable = Number(invoiceData.totals?.payable || 0);
         const previouslyReceived = Number(invoiceData.amountReceived || 0);
         const delta = Math.max(0, newAmountReceivedTotal - previouslyReceived);
-        const newStatus = payable > 0 && newAmountReceivedTotal >= payable ? 'paid' : 'partially paid';
+        const newStatus = payable > 0 && newAmountReceivedTotal >= payable ? 'PAID' : 'PARTIALLY_PAID';
         const nowIso = new Date().toISOString();
 
         tx.update(invoiceRef, {
@@ -365,6 +378,13 @@ export function useBillingState() {
       setCurrentInvoice((curr) =>
         curr.id === invoiceId ? { ...curr, status: result.newStatus, amountReceived: result.newAmountReceived } : curr
       );
+
+      const invToSync = invoicesRef.current.find((x) => x.id === invoiceId);
+      if (invToSync) {
+        syncInvoiceProjectsToFirestore({ ...invToSync, status: result.newStatus }, result.newStatus).catch((e) =>
+          console.warn('Error syncing projects in logRevenueForInvoice:', e)
+        );
+      }
 
       return result;
     },
