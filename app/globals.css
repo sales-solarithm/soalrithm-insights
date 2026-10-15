@@ -274,3 +274,50 @@ table.pv-table tbody tr:nth-child(even) { background: #FDFBF7; }
 .pv-page-label-ui { color: #E5E7EB; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; }
 .preview-page-scale-wrap { overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
 .pv-bottom-wrap { display: block; }
+
+/* ==========================================================================
+   Light Mode Contrast & Surface Inversion Enforcement (UIX-01)
+   Ensures custom dark background classes (.bg-[#1E1E1E], .bg-[#141414], etc.)
+   automatically invert to clean light surfaces under html:not(.dark) / html.light
+   ========================================================================== */
+html:not(.dark) .bg-\[\#1E1E1E\],
+html:not(.dark) .bg-\[\#141414\],
+html:not(.dark) .bg-\[\#1F1F1F\],
+html:not(.dark) .bg-\[\#121212\],
+html.light .bg-\[\#1E1E1E\],
+html.light .bg-\[\#141414\],
+html.light .bg-\[\#1F1F1F\],
+html.light .bg-\[\#121212\] {
+  background-color: #FFFFFF !important;
+  color: #0F172A !important;
+}
+
+html:not(.dark) select.bg-\[\#1E1E1E\],
+html:not(.dark) input.bg-\[\#1E1E1E\],
+html.light select.bg-\[\#1E1E1E\],
+html.light input.bg-\[\#1E1E1E\] {
+  background-color: #F8FAFC !important;
+  color: #0F172A !important;
+  border-color: #E2E8F0 !important;
+}
+
+html:not(.dark) .border-neutral-700,
+html:not(.dark) .border-neutral-800,
+html.light .border-neutral-700,
+html.light .border-neutral-800 {
+  border-color: #E2E8F0 !important;
+}
+
+html:not(.dark) .text-neutral-100,
+html:not(.dark) .text-neutral-200,
+html.light .text-neutral-100,
+html.light .text-neutral-200 {
+  color: #0F172A !important;
+}
+
+html:not(.dark) .text-neutral-400,
+html:not(.dark) .text-neutral-500,
+html.light .text-neutral-400,
+html.light .text-neutral-500 {
+  color: #64748B !important;
+}

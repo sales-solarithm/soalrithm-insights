@@ -331,7 +331,7 @@ export default function BillingModule({
     }
 
     invoices.forEach((inv) => {
-      const d = parseSafeDate(inv.invDate || inv.date || inv.createdAt);
+      const d = parseSafeDate(inv.invDate || (inv as any).date || inv.createdAt);
       if (d && !isNaN(d.getTime())) {
         const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
         if (monthMap.has(ym)) {

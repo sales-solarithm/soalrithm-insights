@@ -81,7 +81,8 @@ import {
   SCOPE_LABELS, 
   MONTH_OPTIONS,
   resolveProjectPaymentStatus,
-  resolveEffectivePricingCategory
+  resolveEffectivePricingCategory,
+  toCanonicalScopeKey
 } from '@/src/lib/projectUtils';
 import BillingModule from '@/src/components/Billing';
 import CompanySettingsView from '@/src/components/CompanySettingsView';
@@ -496,29 +497,31 @@ export default function DashboardPage() {
         }
       }
 
-      // Commission Engine with Zero-Value Safety
+      // Commission Engine with Zero-Value Safety & Explicit Admin Override Precedence
       const calculateCommission = (role: string) => {
-        const lockedVal = role === 'designer' 
+        // Rank 1 (Highest): Explicit Manual Admin Override MUST BE PRESERVED AS-IS (allows amounts > 3000, e.g. 43256, 28840, or explicit 0)
+        const lockedVal = role === 'designer'
           ? (project.designerCommission ?? project.designerFee ?? project.financials?.designerCommission)
           : (project.salesCommission ?? project.commission ?? project.totalCommission ?? project.financials?.salesCommission);
-        
-        if (isZeroOrPositive(lockedVal)) {
+
+        if (lockedVal !== undefined && lockedVal !== null && String(lockedVal).trim() !== "" && !isNaN(Number(lockedVal))) {
           return Number(lockedVal);
         }
 
+        // Rank 2 (Fallback): Dynamic Slab Computation with Cap Enforcement (e.g. 3000 maxCap)
+        const canScopeKey = toCanonicalScopeKey(scope);
         let matchedRule = commissionRules.find(rule => {
           const ruleRole = String(rule.role || '').toLowerCase().trim();
-          const ruleScope = String(rule.scope || rule.scopeOfWork || '').toLowerCase().trim();
+          const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || '');
           const ruleSubService = String(rule.subService || 'Standard').toLowerCase().trim();
-          return ruleRole === role && ruleScope === scope && ruleSubService === subService;
+          return ruleRole === role && (ruleScopeKey === canScopeKey || String(rule.scope || '').toLowerCase().trim() === scope) && ruleSubService === subService;
         });
 
         if (!matchedRule) {
           matchedRule = commissionRules.find(rule => {
             const ruleRole = String(rule.role || '').toLowerCase().trim();
-            const ruleScope = String(rule.scope || rule.scopeOfWork || '').toLowerCase().trim();
-            const ruleSubService = String(rule.subService || 'Standard').toLowerCase().trim();
-            return ruleRole === role && ruleScope === scope && ruleSubService === 'standard';
+            const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || '');
+            return ruleRole === role && (ruleScopeKey === canScopeKey || String(rule.scope || '').toLowerCase().trim() === scope);
           });
         }
 
@@ -527,16 +530,19 @@ export default function DashboardPage() {
           if (matchedRow) {
             const maxCap = isZeroOrPositive(matchedRule.maxCommission)
               ? Number(matchedRule.maxCommission)
-              : 0;
+              : 3000;
             return calculateSlabCommission(matchedRow, capacity, maxCap);
           }
         }
+
         if (matchedRule && isZeroOrPositive(matchedRule.basePrice || matchedRule.price)) {
-          return Number(matchedRule.basePrice || matchedRule.price || 0);
+          const base = Number(matchedRule.basePrice || matchedRule.price || 0);
+          const maxCap = isZeroOrPositive(matchedRule.maxCommission) ? Number(matchedRule.maxCommission) : 3000;
+          return maxCap > 0 ? Math.min(base, maxCap) : base;
         }
+
         return 0;
       };
-
       const designerCommission = calculateCommission('designer');
       const salesCommission = calculateCommission('sales');
 
@@ -557,10 +563,21 @@ export default function DashboardPage() {
 
       return {
         ...project,
+        plantCapacity: capacity,
+        systemCapacity: capacity,
+        capacity,
         calculatedCost,
+        finalCost: calculatedCost,
+        cost: calculatedCost,
+        costOfProject: calculatedCost,
         designerCommission,
+        designerFee: designerCommission,
         salesCommission,
+        commission: salesCommission,
+        totalCommission: totalCommissionExpense,
         totalCommissionExpense,
+        remainingBalance,
+        netBalance: remainingBalance,
         financials: {
           capacity,
           costOfProject: calculatedCost,
@@ -570,7 +587,11 @@ export default function DashboardPage() {
           remainingBalance,
         },
         matchedClient,
+        client: matchedClient,
         activeCategory,
+        category: activeCategory,
+        pricingCategory: resolvedTier,
+        tier: resolvedTier,
       };
     });
   }, [projects, clients, pricingRules, commissionRules]);
@@ -700,14 +721,10 @@ export default function DashboardPage() {
         firestoreUpdatePayload.finalCost = finalCostValue;
         firestoreUpdatePayload.cost = finalCostValue;
       }
-      if (salesCommissionValue !== safeNumber(originalProject.salesCommission)) {
-        firestoreUpdatePayload.salesCommission = salesCommissionValue;
-        firestoreUpdatePayload.commission = salesCommissionValue;
-      }
-      if (designerCommissionValue !== safeNumber(originalProject.designerCommission)) {
-        firestoreUpdatePayload.designerCommission = designerCommissionValue;
-        firestoreUpdatePayload.designerFee = designerCommissionValue;
-      }
+      firestoreUpdatePayload.salesCommission = salesCommissionValue;
+      firestoreUpdatePayload.commission = salesCommissionValue;
+      firestoreUpdatePayload.designerCommission = designerCommissionValue;
+      firestoreUpdatePayload.designerFee = designerCommissionValue;
       firestoreUpdatePayload.totalCommission = salesCommissionValue + designerCommissionValue;
 
       // Strict Date preservation in Firestore: only write if explicitly changed by user

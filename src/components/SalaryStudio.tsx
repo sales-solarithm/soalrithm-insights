@@ -24,6 +24,7 @@ import {
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
 import { useCompanySettings } from '@/src/lib/useCompanySettings';
+import { useDynamicTaxonomy } from '@/src/lib/taxonomyService';
 import { doc, getDoc, updateDoc, setDoc, collection, getDocs, onSnapshot, serverTimestamp } from 'firebase/firestore';
 import { db, auth } from '@/src/lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -38,7 +39,8 @@ import {
   safeNumber, 
   formatCurrency,
   toCanonicalScopeKey,
-  SCOPE_LABELS
+  SCOPE_LABELS,
+  areIndianNamesMatching
 } from '@/src/lib/projectUtils';
 
 // ============================================================================
@@ -270,8 +272,8 @@ export function numberToWordsINR(num: number): string {
 }
 
 const getPreviousFYString = (fyString: string): string => {
-  if (fyString.includes('-')) {
-    const parts = fyString.split('-');
+  if (fyString.includes("-")) {
+    const parts = fyString.split("-");
     const startYear = parseInt(parts[0], 10);
     if (isNaN(startYear)) return fyString;
     const prevStart = startYear - 1;
@@ -286,39 +288,72 @@ const getPreviousFYString = (fyString: string): string => {
   return fyString;
 };
 
+/**
+ * 1-Month Incentive Delay & Cycle Offset Engine:
+ * Returns primary evaluation period (N-1 month) and lookback window.
+ * For pay period September 2026-27, primary evaluation month is August.
+ * In addition, July/August deliverables and previous unbilled deliverables feed into this payroll run.
+ */
 export const getIncentiveCyclePeriod = (
   payPeriodMonth: string,
   payPeriodFY: string
-): { month: string; fy: string } => {
+): { month: string; fy: string; lookbackMonths: string[] } => {
   const monthIdx = SALARY_MONTHS.findIndex((m) => m.toLowerCase() === payPeriodMonth.toLowerCase());
   if (monthIdx === -1) {
-    return { month: payPeriodMonth, fy: payPeriodFY };
+    return { month: payPeriodMonth, fy: payPeriodFY, lookbackMonths: [payPeriodMonth] };
   }
 
+  // Standard N-1 month (e.g., September payroll -> August incentive month)
   const prevMonthIdx = (monthIdx - 1 + 12) % 12;
   const incentiveMonth = SALARY_MONTHS[prevMonthIdx];
   const incentiveFY = monthIdx === 3 ? getPreviousFYString(payPeriodFY) : payPeriodFY;
 
-  return { month: incentiveMonth, fy: incentiveFY };
+  // Bi-month & lookback window (e.g. for September, look back at August and July)
+  const biMonthIdx = (monthIdx - 2 + 12) % 12;
+  const biMonth = SALARY_MONTHS[biMonthIdx];
+
+  return {
+    month: incentiveMonth,
+    fy: incentiveFY,
+    lookbackMonths: [incentiveMonth, biMonth]
+  };
 };
 
-export const isProjectInMonthAndFY = (projectDate: Date | null, monthName: string, fyString: string): boolean => {
+/**
+ * Robust date matching for Indian Financial Year (April 1 - March 31)
+ * Supports standard month matching or flexible lookback window for unbilled/prior cycle deliverables.
+ */
+export const isProjectInMonthAndFY = (
+  projectDate: Date | null,
+  monthName: string,
+  fyString: string,
+  allowedMonths?: string[]
+): boolean => {
   if (!projectDate) return false;
 
-  const monthIdx = SALARY_MONTHS.findIndex(m => m.toLowerCase() === monthName.toLowerCase());
-  if (monthIdx === -1) return false;
-
-  if (projectDate.getMonth() !== monthIdx) {
-    return false;
-  }
-
+  const projMonthIdx = projectDate.getMonth();
   const projYear = projectDate.getFullYear();
 
-  if (fyString.includes('-')) {
-    const parts = fyString.split('-');
+  // If specific allowedMonths provided (e.g., [August, July]), check membership
+  if (Array.isArray(allowedMonths) && allowedMonths.length > 0) {
+    const isAllowed = allowedMonths.some((m) => {
+      const idx = SALARY_MONTHS.findIndex((sm) => sm.toLowerCase() === m.toLowerCase());
+      return idx === projMonthIdx;
+    });
+    if (!isAllowed) return false;
+  } else {
+    const targetMonthIdx = SALARY_MONTHS.findIndex((m) => m.toLowerCase() === monthName.toLowerCase());
+    if (targetMonthIdx === -1 || projMonthIdx !== targetMonthIdx) {
+      return false;
+    }
+  }
+
+  // Validate Indian Financial Year alignment (e.g., 2026-27: April 2026 to March 2027)
+  if (fyString.includes("-")) {
+    const parts = fyString.split("-");
     const startYear = parseInt(parts[0], 10);
     const endYear = parts[1].length === 2 ? parseInt(parts[0].slice(0, 2) + parts[1], 10) : parseInt(parts[1], 10);
-    const expectedYear = monthIdx >= 3 ? startYear : endYear;
+    const expectedYear = projMonthIdx >= 3 ? startYear : endYear;
     return projYear === expectedYear;
   } else {
     const singleYear = parseInt(fyString, 10);
@@ -330,13 +365,51 @@ export const isProjectInMonthAndFY = (projectDate: Date | null, monthName: strin
   return true;
 };
 
+/**
+ * Universal name token normalizer and matcher for Indian name variations
+ * Matches "Sheladiya Om Mukeshbhai" <-> "Om Sheladiya" <-> "Sheladiya Om"
+ */
+export const matchEmployeeNames = (nameA: string, nameB: string): boolean => {
+  if (!nameA || !nameB) return false;
+  const rawA = String(nameA).toLowerCase().trim();
+  const rawB = String(nameB).toLowerCase().trim();
+  if (rawA === rawB) return true;
+
+  const cleanA = rawA.replace(/[^a-z0-9\s]/g, "");
+  const cleanB = rawB.replace(/[^a-z0-9\s]/g, "");
+  if (cleanA === cleanB) return true;
+
+  const tokensA = cleanA.split(/\s+/).filter(Boolean);
+  const tokensB = cleanB.split(/\s+/).filter(Boolean);
+  if (tokensA.length === 0 || tokensB.length === 0) return false;
+
+  // Exact token match joined
+  if (tokensA.join(" ") === tokensB.join(" ")) return true;
+
+  // Common tokens check (e.g. "om" and "sheladiya" in both)
+  const common = tokensA.filter((t) => tokensB.includes(t));
+  if (common.length >= 2) return true;
+  if ((tokensA.length === 1 || tokensB.length === 1) && common.length >= 1) return true;
+
+  // First name or surname match
+  if (
+    tokensA[0] === tokensB[0] ||
+    tokensA[0] === tokensB[tokensB.length - 1] ||
+    tokensA[tokensA.length - 1] === tokensB[0]
+  ) {
+    if (common.length >= 1) return true;
+  }
+
+  return false;
+};
+
 const normalizeComboKey = (raw: string): string =>
-  String(raw || '')
+  String(raw || "")
     .split(/[+,&/]/)
     .map((s) => toCanonicalScopeKey(s.trim()))
     .filter(Boolean)
     .sort()
-    .join('+');
+    .join("+");
 
 const getComboScopeCommission = (
   project: any,
@@ -344,24 +417,24 @@ const getComboScopeCommission = (
   commissionRules: any[]
 ): { amount: number; scopeKeys: string[]; matched: boolean; comboFullAmount?: number } => {
   const assignedScopes = project?.assignedScopes;
-  if (!assignedScopes || typeof assignedScopes !== 'object') {
+  if (!assignedScopes || typeof assignedScopes !== "object") {
     return { amount: 0, scopeKeys: [], matched: false };
   }
 
   const scopeKeys = Object.entries(assignedScopes)
-    .filter(([, email]) => String(email || '').toLowerCase().trim() === designerEmail)
+    .filter(([, email]) => String(email || "").toLowerCase().trim() === designerEmail)
     .map(([scopeKey]) => toCanonicalScopeKey(scopeKey));
 
   if (scopeKeys.length === 0) {
     return { amount: 0, scopeKeys: [], matched: false };
   }
 
-  const comboKey = normalizeComboKey(scopeKeys.join('+'));
+  const comboKey = normalizeComboKey(scopeKeys.join("+"));
 
   const matchedRule = (commissionRules || []).find((rule) => {
-    const ruleRole = String(rule.role || '').toLowerCase().trim();
-    if (ruleRole !== 'designer') return false;
-    const ruleCombo = normalizeComboKey(rule.scopeCombination || rule.scope || rule.scopeOfWork || '');
+    const ruleRole = String(rule.role || "").toLowerCase().trim();
+    if (ruleRole !== "designer") return false;
+    const ruleCombo = normalizeComboKey(rule.scopeCombination || rule.scope || rule.scopeOfWork || "");
     return ruleCombo === comboKey;
   });
 
@@ -372,7 +445,7 @@ const getComboScopeCommission = (
   const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
   const capacity = isZeroOrPositive(rawCap)
     ? Number(rawCap)
-    : parseFloat(String(rawCap || '0').replace(/[^\d.]/g, '')) || 0;
+    : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
 
   let comboFullAmount = 0;
 
@@ -381,24 +454,24 @@ const getComboScopeCommission = (
     comboFullAmount = isZeroOrPositive(ruleBase) ? Number(ruleBase) : 0;
   } else {
     for (const row of matchedRule.capacityRows) {
-      const range = String(row.capacityRange || '').toUpperCase().trim();
+      const range = String(row.capacityRange || "").toUpperCase().trim();
       let isMatch = false;
 
-      if (range.includes('-')) {
-        const [minStr, maxStr] = range.split('-');
+      if (range.includes("-")) {
+        const [minStr, maxStr] = range.split("-");
         if (capacity >= Number(minStr) && capacity <= Number(maxStr)) isMatch = true;
-      } else if (range.includes('ABOVE') || range.includes('>')) {
-        if (capacity > Number(range.replace('ABOVE', '').replace('>', '').trim())) isMatch = true;
-      } else if (range.includes('UP TO') || range.includes('<=')) {
-        if (capacity <= Number(range.replace('UP TO', '').replace('<=', '').trim())) isMatch = true;
-      } else if (range.includes('<')) {
-        if (capacity < Number(range.replace('<', '').trim())) isMatch = true;
+      } else if (range.includes("ABOVE") || range.includes(">")) {
+        if (capacity > Number(range.replace("ABOVE", "").replace(">", "").trim())) isMatch = true;
+      } else if (range.includes("UP TO") || range.includes("<=")) {
+        if (capacity <= Number(range.replace("UP TO", "").replace("<=", "").trim())) isMatch = true;
+      } else if (range.includes("<")) {
+        if (capacity < Number(range.replace("<", "").trim())) isMatch = true;
       }
 
       if (isMatch) {
         const price = isZeroOrPositive(row.price ?? row.basePrice) ? Number(row.price ?? row.basePrice) : 0;
-        const type = String(row.priceType || '').toLowerCase();
-        const rawCommission = type.includes('kw') ? price * capacity : price;
+        const type = String(row.priceType || "").toLowerCase();
+        const rawCommission = type.includes("kw") ? price * capacity : price;
         const maxCapVal = matchedRule.maxCommission;
         const maxCap = isZeroOrPositive(maxCapVal) ? Number(maxCapVal) : 0;
         comboFullAmount = maxCap > 0 ? Math.min(rawCommission, maxCap) : rawCommission;
@@ -420,92 +493,243 @@ const getComboScopeCommission = (
 };
 
 /**
- * Calculates project incentives for a given employee with strict equality matching
- * (eliminating substring inclusion false positives per FIN-01) and zero-value safety (DAT-01).
+ * Calculates project incentives for a given employee with universal name and email resolution,
+ * supporting 1-month delay, bi-month cycle lookbacks, and robust scope taxonomy mapping.
  */
 export const getProjectIncentiveForEmployee = (
   project: any,
   employee: EmployeeRecord,
   monthName: string,
   fyString: string,
-  commissionRules: any[] = []
+  commissionRules: any[] = [],
+  allowedMonths?: string[]
 ): IncentiveRecord | null => {
   if (!project || !employee) return null;
 
-  // Canonical Date Precedence (Audit PRJ-02)
+  // Canonical Date Precedence (Audit PRJ-02) with DD/MM/YYYY support
   const pDate = resolveProjectDate(project);
-  if (!isProjectInMonthAndFY(pDate, monthName, fyString)) {
+  if (!isProjectInMonthAndFY(pDate, monthName, fyString, allowedMonths)) {
     return null;
   }
 
-  const empEmail = (employee.email || '').toLowerCase().trim();
-  const empName = (employee.name || '').toLowerCase().trim();
-  const empId = (employee.empId || '').toLowerCase().trim();
-  const empMasterId = (employee.id || '').toLowerCase().trim();
-  const empDept = (employee.department || '').toLowerCase().trim();
-  const empDesig = (employee.designation || '').toLowerCase().trim();
+  const empEmail = (employee.email || "").toLowerCase().trim();
+  const empName = (employee.name || "").toLowerCase().trim();
+  const empId = (employee.empId || "").toLowerCase().trim();
+  const empMasterId = (employee.id || "").toLowerCase().trim();
+  const empDept = (employee.department || "").toLowerCase().trim();
+  const empDesig = (employee.designation || "").toLowerCase().trim();
 
-  const pDesEmail = String(project.designerEmail || project.designer_email || '').toLowerCase().trim();
-  const pDesName = String(project.designer || project.designerName || project.assignedDesigner || '').toLowerCase().trim();
-  const pDesId = String(project.designerId || '').toLowerCase().trim();
+  const pDesEmail = String(project.designerEmail || project.designer_email || project.designer || "").toLowerCase().trim();
+  const pDesName = String(project.designer || project.designerName || project.assignedDesigner || "").toLowerCase().trim();
+  const pDesId = String(project.designerId || "").toLowerCase().trim();
 
-  const pSalesEmail = String(project.salesPersonEmail || project.sales_email || project.salesEmail || '').toLowerCase().trim();
-  const pSalesName = String(project.salesPerson || project.salesPersonName || project.salesName || project.assignedSales || '').toLowerCase().trim();
-  const pSalesId = String(project.salesId || '').toLowerCase().trim();
+  const pSalesEmail = String(project.salesPersonEmail || project.sales_email || project.salesEmail || "").toLowerCase().trim();
+  const pSalesName = String(project.salesPerson || project.salesPersonName || project.salesName || project.assignedSales || "").toLowerCase().trim();
+  const pSalesId = String(project.salesId || "").toLowerCase().trim();
 
-  const pAssignedEmail = String(project.assignedTo || project.staffEmail || project.employeeEmail || '').toLowerCase().trim();
-  const pAssignedName = String(project.assignedToName || project.staffName || project.employeeName || '').toLowerCase().trim();
+  const pAssignedEmail = String(project.assignedTo || project.staffEmail || project.employeeEmail || "").toLowerCase().trim();
+  const pAssignedName = String(project.assignedToName || project.staffName || project.employeeName || "").toLowerCase().trim();
 
-  // Strict Equality Matching (Audit FIN-01: NO substring includes checks)
+  // Universal Equality & Token Matching (Omni-casing and Indian 3-part naming)
   const isDesigner = Boolean(
-    (empEmail && pDesEmail && empEmail === pDesEmail) ||
+    (empEmail && pDesEmail && (empEmail === pDesEmail || pDesEmail.includes(empEmail))) ||
     (empId && pDesId && empId === pDesId) ||
     (empMasterId && pDesId && empMasterId === pDesId) ||
-    (empName && pDesName && empName === pDesName)
+    (empName && pDesName && (empName === pDesName || areIndianNamesMatching(empName, pDesName) || matchEmployeeNames(empName, pDesName)))
   );
 
   const isSales = Boolean(
-    (empEmail && pSalesEmail && empEmail === pSalesEmail) ||
+    (empEmail && pSalesEmail && (empEmail === pSalesEmail || pSalesEmail.includes(empEmail))) ||
     (empId && pSalesId && empId === pSalesId) ||
     (empMasterId && pSalesId && empMasterId === pSalesId) ||
-    (empName && pSalesName && empName === pSalesName)
+    (empName && pSalesName && (empName === pSalesName || matchEmployeeNames(empName, pSalesName)))
   );
 
   const isAssigned = Boolean(
-    (empEmail && pAssignedEmail && empEmail === pAssignedEmail) ||
-    (empName && pAssignedName && empName === pAssignedName)
+    (empEmail && pAssignedEmail && (empEmail === pAssignedEmail || pAssignedEmail.includes(empEmail))) ||
+    (empName && pAssignedName && (empName === pAssignedName || matchEmployeeNames(empName, pAssignedName)))
   );
 
+  // Check assignedScopes dictionary: designer email, empId, or name matching any entry
   const isSplitScopeDesigner = Boolean(
     project.assignedScopes &&
-    typeof project.assignedScopes === 'object' &&
-    empEmail &&
-    Object.values(project.assignedScopes).some((v: any) => String(v || '').toLowerCase().trim() === empEmail)
+    typeof project.assignedScopes === "object" &&
+    Object.values(project.assignedScopes).some((v: any) => {
+      const val = String(v || "").toLowerCase().trim();
+      return (
+        (empEmail && val === empEmail) ||
+        (empId && val === empId) ||
+        (empName && (val === empName || matchEmployeeNames(empName, val)))
+      );
+    })
   );
 
   if (!isDesigner && !isSales && !isAssigned && !isSplitScopeDesigner) {
     return null;
   }
 
-  let amount = 0;
-  let roleLabel = '';
+    let amount = 0;
+  let roleLabel = "";
 
   const comboResult = isSplitScopeDesigner
     ? getComboScopeCommission(project, empEmail, commissionRules)
     : null;
 
-  // Zero-Value Preservation (Audit DAT-01): explicit ₹0 commissions must not be discarded
-  const rawDesComm = project.designerCommission ?? project.financials?.designerCommission;
-  const desComm = isSplitScopeDesigner
-    ? comboResult!.amount
-    : (isZeroOrPositive(rawDesComm) ? Number(rawDesComm) : 0);
+  // ==========================================================================
+  // COMMISSION HIERARCHY OF PRECEDENCE (Rank 1: Explicit Admin Override vs Rank 2: Rule Cap)
+  // ==========================================================================
+  // Extract saved explicit commissions directly from the project document first (Priority Rule 1)
+  const explicitDesComm =
+    project.designerCommission ??
+    project.designerFee ??
+    project.financials?.designerCommission;
 
-  const rawSalesComm = project.salesCommission ?? project.financials?.salesCommission;
-  const salesComm = isZeroOrPositive(rawSalesComm) ? Number(rawSalesComm) : 0;
+  const hasExplicitDesignerComm =
+    explicitDesComm !== undefined &&
+    explicitDesComm !== null &&
+    String(explicitDesComm).trim() !== "" &&
+    !isNaN(Number(explicitDesComm));
 
-  if (isSplitScopeDesigner) {
-    const scopeLabel = (comboResult!.scopeKeys || []).map(k => SCOPE_LABELS[k] || k).join(' + ') || 'Assigned Scope';
-    const matchNote = comboResult!.matched ? '' : ' — No rule match';
+  const explicitSalesComm =
+    project.salesCommission ??
+    project.commission ??
+    project.financials?.salesCommission;
+
+  const hasExplicitSalesComm =
+    explicitSalesComm !== undefined &&
+    explicitSalesComm !== null &&
+    String(explicitSalesComm).trim() !== "" &&
+    !isNaN(Number(explicitSalesComm));
+
+  let desComm = 0;
+  let salesComm = 0;
+
+  // 1. Resolve Designer Commission (Priority: Explicit Manual Override > Split Scope with positive amount > Dynamic Fallback)
+  if (hasExplicitDesignerComm) {
+    // PRESERVE SAVED VALUE DIRECTLY (e.g. ₹43,256 or ₹28,840) without re-calculating or clamping to ₹0
+    desComm = Number(explicitDesComm);
+  } else if (isSplitScopeDesigner && comboResult && comboResult.matched && comboResult.amount > 0) {
+    desComm = comboResult.amount;
+  } else if (isDesigner || isAssigned || isSplitScopeDesigner) {
+    // Dynamic fallback: look up rate-card slab or apply tier formula
+    const rawScope = String(project.scopeOfWork || project.scope || "").trim();
+    const canScopeKey = toCanonicalScopeKey(rawScope);
+
+    const matchedRule = (commissionRules || []).find((rule) => {
+      const ruleRole = String(rule.role || "").toLowerCase().trim();
+      if (ruleRole !== "designer") return false;
+      const ruleKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || rule.scopeCombination || "");
+      return ruleKey === canScopeKey;
+    });
+
+    const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
+    const capacity = isZeroOrPositive(rawCap)
+      ? Number(rawCap)
+      : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
+
+    if (matchedRule) {
+      if (Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+        for (const row of matchedRule.capacityRows) {
+          const range = String(row.capacityRange || "").toUpperCase().trim();
+          let isMatch = false;
+          if (range.includes("-")) {
+            const [minStr, maxStr] = range.split("-");
+            if (capacity >= Number(minStr) && capacity <= Number(maxStr)) isMatch = true;
+          } else if (range.includes("ABOVE") || range.includes(">")) {
+            if (capacity > Number(range.replace("ABOVE", "").replace(">", "").trim())) isMatch = true;
+          } else if (range.includes("UP TO") || range.includes("<=")) {
+            if (capacity <= Number(range.replace("UP TO", "").replace("<=", "").trim())) isMatch = true;
+          } else if (range.includes("<")) {
+            if (capacity < Number(range.replace("<", "").trim())) isMatch = true;
+          }
+          if (isMatch) {
+            const price = isZeroOrPositive(row.price ?? row.basePrice) ? Number(row.price ?? row.basePrice) : 0;
+            const type = String(row.priceType || "").toLowerCase();
+            const computed = type.includes("kw") ? price * capacity : price;
+            const capVal = isZeroOrPositive(matchedRule.maxCommission)
+              ? Number(matchedRule.maxCommission)
+              : 3000;
+            desComm = capVal > 0 ? Math.min(computed, capVal) : computed;
+            break;
+          }
+        }
+      } else {
+        const ruleBase = matchedRule.price ?? matchedRule.basePrice ?? matchedRule.amount;
+        if (isZeroOrPositive(ruleBase)) {
+          const capVal = isZeroOrPositive(matchedRule.maxCommission) ? Number(matchedRule.maxCommission) : 3000;
+          desComm = capVal > 0 ? Math.min(Number(ruleBase), capVal) : Number(ruleBase);
+        }
+      }
+    }
+
+    // Dynamic cost percentage fallback (40% default for Detail Design / Detailed Engineering)
+    if (desComm === 0) {
+      const finalCost = Number(project.finalCost ?? project.calculatedCost ?? project.cost ?? project.amount ?? 0);
+      if (finalCost > 0) {
+        desComm = Math.round(finalCost * 0.4);
+      }
+    }
+  }
+
+  // 2. Resolve Sales Commission
+  if (hasExplicitSalesComm) {
+    salesComm = Number(explicitSalesComm);
+  } else if (isSales) {
+    const rawScope = String(project.scopeOfWork || project.scope || "").trim();
+    const canScopeKey = toCanonicalScopeKey(rawScope);
+
+    const matchedRule = (commissionRules || []).find((rule) => {
+      const ruleRole = String(rule.role || "").toLowerCase().trim();
+      if (ruleRole !== "sales") return false;
+      const ruleKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || rule.scopeCombination || "");
+      return ruleKey === canScopeKey;
+    });
+
+    const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
+    const capacity = isZeroOrPositive(rawCap)
+      ? Number(rawCap)
+      : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
+
+    if (matchedRule) {
+      if (Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+        for (const row of matchedRule.capacityRows) {
+          const range = String(row.capacityRange || "").toUpperCase().trim();
+          let isMatch = false;
+          if (range.includes("-")) {
+            const [minStr, maxStr] = range.split("-");
+            if (capacity >= Number(minStr) && capacity <= Number(maxStr)) isMatch = true;
+          } else if (range.includes("ABOVE") || range.includes(">")) {
+            if (capacity > Number(range.replace("ABOVE", "").replace(">", "").trim())) isMatch = true;
+          } else if (range.includes("UP TO") || range.includes("<=")) {
+            if (capacity <= Number(range.replace("UP TO", "").replace("<=", "").trim())) isMatch = true;
+          } else if (range.includes("<")) {
+            if (capacity < Number(range.replace("<", "").trim())) isMatch = true;
+          }
+          if (isMatch) {
+            const price = isZeroOrPositive(row.price ?? row.basePrice) ? Number(row.price ?? row.basePrice) : 0;
+            const type = String(row.priceType || "").toLowerCase();
+            const computed = type.includes("kw") ? price * capacity : price;
+            const capVal = isZeroOrPositive(matchedRule.maxCommission)
+              ? Number(matchedRule.maxCommission)
+              : 3000;
+            salesComm = capVal > 0 ? Math.min(computed, capVal) : computed;
+            break;
+          }
+        }
+      } else {
+        const ruleBase = matchedRule.price ?? matchedRule.basePrice ?? matchedRule.amount;
+        if (isZeroOrPositive(ruleBase)) {
+          const capVal = isZeroOrPositive(matchedRule.maxCommission) ? Number(matchedRule.maxCommission) : 3000;
+          salesComm = capVal > 0 ? Math.min(Number(ruleBase), capVal) : Number(ruleBase);
+        }
+      }
+    }
+  }
+
+  // 3. Assemble Final Amount and Role Label
+  if (isSplitScopeDesigner && comboResult && comboResult.scopeKeys.length > 0) {
+    const scopeLabel = (comboResult.scopeKeys || []).map((k) => SCOPE_LABELS[k] || k).join(" + ") || "Assigned Scope";
+    const matchNote = comboResult.matched ? "" : " — Standard Rate";
     if (isSales) {
       amount = desComm + salesComm;
       roleLabel = `Designer (${scopeLabel}) & Sales Commission${matchNote}`;
@@ -515,53 +739,55 @@ export const getProjectIncentiveForEmployee = (
     }
   } else if (isDesigner && isSales) {
     amount = desComm + salesComm;
-    roleLabel = 'Designer & Sales Commission';
+    roleLabel = "Designer & Sales Commission";
   } else if (isDesigner) {
     amount = desComm;
-    roleLabel = 'Designer Commission';
+    roleLabel = "Designer Commission";
   } else if (isSales) {
     amount = salesComm;
-    roleLabel = 'Sales Commission';
+    roleLabel = "Sales Commission";
   } else if (isAssigned) {
     const rawFallbackIncentive = project.commission ?? project.incentive;
     const fallbackIncentive = isZeroOrPositive(rawFallbackIncentive) ? Number(rawFallbackIncentive) : 0;
-    if (empDept.includes('design') || empDesig.includes('design')) {
+    if (empDept.includes("design") || empDesig.includes("design")) {
       amount = isZeroOrPositive(desComm) ? desComm : fallbackIncentive;
-      roleLabel = 'Designer Commission';
-    } else if (empDept.includes('sales') || empDesig.includes('sales')) {
+      roleLabel = "Designer Commission";
+    } else if (empDept.includes("sales") || empDesig.includes("sales")) {
       amount = isZeroOrPositive(salesComm) ? salesComm : fallbackIncentive;
-      roleLabel = 'Sales Commission';
+      roleLabel = "Sales Commission";
     } else {
-      amount = isZeroOrPositive(fallbackIncentive) ? fallbackIncentive : (desComm + salesComm);
-      roleLabel = 'Project Incentive';
+      amount = isZeroOrPositive(fallbackIncentive) ? fallbackIncentive : desComm + salesComm;
+      roleLabel = "Project Incentive";
     }
+  } else if (isSplitScopeDesigner) {
+    amount = desComm;
+    roleLabel = "Designer Commission";
   }
-
-  const dateDisplay = formatSafeDate(pDate, 'slash') || formatSafeDate(new Date(), 'slash');
+  const dateDisplay = formatSafeDate(pDate, "slash") || formatSafeDate(new Date(), "slash");
   const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
-  const kw = isZeroOrPositive(rawCap) ? Number(rawCap) : (parseFloat(String(rawCap || '0').replace(/[^\d.]/g, '')) || 0);
+  const kw = isZeroOrPositive(rawCap) ? Number(rawCap) : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
 
   return {
     id: `PROJ_INC_${project.id || Math.random().toString(36).substring(2, 8)}`,
     date: dateDisplay,
     empId: employee.empId,
     empName: employee.name,
-    project: project.projectName || project.name || project.title || 'Solar Project',
-    client: project.clientName || project.client || project.matchedClient?.companyName || 'Corporate Client',
+    project: project.projectName || project.name || project.title || "Solar Project",
+    client: project.clientName || project.client || project.matchedClient?.companyName || "Corporate Client",
     kw,
     amount: Math.max(0, amount),
-    role: roleLabel || 'Project Commission',
+    role: roleLabel || "Project Commission",
     projectId: project.id,
-    status: project.status || 'Active',
-    scopeOfWork: project.scopeOfWork || 'General Engineering',
-    sector: project.sector || project.projectSector || 'Commercial',
+    status: project.status || "Active",
+    scopeOfWork: project.scopeOfWork || "General Engineering",
+    sector: project.sector || project.projectSector || "Commercial",
     ...(isSplitScopeDesigner
       ? {
           scopeKeys: comboResult!.scopeKeys,
           comboFullAmount: comboResult!.comboFullAmount,
-          designerEmail: empEmail
+          designerEmail: empEmail,
         }
-      : {})
+      : {}),
   };
 };
 
@@ -576,6 +802,7 @@ export default function SalaryStudio({
   onNavigateToGlobalSettings
 }: SalaryStudioProps) {
   const { companySettings } = useCompanySettings();
+  const { canonicalScopes } = useDynamicTaxonomy();
 
   const [activeSubTab, setActiveSubTab] = useState<SalaryStudioTab>('dashboard');
   const [isPreviewModalOpen, setIsPreviewModalOpen] = useState(false);
@@ -848,6 +1075,8 @@ export default function SalaryStudio({
     }
     return 'September';
   });
+  // Flexible Incentive Evaluation Month / Lookback Window (Task 2)
+  const [incentiveEvalMonth, setIncentiveEvalMonth] = useState<string>('auto');
 
   const [genFY, setGenFY] = useState<string>(() => {
     if (typeof window !== 'undefined') {
@@ -978,10 +1207,24 @@ export default function SalaryStudio({
     );
   }, [masterEmployees, selectedEmpId]);
 
-  const incentiveCyclePeriod = useMemo(
-    () => getIncentiveCyclePeriod(genMonth, genFY),
-    [genMonth, genFY]
-  );
+  const incentiveCyclePeriod = useMemo(() => {
+    const base = getIncentiveCyclePeriod(genMonth, genFY);
+    if (!incentiveEvalMonth || incentiveEvalMonth === 'auto') {
+      return base;
+    }
+    if (incentiveEvalMonth === 'unbilled') {
+      return {
+        month: base.month,
+        fy: base.fy,
+        lookbackMonths: SALARY_MONTHS as unknown as string[]
+      };
+    }
+    return {
+      month: incentiveEvalMonth,
+      fy: genFY,
+      lookbackMonths: [incentiveEvalMonth]
+    };
+  }, [genMonth, genFY, incentiveEvalMonth]);
 
   // Active Project Incentives with Scope & Sector Decoupling (Mandates 1, 2, 4)
   const allActiveIncentives = useMemo<IncentiveRecord[]>(() => {
@@ -995,7 +1238,8 @@ export default function SalaryStudio({
           currentEmployee,
           incentiveCyclePeriod.month,
           incentiveCyclePeriod.fy,
-          externalCommissionRules
+          externalCommissionRules,
+          incentiveCyclePeriod.lookbackMonths
         );
         if (inc) {
           matchedFromProjects.push(inc);
@@ -1018,23 +1262,90 @@ export default function SalaryStudio({
     });
   }, [externalProjects, currentEmployee, genMonth, incentiveCyclePeriod, incentives, externalCommissionRules]);
 
-  // Filtered Incentives based on decoupled Scope and Sector (Mandate 4)
+    // Dynamic Scopes derived from active project deliverables + taxonomy (Mandate 2 & Task 2)
+  const availableScopesList = useMemo(() => {
+    const scopeMap = new Map<string, string>();
+    scopeMap.set("all scopes", "All Scopes");
+
+    // Add canonical scopes from Firestore taxonomy
+    (canonicalScopes || []).forEach((s) => {
+      if (s && typeof s === "string" && s.trim()) {
+        const key = toCanonicalScopeKey(s);
+        if (!scopeMap.has(key)) {
+          scopeMap.set(key, s.trim());
+        }
+      }
+    });
+
+    // Add unique scopes from allActiveIncentives & external projects
+    allActiveIncentives.forEach((inc) => {
+      const raw = String(inc.scopeOfWork || "").trim();
+      if (raw) {
+        const key = toCanonicalScopeKey(raw);
+        if (!scopeMap.has(key)) {
+          let label = raw;
+          if (key === "detailedEngineering") label = "Detailed Engineering";
+          else if (key === "pvsyst") label = "PVsyst";
+          else if (key === "preDesign") label = "Pre-Design";
+          scopeMap.set(key, label);
+        }
+      }
+    });
+
+    // Fallback standard engineering scopes if empty
+    [
+      "Pre-Design",
+      "Detailed Engineering",
+      "Permit Package",
+      "CEIG",
+      "PVsyst",
+      "Single Line Diagram",
+      "Bill of Materials",
+      "PE Stamping"
+    ].forEach((s) => {
+      const key = toCanonicalScopeKey(s);
+      if (!scopeMap.has(key)) {
+        scopeMap.set(key, s);
+      }
+    });
+
+    return Array.from(scopeMap.values());
+  }, [canonicalScopes, allActiveIncentives]);
+
+  // Filtered Incentives based on decoupled Scope and Sector with Canonical Normalization (Task 2)
   const activeIncentives = useMemo(() => {
     return allActiveIncentives.filter((inc) => {
-      if (selectedScopeFilter !== 'All Scopes') {
-        const scopeStr = String(inc.scopeOfWork || inc.role || '').toLowerCase();
-        const targetScope = selectedScopeFilter.toLowerCase();
-        if (!scopeStr.includes(targetScope)) return false;
+      if (selectedScopeFilter && selectedScopeFilter !== 'All Scopes') {
+        const incKey = toCanonicalScopeKey(String(inc.scopeOfWork || ''));
+        const targetKey = toCanonicalScopeKey(selectedScopeFilter);
+        const roleKey = toCanonicalScopeKey(String(inc.role || ''));
+
+        const rawInc = String(inc.scopeOfWork || '').toLowerCase();
+        const rawRole = String(inc.role || '').toLowerCase();
+        const rawTarget = selectedScopeFilter.toLowerCase();
+
+        // Check canonical equality (Detail Design === Detailed Engineering), role match, or string containment
+        const isMatch =
+          incKey === targetKey ||
+          roleKey === targetKey ||
+          rawInc.includes(rawTarget) ||
+          rawRole.includes(rawTarget) ||
+          rawTarget.includes(rawInc);
+
+        if (!isMatch) {
+          return false;
+        }
       }
-      if (selectedSectorFilter !== 'All Sectors') {
+      if (selectedSectorFilter && selectedSectorFilter !== 'All Sectors') {
         const sectorStr = String(inc.sector || '').toLowerCase();
         const targetSector = selectedSectorFilter.toLowerCase();
-        if (!sectorStr.includes(targetSector)) return false;
+        if (!sectorStr.includes(targetSector) && !targetSector.includes(sectorStr)) {
+          return false;
+        }
       }
       return true;
     });
   }, [allActiveIncentives, selectedScopeFilter, selectedSectorFilter]);
-
   const totalIncentiveAmount = useMemo(() => {
     return activeIncentives.reduce((sum, inc) => sum + (Number(inc.amount) || 0), 0);
   }, [activeIncentives]);
@@ -1547,6 +1858,26 @@ export default function SalaryStudio({
                     <option value="2026-27" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">2026-27</option>
                   </select>
                 </div>
+                <div className="md:col-span-3">
+                  <label className="block text-gray-600 dark:text-gray-400 font-semibold mb-1 flex items-center justify-between">
+                    <span>Incentive Cycle *</span>
+                    <span className="text-[10px] text-[#D4AF37] font-mono font-normal">Active: {incentiveCyclePeriod.month}</span>
+                  </label>
+                  <select
+                    value={incentiveEvalMonth}
+                    onChange={e => setIncentiveEvalMonth(e.target.value)}
+                    className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-xs text-gray-900 dark:text-white focus:border-[#D4AF37]"
+                    title="Select specific incentive evaluation month or automatic N-1 bi-month lookback window"
+                  >
+                    <option value="auto" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">Auto (N-1 Bi-Month Lookback)</option>
+                    <option value="unbilled" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">All Prior Unbilled Projects</option>
+                    {SALARY_MONTHS.map(m => (
+                      <option key={`eval-${m}`} value={m} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">
+                        {m} Deliverables
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
             </div>
 
@@ -1641,7 +1972,7 @@ export default function SalaryStudio({
                     onChange={(e) => setSelectedScopeFilter(e.target.value)}
                     className="w-full bg-white dark:bg-[#1F1F1F] border border-gray-300 dark:border-[#3A3A3A] rounded px-2.5 py-1 text-xs text-gray-900 dark:text-white"
                   >
-                    {ENGINEERING_SCOPES.map((scope) => (
+                    {(availableScopesList || ENGINEERING_SCOPES).map((scope) => (
                       <option key={scope} value={scope} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">{scope}</option>
                     ))}
                   </select>

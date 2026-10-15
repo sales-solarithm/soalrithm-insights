@@ -425,14 +425,14 @@ export default function PricingRulesView({
       </div>
 
       {/* 2. Filter Selectors: Single top row drill-down card with Upgraded Accessibility & Typography */}
-      <div className="bg-[#1E1E1E] border border-neutral-700 rounded-2xl p-6 shadow-md transition-colors">
-        <div className="flex items-center justify-between pb-4 mb-5 border-b border-neutral-800">
+      <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-neutral-700 rounded-2xl p-6 shadow-md transition-colors">
+        <div className="flex items-center justify-between pb-4 mb-5 border-b border-gray-200 dark:border-neutral-800">
           <div className="flex items-center space-x-2.5">
             <Filter className="w-4 h-4 text-[#D4AF37]" />
-            <h3 className="text-xs font-bold uppercase tracking-wider text-neutral-200">
+            <h3 className="text-xs font-bold uppercase tracking-wider text-gray-800 dark:text-neutral-200">
               Pricing Matrix Cascade
             </h3>
-            <span className="text-xs text-neutral-400 font-mono">
+            <span className="text-xs text-gray-500 dark:text-neutral-400 font-mono">
               ({activeRulesList.length} rules loaded from Firestore)
             </span>
           </div>
@@ -441,7 +441,7 @@ export default function PricingRulesView({
             <button
               type="button"
               onClick={handleResetFilters}
-              className="text-xs font-semibold text-neutral-400 hover:text-rose-400 transition-colors flex items-center gap-1.5 cursor-pointer"
+              className="text-xs font-semibold text-gray-500 dark:text-neutral-400 hover:text-rose-500 dark:hover:text-rose-400 transition-colors flex items-center gap-1.5 cursor-pointer"
             >
               <X className="w-3.5 h-3.5" />
               <span>Reset Selection</span>
@@ -454,7 +454,7 @@ export default function PricingRulesView({
           <div>
             <label
               htmlFor="pricing-category-select"
-              className="text-xs font-semibold tracking-wider text-neutral-400 uppercase mb-2 block"
+              className="text-xs font-semibold tracking-wider text-gray-700 dark:text-neutral-400 uppercase mb-2 block"
             >
               CATEGORY / TIER
             </label>
@@ -463,19 +463,19 @@ export default function PricingRulesView({
                 id="pricing-category-select"
                 value={selectedCategory}
                 onChange={(e) => handleCategoryChange(e.target.value)}
-                className="w-full text-base font-medium py-3 px-4 min-h-[48px] bg-[#1E1E1E] text-neutral-100 border border-neutral-700 rounded-lg focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37] transition-all cursor-pointer outline-none"
+                className="w-full text-base font-medium py-3 px-4 min-h-[48px] bg-gray-50 dark:bg-[#1E1E1E] text-gray-900 dark:text-neutral-100 border border-gray-300 dark:border-neutral-700 rounded-lg focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37] transition-all cursor-pointer outline-none"
               >
-                <option value="" className="text-base py-2.5 bg-[#1E1E1E] text-neutral-400">
+                <option value="" className="text-base py-2.5 bg-white dark:bg-[#1E1E1E] text-gray-500 dark:text-neutral-400">
                   Select Category / Tier ({availableCategories.length})
                 </option>
                 {availableCategories.map((cat) => (
-                  <option key={cat} value={cat} className="text-base py-2.5 bg-[#1E1E1E] text-neutral-100">
+                  <option key={cat} value={cat} className="text-base py-2.5 bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-neutral-100">
                     {cat}
                   </option>
                 ))}
               </select>
             </div>
-            <p className="text-[11px] text-neutral-400 mt-1.5 font-mono">
+            <p className="text-[11px] text-gray-500 dark:text-neutral-400 mt-1.5 font-mono">
               {selectedCategory ? `Active Tier: ${selectedCategory}` : 'Derived dynamically from Firestore pricing rules'}
             </p>
           </div>
@@ -484,7 +484,7 @@ export default function PricingRulesView({
           <div>
             <label
               htmlFor="pricing-scope-select"
-              className="text-xs font-semibold tracking-wider text-neutral-400 uppercase mb-2 block"
+              className="text-xs font-semibold tracking-wider text-gray-700 dark:text-neutral-400 uppercase mb-2 block"
             >
               SCOPE OF WORK
             </label>
@@ -494,11 +494,11 @@ export default function PricingRulesView({
                 value={selectedScope}
                 onChange={(e) => handleScopeChange(e.target.value)}
                 disabled={!selectedCategory}
-                className={`w-full text-base font-medium py-3 px-4 min-h-[48px] bg-[#1E1E1E] text-neutral-100 border border-neutral-700 rounded-lg focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37] transition-all cursor-pointer outline-none ${
-                  !selectedCategory ? 'opacity-50 cursor-not-allowed border-neutral-800 text-neutral-500' : ''
+                className={`w-full text-base font-medium py-3 px-4 min-h-[48px] bg-gray-50 dark:bg-[#1E1E1E] text-gray-900 dark:text-neutral-100 border border-gray-300 dark:border-neutral-700 rounded-lg focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37] transition-all cursor-pointer outline-none ${
+                  !selectedCategory ? 'opacity-50 cursor-not-allowed border-gray-200 dark:border-neutral-800 text-gray-400 dark:text-neutral-500' : ''
                 }`}
               >
-                <option value="" className="text-base py-2.5 bg-[#1E1E1E] text-neutral-400">
+                <option value="" className="text-base py-2.5 bg-white dark:bg-[#1E1E1E] text-gray-500 dark:text-neutral-400">
                   {selectedCategory
                     ? availableScopes.length > 0
                       ? `Select Scope (${availableScopes.length})`
@@ -506,13 +506,13 @@ export default function PricingRulesView({
                     : '1. Select Category / Tier first'}
                 </option>
                 {availableScopes.map((scope) => (
-                  <option key={scope} value={scope} className="text-base py-2.5 bg-[#1E1E1E] text-neutral-100">
+                  <option key={scope} value={scope} className="text-base py-2.5 bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-neutral-100">
                     {scope}
                   </option>
                 ))}
               </select>
             </div>
-            <p className="text-[11px] text-neutral-400 mt-1.5 font-mono">
+            <p className="text-[11px] text-gray-500 dark:text-neutral-400 mt-1.5 font-mono">
               {selectedScope
                 ? `Resolved Scope: ${selectedScope}`
                 : selectedCategory
@@ -525,7 +525,7 @@ export default function PricingRulesView({
           <div>
             <label
               htmlFor="pricing-subservice-select"
-              className="text-xs font-semibold tracking-wider text-neutral-400 uppercase mb-2 block"
+              className="text-xs font-semibold tracking-wider text-gray-700 dark:text-neutral-400 uppercase mb-2 block"
             >
               SUB-SERVICE
             </label>
@@ -535,23 +535,23 @@ export default function PricingRulesView({
                 value={selectedSubService}
                 onChange={(e) => setSelectedSubService(e.target.value)}
                 disabled={!selectedScope}
-                className={`w-full text-base font-medium py-3 px-4 min-h-[48px] bg-[#1E1E1E] text-neutral-100 border border-neutral-700 rounded-lg focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37] transition-all cursor-pointer outline-none ${
-                  !selectedScope ? 'opacity-50 cursor-not-allowed border-neutral-800 text-neutral-500' : ''
+                className={`w-full text-base font-medium py-3 px-4 min-h-[48px] bg-gray-50 dark:bg-[#1E1E1E] text-gray-900 dark:text-neutral-100 border border-gray-300 dark:border-neutral-700 rounded-lg focus:border-[#D4AF37] focus:ring-1 focus:ring-[#D4AF37] transition-all cursor-pointer outline-none ${
+                  !selectedScope ? 'opacity-50 cursor-not-allowed border-gray-200 dark:border-neutral-800 text-gray-400 dark:text-neutral-500' : ''
                 }`}
               >
-                <option value="" className="text-base py-2.5 bg-[#1E1E1E] text-neutral-400">
+                <option value="" className="text-base py-2.5 bg-white dark:bg-[#1E1E1E] text-gray-500 dark:text-neutral-400">
                   {selectedScope
                     ? `Select Sub-Service (${availableSubServices.length})`
                     : '2. Select Scope of Work first'}
                 </option>
                 {availableSubServices.map((sub) => (
-                  <option key={sub} value={sub} className="text-base py-2.5 bg-[#1E1E1E] text-neutral-100">
+                  <option key={sub} value={sub} className="text-base py-2.5 bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-neutral-100">
                     {sub}
                   </option>
                 ))}
               </select>
             </div>
-            <p className="text-[11px] text-neutral-400 mt-1.5 font-mono">
+            <p className="text-[11px] text-gray-500 dark:text-neutral-400 mt-1.5 font-mono">
               {selectedSubService
                 ? `Active Sub-Service: ${selectedSubService}`
                 : selectedScope

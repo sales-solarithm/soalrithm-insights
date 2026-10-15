@@ -410,7 +410,7 @@ export default function EmployeeDirectory({
         authUid: canonicalUid,
         empId: canonicalEmpId,
         employeeId: canonicalEmpId
-      };
+      } as unknown as AdminEmployee;
 
       await logAuditEvent({
         action: editingEmployee && editingEmployee.id ? 'EMPLOYEE_UPDATED' : 'EMPLOYEE_CREATED',

@@ -56,15 +56,18 @@ export const MONTH_OPTIONS = [
  */
 export function parseSafeDate(dateVal: any): Date | null {
   if (dateVal === null || dateVal === undefined || dateVal === '') return null;
+
   try {
     if (dateVal instanceof Date) {
       return isNaN(dateVal.getTime()) ? null : dateVal;
     }
+
     // Firestore Timestamp instance (.toDate() method)
     if (typeof dateVal?.toDate === 'function') {
       const d = dateVal.toDate();
       return isNaN(d.getTime()) ? null : d;
     }
+
     // Firestore Timestamp serialized representation (seconds + nanoseconds)
     if (typeof dateVal?.seconds === 'number') {
       const millis =
@@ -73,6 +76,7 @@ export function parseSafeDate(dateVal: any): Date | null {
       const d = new Date(millis);
       return isNaN(d.getTime()) ? null : d;
     }
+
     // Internal Firestore Timestamp property (_seconds + _nanoseconds)
     if (typeof dateVal?._seconds === 'number') {
       const millis =
@@ -81,30 +85,49 @@ export function parseSafeDate(dateVal: any): Date | null {
       const d = new Date(millis);
       return isNaN(d.getTime()) ? null : d;
     }
+
     // Numeric timestamps: second-based (< 1e11) vs millisecond-based (>= 1e11)
     if (typeof dateVal === 'number') {
       if (!Number.isFinite(dateVal)) return null;
       const d = dateVal < 1e11 ? new Date(dateVal * 1000) : new Date(dateVal);
       return isNaN(d.getTime()) ? null : d;
     }
-    // String inputs (ISO strings, YYYY-MM-DD, DD/MM/YYYY, etc.)
+
+    // String inputs (ISO strings, YYYY-MM-DD, DD/MM/YYYY, DD-MM-YYYY, etc.)
     if (typeof dateVal === 'string') {
       const trimmed = dateVal.trim();
       if (!trimmed) return null;
 
-      // Handle DD/MM/YYYY or DD-MM-YYYY explicitly
-      const dmyMatch = trimmed.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+      // Explicitly support DD/MM/YYYY, DD-MM-YYYY, or DD.MM.YYYY (with optional time)
+      const dmyMatch = trimmed.match(/^(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})(?:[\sT](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/);
       if (dmyMatch) {
         const day = parseInt(dmyMatch[1], 10);
         const month = parseInt(dmyMatch[2], 10) - 1;
         const year = parseInt(dmyMatch[3], 10);
-        const d = new Date(year, month, day);
+        const hours = dmyMatch[4] ? parseInt(dmyMatch[4], 10) : 0;
+        const mins = dmyMatch[5] ? parseInt(dmyMatch[5], 10) : 0;
+        const secs = dmyMatch[6] ? parseInt(dmyMatch[6], 10) : 0;
+        const d = new Date(year, month, day, hours, mins, secs);
+        return isNaN(d.getTime()) ? null : d;
+      }
+
+      // Explicitly support YYYY-MM-DD, YYYY/MM/DD, or YYYY.MM.DD (with optional time)
+      const ymdMatch = trimmed.match(/^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})(?:[\sT](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+      if (ymdMatch) {
+        const year = parseInt(ymdMatch[1], 10);
+        const month = parseInt(ymdMatch[2], 10) - 1;
+        const day = parseInt(ymdMatch[3], 10);
+        const hours = ymdMatch[4] ? parseInt(ymdMatch[4], 10) : 0;
+        const mins = ymdMatch[5] ? parseInt(ymdMatch[5], 10) : 0;
+        const secs = ymdMatch[6] ? parseInt(ymdMatch[6], 10) : 0;
+        const d = new Date(year, month, day, hours, mins, secs);
         return isNaN(d.getTime()) ? null : d;
       }
 
       const d = new Date(trimmed);
       return isNaN(d.getTime()) ? null : d;
     }
+
     return null;
   } catch {
     return null;
@@ -116,8 +139,9 @@ export function parseSafeDate(dateVal: any): Date | null {
  * Precedence Hierarchy:
  * 1. project.projectDate
  * 2. project.date
- * 3. project.createdAt
- * 4. Fallback to current Date
+ * 3. project.completedDate
+ * 4. project.createdAt
+ * 5. Fallback to current Date
  *
  * Guaranteed to return a valid Date object.
  */
@@ -129,6 +153,7 @@ export function resolveProjectDate(project: any): Date {
   const rawCandidate =
     project.projectDate ||
     project.date ||
+    project.completedDate ||
     project.createdAt ||
     project.dateCreated ||
     project.created_at ||
@@ -279,7 +304,14 @@ export function formatIndianName(rawName: string | undefined | null): string {
 export function getFirstName(fullName: string | undefined | null): string {
   if (!fullName || typeof fullName !== 'string') return '';
   const trimmed = fullName.trim();
-  if (!trimmed) return '';
+  if (!trimmed || trimmed === '—' || trimmed === 'N/A' || trimmed.toLowerCase() === 'unassigned') return '';
+
+  if (trimmed.includes('@')) {
+    const handle = trimmed.split('@')[0];
+    const firstPart = handle.split(/[._-]/)[0];
+    const clean = firstPart.replace(/\d+$/, '');
+    return toTitleCase(clean || handle);
+  }
 
   const parts = trimmed.split(/\s+/).filter(Boolean);
   if (parts.length === 0) return '';
@@ -314,6 +346,59 @@ export function getFirstName(fullName: string | undefined | null): string {
 
   // Multi-part fallback (>3 parts): return first token
   return toTitleCase(parts[0]);
+}
+
+/**
+ * Universal Indian name permutation matcher.
+ * Matches "Sheladiya Om Mukeshbhai" <-> "Om Sheladiya" <-> "Sheladiya Om".
+ * Checks exact equality, first name equality, or common token overlap.
+ */
+export function areIndianNamesMatching(
+  nameA: string | undefined | null,
+  nameB: string | undefined | null
+): boolean {
+  if (!nameA || !nameB) return false;
+  const cleanA = String(nameA).trim().toLowerCase();
+  const cleanB = String(nameB).trim().toLowerCase();
+  if (cleanA === cleanB) return true;
+
+  // Stripped alphanumeric
+  const normA = cleanA.replace(/[^a-z0-9\s]/g, '').trim();
+  const normB = cleanB.replace(/[^a-z0-9\s]/g, '').trim();
+  if (normA === normB) return true;
+
+  const tokensA = normA.split(/\s+/).filter(Boolean);
+  const tokensB = normB.split(/\s+/).filter(Boolean);
+  if (tokensA.length === 0 || tokensB.length === 0) return false;
+
+  // Joined normalized comparison
+  if (tokensA.join(' ') === tokensB.join(' ')) return true;
+
+  // Extract first names using intelligent Indian naming heuristics
+  const firstA = getFirstName(cleanA).toLowerCase();
+  const firstB = getFirstName(cleanB).toLowerCase();
+
+  // If first names match and both have common tokens (e.g. Om with Sheladiya)
+  if (firstA && firstB && firstA === firstB) {
+    const hasTokenOverlap = tokensA.some((t) => tokensB.includes(t));
+    if (hasTokenOverlap) return true;
+  }
+
+  // Token intersection count
+  const common = tokensA.filter((t) => tokensB.includes(t));
+  if (common.length >= 2) return true;
+  if ((tokensA.length === 1 || tokensB.length === 1) && common.length >= 1) return true;
+
+  // Cross-order check: First token in A matches last token in B or vice versa
+  if (
+    tokensA[0] === tokensB[0] ||
+    tokensA[0] === tokensB[tokensB.length - 1] ||
+    tokensA[tokensA.length - 1] === tokensB[0]
+  ) {
+    if (common.length >= 1) return true;
+  }
+
+  return false;
 }
 
 // ============================================================================
@@ -500,7 +585,15 @@ export function toCanonicalScopeKey(scopeName: string): string {
   if (lower.includes('predesign') || lower.includes('pre-design') || lower.includes('pre design')) return 'preDesign';
   if (lower.includes('ceig')) return 'ceig';
   if (lower.includes('ifp')) return 'ifp';
-  if (lower.includes('detailed')) return 'detailedEngineering';
+  if (
+    lower.includes('detail design') ||
+    lower.includes('detail_design') ||
+    lower.includes('detail-design') ||
+    lower.includes('detailed') ||
+    lower.includes('detail engineering') ||
+    lower.includes('detailed engineering') ||
+    lower === 'detail'
+  ) return 'detailedEngineering';
   if (lower.includes('permit')) return 'permitPackage';
   if (lower.includes('sld') || lower.includes('single line')) return 'sld';
   if (lower.includes('bom') || lower.includes('bill of materials')) return 'bom';
