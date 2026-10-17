@@ -581,8 +581,18 @@ export function toCanonicalScopeKey(scopeName: string): string {
   if (!scopeName) return 'scope';
   const lower = scopeName.toLowerCase().trim();
 
-  if (lower.includes('pvsyst') || lower.includes('pv-syst') || lower.includes('pv syst')) return 'pvsyst';
+  // 1. Compound Scopes FIRST (Prevents "PRE-DESIGN + CEIG + IFP" from being truncated to singular "preDesign")
+  if (lower.includes('pre') && lower.includes('pvsyst') && lower.includes('ceig')) return 'preDesignPvsystCeigIfp';
+  if (lower.includes('post') && lower.includes('pvsyst') && lower.includes('ceig')) return 'postDesignPvsystCeigIfp';
+  if (lower.includes('pre') && lower.includes('ceig')) return 'preDesignCeigIfp';
+  if (lower.includes('post') && lower.includes('ceig')) return 'postDesignCeigIfp';
+  if (lower.includes('pre') && lower.includes('pvsyst')) return 'preDesignPvsyst';
+  if (lower.includes('post') && lower.includes('pvsyst')) return 'postDesignPvsyst';
+
+  // 2. Individual Singular Scopes
   if (lower.includes('predesign') || lower.includes('pre-design') || lower.includes('pre design')) return 'preDesign';
+  if (lower.includes('postdesign') || lower.includes('post-design') || lower.includes('post design')) return 'postDesign';
+  if (lower.includes('pvsyst') || lower.includes('pv-syst') || lower.includes('pv syst')) return 'pvsyst';
   if (lower.includes('ceig')) return 'ceig';
   if (lower.includes('ifp')) return 'ifp';
   if (
@@ -600,6 +610,7 @@ export function toCanonicalScopeKey(scopeName: string): string {
   if (lower.includes('stamp')) return 'peStamping';
   if (lower.includes('as-built') || lower.includes('asbuilt')) return 'asBuilt';
   if (lower.includes('interconnection')) return 'interconnection';
+  if (lower.includes('cei') || lower.includes('ga layout') || lower.includes('pipe')) return 'ceiLayouts';
 
   const clean = lower.replace(/[^a-z0-9\s_-]/g, '');
   const parts = clean.split(/[\s_-]+/).filter(Boolean);
@@ -853,11 +864,17 @@ export function calculateSlabCost(row: any, capacity: number): number {
 /**
  * Calculates commission for a matched capacity row and capacity with optional max cap
  */
-export function calculateSlabCommission(row: any, capacity: number, maxCommission?: number): number {
+export function calculateSlabCommission(row: any, capacity: number, maxCommission?: number, minCommission?: number): number {
   if (!row) return 0;
   const price = Number(row.price || row.basePrice || 0);
   const type = String(row.priceType || '').toLowerCase();
-  const rawCommission = type.includes('kw') ? price * capacity : price;
+  let rawCommission = type.includes('kw') ? price * capacity : price;
+  
+  // Floor check: If small project (e.g. 3 or 8 kW) and minCommission provided, apply floor
+  if (minCommission && minCommission > 0 && rawCommission < minCommission && rawCommission > 0) {
+    rawCommission = minCommission;
+  }
+
   if (maxCommission && maxCommission > 0) {
     return Math.min(rawCommission, maxCommission);
   }

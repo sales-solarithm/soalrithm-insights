@@ -136,6 +136,7 @@ export interface InvoiceData {
   quotNo: string;
   status: CanonicalInvoiceStatus | string;
   amountReceived?: number;
+  paymentDate?: string;
   clientId: string | null;
   client: InvoiceClient;
   rows: InvoiceRow[];
@@ -146,6 +147,11 @@ export interface InvoiceData {
   bank: InvoiceBank;
   terms: string[];
   totals?: InvoiceTotals;
+  invoiceType?: 'PACKAGE_RETAINER' | 'PACKAGE_RENEWAL' | 'STANDARD_KW' | string;
+  packageType?: string;
+  salesPersonEmail?: string;
+  salesIncentiveAmount?: number;
+  salesIncentiveStatus?: 'ELIGIBLE' | 'PENDING' | string;
   createdAt: string;
   updatedAt: string;
 }

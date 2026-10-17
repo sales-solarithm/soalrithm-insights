@@ -60,7 +60,7 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
 
   // Set / Reset Password Modal State
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [modalStep, setModalStep] = useState<'verify' | 'set_password' | 'success'>('verify');
+  const [modalStep, setModalStep] = useState<'verify' | 'set_password' | 'reset_dispatched' | 'success'>('verify');
   const [modalEmail, setModalEmail] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -265,7 +265,7 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
       // 1. If user does not yet exist in /users or needs role sync, automatically mirror into /users with role: 'owner'
       await mirrorOwnerToUsers(db, cleanEmail, match.docData);
 
-      // 2. Trigger sendPasswordResetEmail(auth, enteredEmail)
+      // 2. Trigger sendPasswordResetEmail(auth, cleanEmail)
       let resetDispatched = false;
       try {
         await sendPasswordResetEmail(auth, cleanEmail);
@@ -276,12 +276,10 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
           details: { role: 'owner', source: 'owner_verification_step1' }
         });
       } catch (resetErr: any) {
-        // If the user does not exist in Firebase Auth yet, that is expected for initial password setup;
-        // they will set their credentials directly in Step 2.
         console.log('[OwnerLogin] Reset email dispatch notice (new user will set password directly):', resetErr?.code || resetErr?.message);
       }
 
-      // 3. Permit the password setup/reset flow
+      // 3. Configure modal destination based on account existence
       setVerifiedOwnerData({
         name: match.docData?.name || match.docData?.employeeName || 'Executive Owner',
         email: cleanEmail,
@@ -289,17 +287,18 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
         userData: match.docData
       });
 
-      setModalStep('set_password');
       if (resetDispatched) {
+        setModalStep('reset_dispatched');
         setModalSuccess(
-          `Authorized Owner verified! A password reset link has been dispatched to ${cleanEmail}. You may also set and activate your new password directly below.`
+          `Authorized Owner account confirmed! A password reset link has been dispatched to ${cleanEmail}.`
         );
       } else {
+        setModalStep('set_password');
         setModalSuccess(
-          `Authorized Owner verified! Please set and activate your new access password below.`
+          `Authorized Owner verified! Please initialize your owner credentials below.`
         );
       }
-      setModalError(null);
+      setModalError(null);      setModalError(null);
     } catch (err: any) {
       console.error('[OwnerLogin] Owner verification error:', err);
       setModalError(err.message || 'Unable to verify owner eligibility. Please check network connection.');
@@ -357,7 +356,6 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
         } else {
           // Trigger Firebase Auth password reset email
           await sendPasswordResetEmail(auth, cleanEmail);
-
           // Update Firestore user document
           const docId = verifiedOwnerData?.docId || cleanEmail.replace(/[^a-zA-Z0-9_]/g, '_');
           if (db) {
@@ -369,23 +367,19 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
               updatedAt: new Date().toISOString()
             }, { merge: true });
           }
-
           await logAuditEvent({
             action: 'OWNER_PASSWORD_RESET_DISPATCHED',
             target: cleanEmail,
             details: { role: 'owner', source: 'owner_login_modal' }
           });
-
-          setModalStep('success');
+          setModalStep('reset_dispatched');
           setModalSuccess(
-            `A Firebase password reset link has been dispatched to ${cleanEmail}. Please click the link in your inbox to complete setting your new password, then sign in.`
+            `Your owner account already exists in Firebase. For security, a password reset link has been dispatched to ${cleanEmail}. Please check your inbox (and spam folder), click the link to set your password, then return here to sign in.`
           );
           setModalLoading(false);
           return;
         }
-      }
-
-      // User created or updated directly: sync Firestore records
+      }      // User created or updated directly: sync Firestore records
       if (authUser) {
         const docId = verifiedOwnerData?.docId || authUser.uid;
         const ownerPayload = {
@@ -476,7 +470,7 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
         target: cleanEmail,
         details: { role: 'owner', source: 'direct_modal_trigger' }
       });
-      setModalStep('success');
+      setModalStep('reset_dispatched');
       setModalSuccess(`A secure password reset link has been dispatched to ${cleanEmail}. Please check your inbox.`);
     } catch (err: any) {
       console.error('[OwnerLogin] Send reset email error:', err);
@@ -862,6 +856,55 @@ export default function OwnerLogin({ onSuccess, externalError, externalNotice }:
                   </button>
                 </div>
               </form>
+            )}
+
+            {/* STEP: Reset Link Dispatched (Accurate User Guidance) */}
+            {modalStep === 'reset_dispatched' && (
+              <div className="text-center py-2 space-y-4">
+                <div className="inline-flex items-center justify-center h-12 w-12 rounded-full bg-[#D4AF37]/10 border border-[#D4AF37]/30 text-[#D4AF37]">
+                  <Send className="w-6 h-6 text-[#D4AF37]" />
+                </div>
+                <div className="space-y-1.5">
+                  <h3 className="text-base font-bold text-gray-900 dark:text-white">
+                    Password Reset Link Dispatched
+                  </h3>
+                  <div className="p-3 rounded-xl bg-blue-500/10 border border-blue-500/30 text-left space-y-2">
+                    <p className="text-xs text-blue-900 dark:text-blue-200 leading-relaxed">
+                      Your owner account already exists in Firebase. For security, a password reset link has been dispatched to <strong className="font-mono text-[#D4AF37]">{modalEmail}</strong>.
+                    </p>
+                    <p className="text-[11px] text-gray-600 dark:text-gray-300 leading-relaxed">
+                      Please check your inbox (and spam folder), click the link to set your password, then return here to sign in.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="p-2.5 rounded-lg bg-gray-50 dark:bg-[#121212] border border-gray-200 dark:border-[#333333] text-[11px] text-gray-500 dark:text-gray-400 text-left space-y-1">
+                  <div className="font-semibold text-gray-700 dark:text-gray-300">Authorized Domain Notice:</div>
+                  <div>Ensure you are accessing via an authorized Firebase Authentication domain (e.g. localhost, Cloudflare Pages, or solarithm-master.firebaseapp.com).</div>
+                </div>
+
+                <div className="space-y-2 pt-2">
+                  <button
+                    type="button"
+                    disabled={modalLoading}
+                    onClick={handleSendResetEmailDirectly}
+                    className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl border border-gray-300 dark:border-[#333333] hover:border-[#D4AF37]/60 bg-gray-50 dark:bg-[#161616] text-gray-800 dark:text-gray-200 hover:text-[#D4AF37] text-xs font-bold transition-all cursor-pointer"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Resend Password Reset Email</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsModalOpen(false);
+                      setEmail(modalEmail);
+                    }}
+                    className="w-full py-2.5 px-4 rounded-xl bg-[#D4AF37] hover:bg-[#c49f2c] text-black font-bold text-sm transition-all shadow-md shadow-[#D4AF37]/20 cursor-pointer"
+                  >
+                    Return to Sign In
+                  </button>
+                </div>
+              </div>
             )}
 
             {/* STEP 3: Success Confirmation */}

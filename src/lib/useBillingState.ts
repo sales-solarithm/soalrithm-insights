@@ -285,9 +285,16 @@ export function useBillingState() {
       return updatedInvoices;
     });
 
-    const firestoreUpdate: Record<string, any> = { status: newStatus, updatedAt: new Date().toISOString() };
+    const nowIsoStr = new Date().toISOString();
+    const firestoreUpdate: Record<string, any> = { status: newStatus, updatedAt: nowIsoStr };
     if (amountReceived !== undefined && !isNaN(amountReceived)) {
       firestoreUpdate.amountReceived = amountReceived;
+    }
+    if (newStatus === 'PAID') {
+      firestoreUpdate.paymentDate = nowIsoStr;
+      firestoreUpdate.salesIncentiveStatus = 'ELIGIBLE';
+    } else {
+      firestoreUpdate.salesIncentiveStatus = 'PENDING';
     }
     updateDoc(doc(db, COLLECTIONS.INVOICES, id), firestoreUpdate).catch((e) =>
       console.error('Error updating invoice status in Firestore:', e)
@@ -345,11 +352,22 @@ export function useBillingState() {
         const newStatus = payable > 0 && newAmountReceivedTotal >= payable ? 'PAID' : 'PARTIALLY_PAID';
         const nowIso = new Date().toISOString();
 
-        tx.update(invoiceRef, {
+        const invoiceUpdates: Record<string, any> = {
           amountReceived: newAmountReceivedTotal,
           status: newStatus,
           updatedAt: nowIso
-        });
+        };
+        if (newStatus === 'PAID') {
+          invoiceUpdates.paymentDate = nowIso;
+          if (invoiceData.salesPersonEmail && (invoiceData.invoiceType === 'PACKAGE_RETAINER' || invoiceData.invoiceType === 'PACKAGE_RENEWAL' || invoiceData.salesIncentiveAmount)) {
+            invoiceUpdates.salesIncentiveStatus = 'ELIGIBLE';
+          }
+        } else {
+          if (invoiceData.salesIncentiveAmount) {
+            invoiceUpdates.salesIncentiveStatus = 'PENDING';
+          }
+        }
+        tx.update(invoiceRef, invoiceUpdates);
 
         tx.set(incomeRef, {
           id: incomeRef.id,

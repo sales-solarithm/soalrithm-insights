@@ -82,7 +82,9 @@ import {
   MONTH_OPTIONS,
   resolveProjectPaymentStatus,
   resolveEffectivePricingCategory,
-  toCanonicalScopeKey
+  toCanonicalScopeKey,
+  normalizeSubService,
+  evaluateSubscriptionCoverage
 } from '@/src/lib/projectUtils';
 import BillingModule from '@/src/components/Billing';
 import CompanySettingsView from '@/src/components/CompanySettingsView';
@@ -498,40 +500,80 @@ export default function DashboardPage() {
       }
 
       // Commission Engine with Zero-Value Safety & Explicit Admin Override Precedence
-      const calculateCommission = (role: string) => {
-        // Rank 1 (Highest): Explicit Manual Admin Override MUST BE PRESERVED AS-IS (allows amounts > 3000, e.g. 43256, 28840, or explicit 0)
-        const lockedVal = role === 'designer'
-          ? (project.designerCommission ?? project.designerFee ?? project.financials?.designerCommission)
-          : (project.salesCommission ?? project.commission ?? project.totalCommission ?? project.financials?.salesCommission);
+      // Resilient Staff Attribution (Universal Key Aliasing)
+      const resolvedDesignerEmail =
+        project.designerEmail ||
+        project.designer_email ||
+        project.designer ||
+        project.assignedDesigner ||
+        "";
 
-        if (lockedVal !== undefined && lockedVal !== null && String(lockedVal).trim() !== "" && !isNaN(Number(lockedVal))) {
-          return Number(lockedVal);
+      const resolvedSalesPersonEmail = 
+        project.salesPersonEmail || 
+        project.sales_email ||
+        project.salesEmail || 
+        project.salesPerson ||
+        project.assignedSales || 
+        matchedClient?.salesPersonEmail || 
+        matchedClient?.salesEmail || 
+        matchedClient?.assignedSales || 
+        "";
+
+      const calculateCommission = (role: string) => {
+        // Exclude cached financials object so recursive 0s never poison dynamic evaluation
+        const explicitVal = role === 'designer'
+          ? (project.designerCommission ?? project.designerFee)
+          : (project.salesCommission ?? project.commission);
+
+        // Directive 1: Never treat cached or default 0 as a manual override
+        const isExplicitlyLocked = Boolean(project.isCommissionLocked === true || project.isZeroCommissionApproved === true);
+        if (isExplicitlyLocked && isZeroOrPositive(explicitVal)) {
+          return Number(explicitVal);
+        }
+        if (explicitVal !== undefined && explicitVal !== null && String(explicitVal).trim() !== "" && !isNaN(Number(explicitVal)) && Number(explicitVal) > 0) {
+          return Number(explicitVal);
         }
 
-        // Rank 2 (Fallback): Dynamic Slab Computation with Cap Enforcement (e.g. 3000 maxCap)
-        const canScopeKey = toCanonicalScopeKey(scope);
+        // Directive 2: Universal Canonical Scope Normalization
+        const projectScopeKey = toCanonicalScopeKey(scope || project.scopeOfWork || project.scope || "");
+        const projectSubService = normalizeSubService(subService || project.subService);
+
+        // Directive 3: Sub-Service Coalescing with Standard Fallback
         let matchedRule = commissionRules.find(rule => {
-          const ruleRole = String(rule.role || '').toLowerCase().trim();
-          const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || '');
-          const ruleSubService = String(rule.subService || 'Standard').toLowerCase().trim();
-          return ruleRole === role && (ruleScopeKey === canScopeKey || String(rule.scope || '').toLowerCase().trim() === scope) && ruleSubService === subService;
+          const ruleRole = String(rule.role || "").toLowerCase().trim();
+          const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || rule.serviceName || "");
+          const ruleSubService = normalizeSubService(rule.subService);
+          return ruleRole === role && (ruleScopeKey === projectScopeKey || String(rule.scope || "").toLowerCase().trim() === scope) && (ruleSubService === projectSubService || ruleSubService === "standard");
         });
 
         if (!matchedRule) {
           matchedRule = commissionRules.find(rule => {
-            const ruleRole = String(rule.role || '').toLowerCase().trim();
-            const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || '');
-            return ruleRole === role && (ruleScopeKey === canScopeKey || String(rule.scope || '').toLowerCase().trim() === scope);
+            const ruleRole = String(rule.role || "").toLowerCase().trim();
+            const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || rule.serviceName || "");
+            return ruleRole === role && (ruleScopeKey === projectScopeKey || String(rule.scope || "").toLowerCase().trim() === scope);
           });
         }
 
+        // Secondary Fallback for auxiliary scopes (e.g. Pipe Calculation, Ga Layout -> CEI Layouts)
+        if (!matchedRule && (projectScopeKey === "ceiLayouts" || projectScopeKey === "pipeCalculation")) {
+          matchedRule = commissionRules.find(rule => {
+            const ruleRole = String(rule.role || "").toLowerCase().trim();
+            const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || "");
+            return ruleRole === role && ruleScopeKey === "ceiLayouts";
+          });
+        }
+
+        // Directive 4: Robust Capacity Slab Matching with Floor Fallbacks
         if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
           const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
           if (matchedRow) {
             const maxCap = isZeroOrPositive(matchedRule.maxCommission)
               ? Number(matchedRule.maxCommission)
               : 3000;
-            return calculateSlabCommission(matchedRow, capacity, maxCap);
+            const minFloor = isZeroOrPositive(matchedRule.basePrice || matchedRule.minCommission)
+              ? Number(matchedRule.basePrice || matchedRule.minCommission)
+              : 0;
+            return calculateSlabCommission(matchedRow, capacity, maxCap, minFloor);
           }
         }
 
@@ -543,8 +585,19 @@ export default function DashboardPage() {
 
         return 0;
       };
+      // Check if client is on a Fixed Package and this project is quota covered
+      const isPackageClient = Boolean(
+        matchedClient?.commercialModel === 'FIXED_PACKAGE' ||
+        Boolean(matchedClient?.subscriptionPlan) ||
+        project.isPackageClient ||
+        project.commercialModel === 'FIXED_PACKAGE'
+      );
+      const coverage = matchedClient ? evaluateSubscriptionCoverage(matchedClient, project) : { isQuotaCovered: false };
+      const isQuotaCoveredDeliverable = isPackageClient && coverage.isQuotaCovered;
+
       const designerCommission = calculateCommission('designer');
-      const salesCommission = calculateCommission('sales');
+      // Individual deliverables executed under the package quota have Sales Commission = 0 (prevents double paying sales)
+      const salesCommission = isQuotaCoveredDeliverable ? 0 : calculateCommission('sales');
 
       const directComm = safeNumber(project.commission ?? project.totalCommission ?? project.incentive);
       let totalCommissionExpense = designerCommission + salesCommission;
@@ -588,6 +641,8 @@ export default function DashboardPage() {
         },
         matchedClient,
         client: matchedClient,
+        salesPersonEmail: resolvedSalesPersonEmail,
+        designerEmail: resolvedDesignerEmail || project.designerEmail,
         activeCategory,
         category: activeCategory,
         pricingCategory: resolvedTier,
@@ -2292,6 +2347,8 @@ export default function DashboardPage() {
                 users={users || []} 
                 projects={financialProjects.length > 0 ? financialProjects : (projects || [])} 
                 commissionRules={commissionRules || []}
+                invoices={invoices || []}
+                clients={clients || []}
                 onNavigateToGlobalSettings={() => setActiveTab('Settings')}
               />
             )}

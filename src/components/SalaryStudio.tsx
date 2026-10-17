@@ -39,8 +39,11 @@ import {
   safeNumber, 
   formatCurrency,
   toCanonicalScopeKey,
+  normalizeSubService,
   SCOPE_LABELS,
-  areIndianNamesMatching
+  areIndianNamesMatching,
+  findMatchingCapacityRow,
+  calculateSlabCommission
 } from '@/src/lib/projectUtils';
 
 // ============================================================================
@@ -219,6 +222,8 @@ interface SalaryStudioProps {
   users?: any[];
   projects?: any[];
   commissionRules?: any[];
+  invoices?: any[];
+  clients?: any[];
   onNavigateToGlobalSettings?: () => void;
 }
 
@@ -519,11 +524,20 @@ export const getProjectIncentiveForEmployee = (
   const empDept = (employee.department || "").toLowerCase().trim();
   const empDesig = (employee.designation || "").toLowerCase().trim();
 
-  const pDesEmail = String(project.designerEmail || project.designer_email || project.designer || "").toLowerCase().trim();
+  // Resilient Staff Attribution (Universal Key Aliasing)
+  const pDesEmail = String(project.designerEmail || project.designer_email || project.designer || project.assignedDesigner || "").toLowerCase().trim();
   const pDesName = String(project.designer || project.designerName || project.assignedDesigner || "").toLowerCase().trim();
   const pDesId = String(project.designerId || "").toLowerCase().trim();
 
-  const pSalesEmail = String(project.salesPersonEmail || project.sales_email || project.salesEmail || "").toLowerCase().trim();
+  const pSalesEmail = String(
+    project.salesPersonEmail ||
+    project.sales_email ||
+    project.salesEmail ||
+    project.salesPerson ||
+    project.assignedSales ||
+    project.matchedClient?.salesPersonEmail ||
+    ""
+  ).toLowerCase().trim();
   const pSalesName = String(project.salesPerson || project.salesPersonName || project.salesName || project.assignedSales || "").toLowerCase().trim();
   const pSalesId = String(project.salesId || "").toLowerCase().trim();
 
@@ -534,14 +548,12 @@ export const getProjectIncentiveForEmployee = (
   const isDesigner = Boolean(
     (empEmail && pDesEmail && (empEmail === pDesEmail || pDesEmail.includes(empEmail))) ||
     (empId && pDesId && empId === pDesId) ||
-    (empMasterId && pDesId && empMasterId === pDesId) ||
-    (empName && pDesName && (empName === pDesName || areIndianNamesMatching(empName, pDesName) || matchEmployeeNames(empName, pDesName)))
+    (empName && pDesName && (empName === pDesName || matchEmployeeNames(empName, pDesName)))
   );
 
   const isSales = Boolean(
     (empEmail && pSalesEmail && (empEmail === pSalesEmail || pSalesEmail.includes(empEmail))) ||
     (empId && pSalesId && empId === pSalesId) ||
-    (empMasterId && pSalesId && empMasterId === pSalesId) ||
     (empName && pSalesName && (empName === pSalesName || matchEmployeeNames(empName, pSalesName)))
   );
 
@@ -550,108 +562,95 @@ export const getProjectIncentiveForEmployee = (
     (empName && pAssignedName && (empName === pAssignedName || matchEmployeeNames(empName, pAssignedName)))
   );
 
-  // Check assignedScopes dictionary: designer email, empId, or name matching any entry
-  const isSplitScopeDesigner = Boolean(
-    project.assignedScopes &&
-    typeof project.assignedScopes === "object" &&
-    Object.values(project.assignedScopes).some((v: any) => {
-      const val = String(v || "").toLowerCase().trim();
-      return (
-        (empEmail && val === empEmail) ||
-        (empId && val === empId) ||
-        (empName && (val === empName || matchEmployeeNames(empName, val)))
-      );
-    })
-  );
-
+  // Split-scope check (if project has assignedScopes mapping)
+  let comboResult: { amount: number; scopeKeys: string[]; matched: boolean; comboFullAmount?: number } | null = null;
+  if (project?.assignedScopes && typeof project.assignedScopes === "object") {
+    comboResult = getComboScopeCommission(project, empEmail, commissionRules);
+  }
+  const isSplitScopeDesigner = Boolean(comboResult && comboResult.scopeKeys.length > 0);
+  // If employee has no role on this project, early return
   if (!isDesigner && !isSales && !isAssigned && !isSplitScopeDesigner) {
     return null;
   }
 
-    let amount = 0;
-  let roleLabel = "";
-
-  const comboResult = isSplitScopeDesigner
-    ? getComboScopeCommission(project, empEmail, commissionRules)
-    : null;
-
-  // ==========================================================================
-  // COMMISSION HIERARCHY OF PRECEDENCE (Rank 1: Explicit Admin Override vs Rank 2: Rule Cap)
-  // ==========================================================================
-  // Extract saved explicit commissions directly from the project document first (Priority Rule 1)
+  // Precedence 1: Explicit Manual Admin Overrides
   const explicitDesComm =
     project.designerCommission ??
-    project.designerFee ??
-    project.financials?.designerCommission;
+    project.designerFee;
+  
+  const isExplicitlyLocked = Boolean(project.isCommissionLocked === true || project.isZeroCommissionApproved === true);
 
   const hasExplicitDesignerComm =
-    explicitDesComm !== undefined &&
-    explicitDesComm !== null &&
-    String(explicitDesComm).trim() !== "" &&
-    !isNaN(Number(explicitDesComm));
+    isExplicitlyLocked
+      ? isZeroOrPositive(explicitDesComm)
+      : (explicitDesComm !== undefined && explicitDesComm !== null && String(explicitDesComm).trim() !== "" && !isNaN(Number(explicitDesComm)) && Number(explicitDesComm) > 0);
 
   const explicitSalesComm =
     project.salesCommission ??
-    project.commission ??
-    project.financials?.salesCommission;
+    project.commission;
 
   const hasExplicitSalesComm =
-    explicitSalesComm !== undefined &&
-    explicitSalesComm !== null &&
-    String(explicitSalesComm).trim() !== "" &&
-    !isNaN(Number(explicitSalesComm));
+    isExplicitlyLocked
+      ? isZeroOrPositive(explicitSalesComm)
+      : (explicitSalesComm !== undefined && explicitSalesComm !== null && String(explicitSalesComm).trim() !== "" && !isNaN(Number(explicitSalesComm)) && Number(explicitSalesComm) > 0);
 
   let desComm = 0;
   let salesComm = 0;
+  let amount = 0;
+  let roleLabel = '';
 
-  // 1. Resolve Designer Commission (Priority: Explicit Manual Override > Split Scope with positive amount > Dynamic Fallback)
+  const rawScope = String(project.scopeOfWork || project.scope || "").trim();
+  const canScopeKey = toCanonicalScopeKey(rawScope);
+  const pSub = normalizeSubService(project.subService);
+
+  const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
+  const capacity = isZeroOrPositive(rawCap)
+    ? Number(rawCap)
+    : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
+
+  // Helper to match commission rule
+  const findRuleForRole = (role: string) => {
+    let rule = (commissionRules || []).find((r) => {
+      const rRole = String(r.role || "").toLowerCase().trim();
+      const rKey = toCanonicalScopeKey(r.scope || r.scopeOfWork || r.serviceName || r.scopeCombination || "");
+      const rSub = normalizeSubService(r.subService);
+      return rRole === role && rKey === canScopeKey && (rSub === pSub || rSub === "standard");
+    });
+    if (!rule) {
+      rule = (commissionRules || []).find((r) => {
+        const rRole = String(r.role || "").toLowerCase().trim();
+        const rKey = toCanonicalScopeKey(r.scope || r.scopeOfWork || r.serviceName || r.scopeCombination || "");
+        return rRole === role && rKey === canScopeKey;
+      });
+    }
+    if (!rule && (canScopeKey === "ceiLayouts" || canScopeKey === "pipeCalculation")) {
+      rule = (commissionRules || []).find((r) => {
+        const rRole = String(r.role || "").toLowerCase().trim();
+        const rKey = toCanonicalScopeKey(r.scope || r.scopeOfWork || "");
+        return rRole === role && rKey === "ceiLayouts";
+      });
+    }
+    return rule;
+  };
+
+  // 1. Resolve Designer Commission
   if (hasExplicitDesignerComm) {
-    // PRESERVE SAVED VALUE DIRECTLY (e.g. ₹43,256 or ₹28,840) without re-calculating or clamping to ₹0
     desComm = Number(explicitDesComm);
   } else if (isSplitScopeDesigner && comboResult && comboResult.matched && comboResult.amount > 0) {
     desComm = comboResult.amount;
   } else if (isDesigner || isAssigned || isSplitScopeDesigner) {
-    // Dynamic fallback: look up rate-card slab or apply tier formula
-    const rawScope = String(project.scopeOfWork || project.scope || "").trim();
-    const canScopeKey = toCanonicalScopeKey(rawScope);
-
-    const matchedRule = (commissionRules || []).find((rule) => {
-      const ruleRole = String(rule.role || "").toLowerCase().trim();
-      if (ruleRole !== "designer") return false;
-      const ruleKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || rule.scopeCombination || "");
-      return ruleKey === canScopeKey;
-    });
-
-    const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
-    const capacity = isZeroOrPositive(rawCap)
-      ? Number(rawCap)
-      : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
-
+    const matchedRule = findRuleForRole("designer");
     if (matchedRule) {
       if (Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
-        for (const row of matchedRule.capacityRows) {
-          const range = String(row.capacityRange || "").toUpperCase().trim();
-          let isMatch = false;
-          if (range.includes("-")) {
-            const [minStr, maxStr] = range.split("-");
-            if (capacity >= Number(minStr) && capacity <= Number(maxStr)) isMatch = true;
-          } else if (range.includes("ABOVE") || range.includes(">")) {
-            if (capacity > Number(range.replace("ABOVE", "").replace(">", "").trim())) isMatch = true;
-          } else if (range.includes("UP TO") || range.includes("<=")) {
-            if (capacity <= Number(range.replace("UP TO", "").replace("<=", "").trim())) isMatch = true;
-          } else if (range.includes("<")) {
-            if (capacity < Number(range.replace("<", "").trim())) isMatch = true;
-          }
-          if (isMatch) {
-            const price = isZeroOrPositive(row.price ?? row.basePrice) ? Number(row.price ?? row.basePrice) : 0;
-            const type = String(row.priceType || "").toLowerCase();
-            const computed = type.includes("kw") ? price * capacity : price;
-            const capVal = isZeroOrPositive(matchedRule.maxCommission)
-              ? Number(matchedRule.maxCommission)
-              : 3000;
-            desComm = capVal > 0 ? Math.min(computed, capVal) : computed;
-            break;
-          }
+        const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
+        if (matchedRow) {
+          const capVal = isZeroOrPositive(matchedRule.maxCommission)
+            ? Number(matchedRule.maxCommission)
+            : 3000;
+          const minFloor = isZeroOrPositive(matchedRule.basePrice || matchedRule.minCommission)
+            ? Number(matchedRule.basePrice || matchedRule.minCommission)
+            : 0;
+          desComm = calculateSlabCommission(matchedRow, capacity, capVal, minFloor);
         }
       } else {
         const ruleBase = matchedRule.price ?? matchedRule.basePrice ?? matchedRule.amount;
@@ -662,7 +661,6 @@ export const getProjectIncentiveForEmployee = (
       }
     }
 
-    // Dynamic cost percentage fallback (40% default for Detail Design / Detailed Engineering)
     if (desComm === 0) {
       const finalCost = Number(project.finalCost ?? project.calculatedCost ?? project.cost ?? project.amount ?? 0);
       if (finalCost > 0) {
@@ -675,46 +673,18 @@ export const getProjectIncentiveForEmployee = (
   if (hasExplicitSalesComm) {
     salesComm = Number(explicitSalesComm);
   } else if (isSales) {
-    const rawScope = String(project.scopeOfWork || project.scope || "").trim();
-    const canScopeKey = toCanonicalScopeKey(rawScope);
-
-    const matchedRule = (commissionRules || []).find((rule) => {
-      const ruleRole = String(rule.role || "").toLowerCase().trim();
-      if (ruleRole !== "sales") return false;
-      const ruleKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || rule.scopeCombination || "");
-      return ruleKey === canScopeKey;
-    });
-
-    const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
-    const capacity = isZeroOrPositive(rawCap)
-      ? Number(rawCap)
-      : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
-
+    const matchedRule = findRuleForRole("sales");
     if (matchedRule) {
       if (Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
-        for (const row of matchedRule.capacityRows) {
-          const range = String(row.capacityRange || "").toUpperCase().trim();
-          let isMatch = false;
-          if (range.includes("-")) {
-            const [minStr, maxStr] = range.split("-");
-            if (capacity >= Number(minStr) && capacity <= Number(maxStr)) isMatch = true;
-          } else if (range.includes("ABOVE") || range.includes(">")) {
-            if (capacity > Number(range.replace("ABOVE", "").replace(">", "").trim())) isMatch = true;
-          } else if (range.includes("UP TO") || range.includes("<=")) {
-            if (capacity <= Number(range.replace("UP TO", "").replace("<=", "").trim())) isMatch = true;
-          } else if (range.includes("<")) {
-            if (capacity < Number(range.replace("<", "").trim())) isMatch = true;
-          }
-          if (isMatch) {
-            const price = isZeroOrPositive(row.price ?? row.basePrice) ? Number(row.price ?? row.basePrice) : 0;
-            const type = String(row.priceType || "").toLowerCase();
-            const computed = type.includes("kw") ? price * capacity : price;
-            const capVal = isZeroOrPositive(matchedRule.maxCommission)
-              ? Number(matchedRule.maxCommission)
-              : 3000;
-            salesComm = capVal > 0 ? Math.min(computed, capVal) : computed;
-            break;
-          }
+        const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
+        if (matchedRow) {
+          const capVal = isZeroOrPositive(matchedRule.maxCommission)
+            ? Number(matchedRule.maxCommission)
+            : 3000;
+          const minFloor = isZeroOrPositive(matchedRule.basePrice || matchedRule.minCommission)
+            ? Number(matchedRule.basePrice || matchedRule.minCommission)
+            : 0;
+          salesComm = calculateSlabCommission(matchedRow, capacity, capVal, minFloor);
         }
       } else {
         const ruleBase = matchedRule.price ?? matchedRule.basePrice ?? matchedRule.amount;
@@ -725,7 +695,6 @@ export const getProjectIncentiveForEmployee = (
       }
     }
   }
-
   // 3. Assemble Final Amount and Role Label
   if (isSplitScopeDesigner && comboResult && comboResult.scopeKeys.length > 0) {
     const scopeLabel = (comboResult.scopeKeys || []).map((k) => SCOPE_LABELS[k] || k).join(" + ") || "Assigned Scope";
@@ -764,7 +733,6 @@ export const getProjectIncentiveForEmployee = (
     roleLabel = "Designer Commission";
   }
   const dateDisplay = formatSafeDate(pDate, "slash") || formatSafeDate(new Date(), "slash");
-  const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity;
   const kw = isZeroOrPositive(rawCap) ? Number(rawCap) : parseFloat(String(rawCap || "0").replace(/[^\d.]/g, "")) || 0;
 
   return {
@@ -799,6 +767,8 @@ export default function SalaryStudio({
   users: externalUsers = [],
   projects: externalProjects = [],
   commissionRules: externalCommissionRules = [],
+  invoices: externalInvoices = [],
+  clients: externalClients = [],
   onNavigateToGlobalSettings
 }: SalaryStudioProps) {
   const { companySettings } = useCompanySettings();
@@ -1230,9 +1200,77 @@ export default function SalaryStudio({
   const allActiveIncentives = useMemo<IncentiveRecord[]>(() => {
     if (!currentEmployee) return [];
 
-    const matchedFromProjects: IncentiveRecord[] = [];
+    const matchedIncentives: IncentiveRecord[] = [];
+    const empEmail = (currentEmployee.email || "").toLowerCase().trim();
+    const empName = (currentEmployee.name || "").toLowerCase().trim();
+    const empId = (currentEmployee.empId || "").toLowerCase().trim();
+
+    // =========================================================================
+    // 1. Fixed Package Sales Incentive (FLAT ₹500 upon 100% PAID Invoices)
+    // =========================================================================
+    if (Array.isArray(externalInvoices) && externalInvoices.length > 0) {
+      externalInvoices.forEach((inv) => {
+        // Must be a Package Retainer or Package Renewal invoice
+        const invType = String(inv.invoiceType || "").toUpperCase().trim();
+        const isPackageInvoice =
+          invType === "PACKAGE_RETAINER" ||
+          invType === "PACKAGE_RENEWAL" ||
+          Boolean(inv.packageType) ||
+          Boolean(inv.salesIncentiveAmount);
+
+        if (!isPackageInvoice) return;
+
+        // Sales Attribution: Match acquiring sales rep email, name, or employee ID
+        const invSalesEmail = String(inv.salesPersonEmail || inv.salesEmail || inv.assignedSales || "").toLowerCase().trim();
+        const invSalesName = String(inv.salesPersonName || inv.salesName || "").toLowerCase().trim();
+
+        const isSalesRepMatch = Boolean(
+          (empEmail && invSalesEmail && (empEmail === invSalesEmail || invSalesEmail.includes(empEmail))) ||
+          (empName && invSalesName && (empName === invSalesName || matchEmployeeNames(empName, invSalesName)))
+        );
+
+        if (!isSalesRepMatch) return;
+
+        // Strict 100% Paid Settlement Verification
+        const canonicalStatus = String(inv.status || "").toUpperCase().trim();
+        const isFullyPaid = canonicalStatus === "PAID";
+        if (!isFullyPaid) return;
+
+        // Date alignment: Must fall into evaluated cycle month/lookback
+        const paymentDateRaw = inv.paymentDate || inv.updatedAt || inv.invDate || inv.createdAt;
+        const pDate = parseSafeDate(paymentDateRaw);
+        if (!isProjectInMonthAndFY(pDate, incentiveCyclePeriod.month, incentiveCyclePeriod.fy, incentiveCyclePeriod.lookbackMonths)) {
+          return;
+        }
+
+        const dateDisplay = formatSafeDate(pDate || new Date(), "slash");
+        const isRenewal = invType === "PACKAGE_RENEWAL";
+        const pkgTitle = inv.packageType || "Fixed Package";
+        const clientTitle = inv.client?.name || inv.clientName || "Corporate Client";
+
+        matchedIncentives.push({
+          id: `PKG_INC_${inv.id || Math.random().toString(36).substring(2, 8)}`,
+          date: dateDisplay,
+          empId: currentEmployee.empId,
+          empName: currentEmployee.name,
+          project: `${pkgTitle} (${isRenewal ? "Renewal" : "Initial"})`,
+          client: clientTitle,
+          kw: 0,
+          amount: 500, // Flat ₹500
+          role: "Package Sales Incentive",
+          status: "PAID",
+          scopeOfWork: pkgTitle,
+          sector: "Subscription"
+        });
+      });
+    }
+
+    // =========================================================================
+    // 2. Deliverable Incentives (Designer Fees + Standard kW Commissions)
+    // Individual deliverables under package quota have Sales Commission = ₹0
+    // =========================================================================
     if (Array.isArray(externalProjects) && externalProjects.length > 0) {
-      externalProjects.forEach(p => {
+      externalProjects.forEach((p) => {
         const inc = getProjectIncentiveForEmployee(
           p,
           currentEmployee,
@@ -1242,25 +1280,27 @@ export default function SalaryStudio({
           incentiveCyclePeriod.lookbackMonths
         );
         if (inc) {
-          matchedFromProjects.push(inc);
+          matchedIncentives.push(inc);
         }
       });
     }
 
-    if (matchedFromProjects.length > 0) {
-      return matchedFromProjects;
+    if (matchedIncentives.length > 0) {
+      return matchedIncentives;
     }
 
-    return incentives.filter(inc => {
-      const isEmpMatch = currentEmployee && (inc.empId === currentEmployee.empId || inc.empName.toLowerCase() === currentEmployee.name.toLowerCase());
+    return incentives.filter((inc) => {
+      const isEmpMatch =
+        currentEmployee &&
+        (inc.empId === currentEmployee.empId || inc.empName.toLowerCase() === currentEmployee.name.toLowerCase());
       if (!isEmpMatch) return false;
       if (!genMonth) return true;
       const d = parseSafeDate(inc.date);
       if (!d) return true;
-      const incMonth = d.toLocaleString('default', { month: 'long' });
+      const incMonth = d.toLocaleString("default", { month: "long" });
       return incMonth.toLowerCase() === genMonth.toLowerCase();
     });
-  }, [externalProjects, currentEmployee, genMonth, incentiveCyclePeriod, incentives, externalCommissionRules]);
+  }, [externalInvoices, externalProjects, currentEmployee, genMonth, incentiveCyclePeriod, incentives, externalCommissionRules]);
 
     // Dynamic Scopes derived from active project deliverables + taxonomy (Mandate 2 & Task 2)
   const availableScopesList = useMemo(() => {

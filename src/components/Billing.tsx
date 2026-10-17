@@ -359,21 +359,25 @@ export default function BillingModule({
   }, [currentInvoice.clientId, filteredClientsForMonth, externalClients]);
 
   // Handle generating upfront subscription retainer invoice
-  const handleGenerateSubscriptionRetainerInvoice = () => {
+  const handleGeneratePackageInvoice = (invoiceType: "PACKAGE_RETAINER" | "PACKAGE_RENEWAL" = "PACKAGE_RETAINER") => {
     if (!selectedClientObject || !selectedClientObject.subscriptionPlan) {
-      showToast('Client does not have an active subscription package plan.', 'error');
+      showToast("Client does not have an active subscription package plan.", "error");
       return;
     }
 
     const plan = selectedClientObject.subscriptionPlan;
-    const upfrontPrice = Number(plan.upfrontPrice || 0);
-    const scope = plan.scopeCovered || 'Engineering';
+    const upfrontPrice = Number(plan.upfrontPrice || plan.price || 0);
+    const scope = plan.scopeCovered || "Engineering";
     const duration = plan.durationMonths || 1;
     const quota = plan.totalAllowedProjects || 0;
+    const planName = plan.planName || `${scope} Retainer`;
+
+    const isRenewal = invoiceType === "PACKAGE_RENEWAL";
+    const labelPrefix = isRenewal ? "Package Renewal" : "Initial Package Retainer";
 
     const retainerRow: InvoiceRow = {
-      id: uid('row'),
-      desc: `${scope} Retainer Package - ${duration} Months (${quota} Projects Quota)`,
+      id: uid("row"),
+      desc: `${planName} (${labelPrefix}) - ${duration} Month(s) (${quota} Projects Quota)`,
       scope: scope,
       kw: 0,
       charge: upfrontPrice
@@ -388,14 +392,25 @@ export default function BillingModule({
       currentInvoice.advance
     );
 
+    const acquiringSalesRep = selectedClientObject.salesPersonEmail || selectedClientObject.salesEmail || selectedClientObject.assignedSales || "";
+
     setCurrentInvoice((prev) => ({
       ...prev,
       rows: nextRows,
-      totals: nextTotals
+      totals: nextTotals,
+      invoiceType,
+      packageType: planName,
+      salesPersonEmail: acquiringSalesRep,
+      salesIncentiveAmount: 500,
+      salesIncentiveStatus: prev.status === "PAID" ? "ELIGIBLE" : "PENDING"
     }));
+
     setIsDirty(true);
-    showToast(`Generated Subscription Retainer Invoice for ${selectedClientObject.companyName || selectedClientObject.name} (₹${upfrontPrice.toLocaleString('en-IN')}) ✓`, 'success');
+    showToast(`Generated ${labelPrefix} Invoice for ${selectedClientObject.companyName || selectedClientObject.name} (₹${upfrontPrice.toLocaleString("en-IN")}) ✓`, "success");
   };
+
+  const handleGenerateSubscriptionRetainerInvoice = () => handleGeneratePackageInvoice("PACKAGE_RETAINER");
+  const handleGeneratePackageRenewalInvoice = () => handleGeneratePackageInvoice("PACKAGE_RENEWAL");
 
   // Handlers for Pending Invoice Notices (Delta vs Supersede)
   const handleResolvePendingAsDelta = () => {
@@ -1609,14 +1624,26 @@ export default function BillingModule({
                           Quota: <strong className="text-[#D4AF37]">{selectedClientObject.subscriptionPlan.totalAllowedProjects} Projects</strong> ({selectedClientObject.subscriptionPlan.scopeCovered}) • Retainer: <strong className="text-gray-900 dark:text-white">₹{Number(selectedClientObject.subscriptionPlan.upfrontPrice || 0).toLocaleString('en-IN')}</strong>
                         </p>
                       </div>
-                      <button
-                        type="button"
-                        onClick={handleGenerateSubscriptionRetainerInvoice}
-                        className="px-3 py-1.5 rounded-lg text-xs font-bold bg-[#D4AF37] hover:bg-[#c49f2e] text-black shadow-xs flex items-center gap-1.5 cursor-pointer shrink-0 transition-colors"
-                      >
-                        <Sparkles className="w-3.5 h-3.5" />
-                        <span>Generate Subscription Retainer Invoice</span>
-                      </button>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={handleGenerateSubscriptionRetainerInvoice}
+                          className="px-3 py-1.5 rounded-lg text-xs font-bold bg-[#D4AF37] hover:bg-[#c49f2e] text-black shadow-xs flex items-center gap-1.5 cursor-pointer transition-colors"
+                          title="Generate initial package retainer invoice"
+                        >
+                          <Sparkles className="w-3.5 h-3.5" />
+                          <span>Initial Retainer</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleGeneratePackageRenewalInvoice}
+                          className="px-3 py-1.5 rounded-lg text-xs font-bold bg-gray-900 hover:bg-black text-white dark:bg-white dark:hover:bg-gray-200 dark:text-black shadow-xs flex items-center gap-1.5 cursor-pointer transition-colors border border-gray-700 dark:border-gray-300"
+                          title="Generate package renewal invoice attributing permanent sales rep"
+                        >
+                          <Sparkles className="w-3.5 h-3.5 text-[#D4AF37]" />
+                          <span>Generate Renewal</span>
+                        </button>
+                      </div>
                     </div>
                   )}
 
