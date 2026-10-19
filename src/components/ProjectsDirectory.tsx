@@ -27,7 +27,9 @@ import {
   formatIndianName, 
   SCOPE_LABELS,
   resolveProjectPaymentStatus,
-  findMatchingInvoicesForProject
+  findMatchingInvoicesForProject,
+  getEmployeeNameEnhanced,
+  formatTwoPartName
 } from '@/src/lib/projectUtils';
 import EditProjectModal from './EditProjectModal';
 
@@ -144,11 +146,11 @@ export default function ProjectsDirectory({
   const [projectToDelete, setProjectToDelete] = useState<any | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
 
-  // Helper to resolve employee name
+  // Enhanced Helper to resolve employee name with 2-part formatting (Surname & Firstname)
   const getEmployeeName = useCallback((email: string | undefined | null) => {
-    if (!email) return 'N/A';
-    const u = users.find(x => (x.email || '').toLowerCase() === email.toLowerCase());
-    return u?.name || u?.displayName || email.split('@')[0];
+    if (!email) return 'Unassigned';
+    const fullName = getEmployeeNameEnhanced(email, users);
+    return formatTwoPartName(fullName);
   }, [users]);
 
   // Status Badge Helper
@@ -715,7 +717,8 @@ export default function ProjectsDirectory({
                   const salesComm = resolveSalesCommission(proj);
                   const balance = cost - (desComm + salesComm);
                   const pDate = getProjectDate(proj);
-                  const desName = formatIndianName(getEmployeeName(proj.designerEmail));
+                  const designerAlias = proj.designerEmail || proj.designer_email || proj.designer || proj.assignedDesigner || '';
+                  const desName = getEmployeeName(designerAlias) || formatTwoPartName(proj.designerName) || 'Unassigned';
 
                   return (
                     <tr key={proj.id} className="hover:bg-gray-50 dark:hover:bg-[#252525]/50 transition-colors">
@@ -972,7 +975,7 @@ export default function ProjectsDirectory({
                   <div>
                     <span className="text-gray-500">Assigned Designer Name &amp; ID:</span>
                     <div className="text-sm font-semibold text-gray-900 dark:text-white mt-0.5">
-                      {formatIndianName(getEmployeeName(detailsProject.designerEmail)) || detailsProject.designerName || 'Unassigned'}
+                      {getEmployeeName(detailsProject.designerEmail || detailsProject.assignedDesigner || detailsProject.designer) || formatTwoPartName(detailsProject.designerName) || 'Unassigned'}
                     </div>
                     <div className="text-[11px] text-gray-400 font-mono mt-0.5">
                       ID: {detailsProject.designerEmployeeId || detailsProject.designerId || detailsProject.designerEmail || 'N/A'}

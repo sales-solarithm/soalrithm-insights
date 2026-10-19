@@ -293,6 +293,97 @@ export function formatIndianName(rawName: string | undefined | null): string {
 }
 
 /**
+ * Enhanced Employee Lookup by Email:
+ * Resolves user from `users` collection matching email, personalEmail, personalEmailAddress, authEmail,
+ * or matching email handle prefix.
+ * Strips '(Owner)' role tags, maps 'Jay Jalpa' to 'Jay Shah', and cleanly formats unknown handles.
+ */
+export function getEmployeeNameEnhanced(
+  email: string | undefined | null,
+  users: any[] = []
+): string {
+  if (!email || !String(email).trim()) return 'Unassigned';
+  const cleanEmail = String(email).trim().toLowerCase();
+  const handlePrefix = cleanEmail.split('@')[0].replace(/[0-9_.]/g, '');
+
+  const user = (users || []).find((u) => {
+    if (!u) return false;
+    const uEmail = String(u.email || '').toLowerCase().trim();
+    const uPersonal = String(u.personalEmail || '').toLowerCase().trim();
+    const uPersonalAddr = String(u.personalEmailAddress || '').toLowerCase().trim();
+    const uAuth = String(u.authEmail || '').toLowerCase().trim();
+
+    if (
+      (uEmail && uEmail === cleanEmail) ||
+      (uPersonal && uPersonal === cleanEmail) ||
+      (uPersonalAddr && uPersonalAddr === cleanEmail) ||
+      (uAuth && uAuth === cleanEmail)
+    ) {
+      return true;
+    }
+
+    // Match by email handle prefix (e.g. deepdavara.23 -> deepdavara)
+    const uHandlePrefix = uEmail.split('@')[0].replace(/[0-9_.]/g, '');
+    if (uHandlePrefix && handlePrefix && uHandlePrefix === handlePrefix) {
+      return true;
+    }
+
+    return false;
+  });
+
+  let resolvedName = user?.name || user?.displayName || user?.fullName || '';
+
+  // Fallback for known company leaders if not found in users list
+  if (!resolvedName) {
+    if (cleanEmail.includes('deepdavara')) resolvedName = 'Deep Davara';
+    else if (cleanEmail.includes('jayshah') || cleanEmail.includes('jayjalpa')) resolvedName = 'Jay Shah';
+    else if (cleanEmail.includes('prathamsolanke')) resolvedName = 'Solanke Pratham';
+    else if (cleanEmail.includes('kaushilparmar')) resolvedName = 'Parmar Kaushil';
+    else if (cleanEmail.includes('hastisavani')) resolvedName = 'Savani Hasti';
+    else if (cleanEmail.includes('sheladiyaom')) resolvedName = 'Sheladiya Om';
+    else {
+      // Cleanly format email handle (e.g. deepdavara.23 -> Deep Davara)
+      const rawHandle = cleanEmail.split('@')[0].replace(/[0-9]+/g, '');
+      const tokens = rawHandle.split(/[._-]+/).filter(Boolean);
+      resolvedName = tokens.map(t => toTitleCase(t)).join(' ') || cleanEmail;
+    }
+  }
+
+  // Strip '(Owner)' or '(owner)' tag if present
+  let cleanName = String(resolvedName).replace(/\s*\(\s*owner\s*\)/gi, '').trim();
+
+  // Map 'Jay Jalpa' to 'Jay Shah'
+  if (cleanName.toLowerCase() === 'jay jalpa' || cleanName.toLowerCase().startsWith('jay jalpa')) {
+    cleanName = 'Jay Shah';
+  }
+
+  return cleanName;
+}
+
+/**
+ * 2-Part Name Formatter:
+ * Takes a full Indian name and returns only Surname and Firstname (2 words),
+ * stripping the patronymic third word (father's name).
+ * E.g.:
+ * - 'Solanke Pratham Chandrakantbhai' -> 'Solanke Pratham'
+ * - 'Parmar Kaushil Chimanbhai' -> 'Parmar Kaushil'
+ * - 'Davara Deep Arvindbhai' -> 'Davara Deep'
+ * - 'Savani Hasti Vijaybhai' -> 'Savani Hasti'
+ * - 'Jay Shah' -> 'Jay Shah'
+ */
+export function formatTwoPartName(fullName: string | undefined | null): string {
+  if (!fullName) return '';
+  const clean = String(fullName).replace(/\s*\(\s*owner\s*\)/gi, '').trim();
+  const parts = clean.split(/\s+/).filter(Boolean);
+  if (parts.length <= 2) return toTitleCase(clean);
+  if (parts.length === 3) {
+    // [Surname] [Firstname] [Fathername] -> Return "Surname Firstname"
+    return `${toTitleCase(parts[0])} ${toTitleCase(parts[1])}`;
+  }
+  return `${toTitleCase(parts[0])} ${toTitleCase(parts[1])}`;
+}
+
+/**
  * Indian Naming Convention Parser:
  * Resolves 3-part Indian naming formats:
  * - Format A: "Surname Firstname Fathername" -> Extracts "Firstname"

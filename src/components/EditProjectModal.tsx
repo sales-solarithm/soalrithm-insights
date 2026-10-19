@@ -22,7 +22,9 @@ import {
   formatSafeDate, 
   formatIndianName, 
   toTitleCase, 
-  SCOPE_LABELS 
+  SCOPE_LABELS,
+  getEmployeeNameEnhanced,
+  formatTwoPartName
 } from '@/src/lib/projectUtils';
 
 export interface EditProjectModalProps {
@@ -71,9 +73,9 @@ function getInitialProjectFormData(project: any) {
     };
   }
 
-  // Resolve date safely
+  // Resolve date safely using local year/month/date (prevents 1-day timezone offset)
   const d = parseSafeDate(project.projectDate || project.date || project.createdAt);
-  const dateFormatted = d ? d.toISOString().split('T')[0] : '';
+  const dateFormatted = d ? formatSafeDate(d, 'input') : '';
 
   // Resolve capacity safely
   const rawCap = project.plantCapacity ?? project.systemCapacity ?? project.capacity ?? 0;
@@ -99,11 +101,11 @@ function getInitialProjectFormData(project: any) {
     clientId: project.clientId || project.matchedClient?.id || '',
     plantCapacity: numCap,
     capacityUnit: project.capacityUnit || 'KW',
-    scopeOfWork: project.scopeOfWork || 'Detailed Engineering',
+    scopeOfWork: project.scopeOfWork || project.scope || 'Detailed Engineering',
     subService: project.subService || 'Standard',
     projectDate: dateFormatted,
-    designerEmail: project.designerEmail || '',
-    designerName: project.designerName || '',
+    designerEmail: project.designerEmail || project.designer_email || project.designer || project.assignedDesigner || '',
+    designerName: project.designerName || project.assignedDesignerName || '',
     salesPersonEmail: project.salesPersonEmail || '',
     calculatedCost: costVal,
     finalCost: costVal,
@@ -152,11 +154,11 @@ export default function EditProjectModal({
 
   // Designer selection handler
   const handleDesignerChange = (email: string) => {
-    const foundUser = users.find(u => (u.email || '').toLowerCase() === email.toLowerCase());
+    const resolvedName = getEmployeeNameEnhanced(email, users);
     setFormData((prev: any) => ({
       ...prev,
       designerEmail: email,
-      designerName: foundUser?.name || foundUser?.displayName || email.split('@')[0]
+      designerName: formatTwoPartName(resolvedName) || email.split('@')[0]
     }));
   };
 
@@ -180,15 +182,17 @@ export default function EditProjectModal({
       return;
     }
 
-    const finalCostValue = safeNumber(formData.finalCost > 0 ? formData.finalCost : formData.calculatedCost);
-    const salesCommissionValue = safeNumber(formData.salesCommission);
-    const designerCommissionValue = safeNumber(formData.designerCommission);
+    const finalCostValue = safeNumber(formData.finalCost !== '' && Number(formData.finalCost) > 0 ? formData.finalCost : formData.calculatedCost, 0);
+    const salesCommissionValue = safeNumber(formData.salesCommission, 0);
+    const designerCommissionValue = safeNumber(formData.designerCommission, 0);
+    const plantCapacityValue = safeNumber(formData.plantCapacity, 0);
 
     // CRITICAL DATE PRESERVATION (Audit Task 5):
     // Preserve existing date strictly: project.projectDate || project.date || project.createdAt
     // Do NOT set new Date() unless user explicitly changed date picker value
     const rawExistingDate = project.projectDate || project.date || project.createdAt || '';
-    const initialFormattedDate = parseSafeDate(rawExistingDate)?.toISOString().split('T')[0] || '';
+    const parsedRaw = parseSafeDate(rawExistingDate);
+    const initialFormattedDate = parsedRaw ? formatSafeDate(parsedRaw, 'input') : '';
     const dateExplicitlyChanged = Boolean(formData.projectDate && formData.projectDate !== initialFormattedDate);
     const finalProjectDate = dateExplicitlyChanged ? formData.projectDate : (rawExistingDate || formData.projectDate);
 
@@ -197,9 +201,9 @@ export default function EditProjectModal({
       projectName: formData.projectName.trim(),
       clientName: formData.clientName.trim(),
       clientId: formData.clientId || project.clientId || '',
-      plantCapacity: safeNumber(formData.plantCapacity),
-      systemCapacity: safeNumber(formData.plantCapacity),
-      capacity: safeNumber(formData.plantCapacity),
+      plantCapacity: plantCapacityValue,
+      systemCapacity: plantCapacityValue,
+      capacity: plantCapacityValue,
       capacityUnit: formData.capacityUnit || 'KW',
       scopeOfWork: formData.scopeOfWork,
       subService: formData.subService || 'Standard',
@@ -233,10 +237,10 @@ export default function EditProjectModal({
     }
   };
 
-  // Calculation summaries
-  const cost = safeNumber(formData.finalCost > 0 ? formData.finalCost : formData.calculatedCost);
-  const desComm = safeNumber(formData.designerCommission);
-  const salesComm = safeNumber(formData.salesCommission);
+  // Calculation summaries with zero-safe math (empty string '' evaluates as 0)
+  const cost = safeNumber(formData.finalCost !== '' && Number(formData.finalCost) > 0 ? formData.finalCost : formData.calculatedCost, 0);
+  const desComm = safeNumber(formData.designerCommission, 0);
+  const salesComm = safeNumber(formData.salesCommission, 0);
   const totalCommissions = desComm + salesComm;
   const netCompanyBalance = cost - totalCommissions;
 
@@ -326,8 +330,14 @@ export default function EditProjectModal({
                   type="number"
                   min="0"
                   step="any"
-                  value={formData.plantCapacity}
-                  onChange={(e) => setFormData({ ...formData, plantCapacity: parseFloat(e.target.value) || 0 })}
+                  value={formData.plantCapacity !== undefined && formData.plantCapacity !== null ? formData.plantCapacity : ''}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setFormData({
+                      ...formData,
+                      plantCapacity: val === '' ? '' : (isNaN(parseFloat(val)) ? '' : parseFloat(val))
+                    });
+                  }}
                   className="w-full bg-gray-50 dark:bg-[#121212] border border-r-0 border-gray-300 dark:border-[#333333] focus:border-[#D4AF37] rounded-l-lg px-3 py-2 text-gray-900 dark:text-white font-mono focus:outline-none"
                   required
                 />
@@ -347,6 +357,12 @@ export default function EditProjectModal({
                 onChange={(e) => setFormData({ ...formData, scopeOfWork: e.target.value })}
                 className="w-full bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] focus:border-[#D4AF37] rounded-lg px-3 py-2 text-gray-900 dark:text-white cursor-pointer focus:outline-none"
               >
+                {/* Dynamically render current custom scope if not in standard EXTENDED_SCOPE_OPTIONS list */}
+                {formData.scopeOfWork && !EXTENDED_SCOPE_OPTIONS.some(opt => opt.label.toLowerCase() === formData.scopeOfWork.toLowerCase() || opt.value.toLowerCase() === formData.scopeOfWork.toLowerCase()) && (
+                  <option value={formData.scopeOfWork} className="bg-white dark:bg-[#1E1E1E] text-[#D4AF37] font-semibold">
+                    {toTitleCase(formData.scopeOfWork)}
+                  </option>
+                )}
                 {EXTENDED_SCOPE_OPTIONS.map((opt) => (
                   <option key={opt.value} value={opt.label} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">
                     {opt.label}
@@ -383,13 +399,19 @@ export default function EditProjectModal({
                 className="w-full bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] focus:border-[#D4AF37] rounded-lg px-3 py-2 text-gray-900 dark:text-white cursor-pointer focus:outline-none"
               >
                 <option value="" className="bg-white dark:bg-[#1E1E1E] text-gray-500">Unassigned</option>
+                {/* Dynamically append assigned designer option if not already in filtered designerOptions */}
+                {formData.designerEmail && !designerOptions.some((d: any) => String(d.email || '').toLowerCase() === String(formData.designerEmail).toLowerCase()) && (
+                  <option value={formData.designerEmail} className="bg-white dark:bg-[#1E1E1E] text-[#D4AF37] font-semibold">
+                    {formatTwoPartName(getEmployeeNameEnhanced(formData.designerEmail, users))} ({formData.designerEmail})
+                  </option>
+                )}
                 {designerOptions.map((des: any) => (
                   <option 
                     key={des.email || des.id} 
                     value={des.email} 
                     className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white"
                   >
-                    {formatIndianName(des.name || des.displayName || des.email)} ({des.email})
+                    {formatTwoPartName(getEmployeeNameEnhanced(des.email, users))} ({des.email})
                   </option>
                 ))}
               </select>
@@ -435,10 +457,15 @@ export default function EditProjectModal({
                   type="number"
                   min="0"
                   step="any"
-                  value={formData.finalCost}
+                  value={formData.finalCost !== undefined && formData.finalCost !== null ? formData.finalCost : ''}
                   onChange={(e) => {
-                    const val = parseFloat(e.target.value) || 0;
-                    setFormData({ ...formData, finalCost: val, calculatedCost: val });
+                    const val = e.target.value;
+                    const parsed = val === '' ? '' : (isNaN(parseFloat(val)) ? '' : parseFloat(val));
+                    setFormData({
+                      ...formData,
+                      finalCost: parsed,
+                      calculatedCost: parsed
+                    });
                   }}
                   className="w-full bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] focus:border-[#D4AF37] rounded-lg px-3 py-2 text-gray-900 dark:text-white font-mono font-bold focus:outline-none"
                   required
@@ -454,8 +481,14 @@ export default function EditProjectModal({
                   type="number"
                   min="0"
                   step="any"
-                  value={formData.designerCommission}
-                  onChange={(e) => setFormData({ ...formData, designerCommission: parseFloat(e.target.value) || 0 })}
+                  value={formData.designerCommission !== undefined && formData.designerCommission !== null ? formData.designerCommission : ''}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setFormData({
+                      ...formData,
+                      designerCommission: val === '' ? '' : (isNaN(parseFloat(val)) ? '' : parseFloat(val))
+                    });
+                  }}
                   className="w-full bg-white dark:bg-[#1E1E1E] border border-gray-300 dark:border-[#333333] focus:border-[#D4AF37] rounded-lg px-3 py-2 text-gray-800 dark:text-gray-200 font-mono focus:outline-none"
                 />
                 <span className="text-[10px] text-gray-500 mt-1 block">Incentive paid to designer</span>
@@ -470,8 +503,14 @@ export default function EditProjectModal({
                   type="number"
                   min="0"
                   step="any"
-                  value={formData.salesCommission}
-                  onChange={(e) => setFormData({ ...formData, salesCommission: parseFloat(e.target.value) || 0 })}
+                  value={formData.salesCommission !== undefined && formData.salesCommission !== null ? formData.salesCommission : ''}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    setFormData({
+                      ...formData,
+                      salesCommission: val === '' ? '' : (isNaN(parseFloat(val)) ? '' : parseFloat(val))
+                    });
+                  }}
                   className="w-full bg-white dark:bg-[#1E1E1E] border border-[#D4AF37]/50 focus:border-[#D4AF37] rounded-lg px-3 py-2 text-[#D4AF37] font-mono font-bold focus:outline-none"
                 />
                 <span className="text-[10px] text-gray-500 mt-1 block">Persists to salesCommission & commission</span>
