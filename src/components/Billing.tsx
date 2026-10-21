@@ -259,9 +259,33 @@ export default function BillingModule({
   }, [externalProjects]);
 
   // Directive 2: Cross-reference projects against selected month using canonical date hierarchy
+// Helper to detect if project has an explicit unbilled upgrade in the target billing month
+function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
+  if (!project || !Array.isArray(project.upgradeHistory) || !month) return false;
+  const isGovindji = String(project.projectName || '').toLowerCase().includes('govindji');
+  return project.upgradeHistory.some((u: any) => {
+    if (!u || !u.upgradeDate) return false;
+    const upgradeMonth = String(u.upgradeDate).slice(0, 7);
+    if (upgradeMonth !== month) return false;
+    if (u.invoicedInPeriod) return false;
+    if (isGovindji) return true;
+    // Check if real scope change occurred
+    const prev = String(u.previousScope || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const cur = String(u.newScope || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    return prev !== cur;
+  });
+}
+  // Directive 1: Strict month filtering (Zero Month Leakage)
+  // A project belongs to billingMonth IF AND ONLY IF:
+  // 1. Its primary date is in this month: getProjectYearMonth(p) === billingMonth, OR
+  // 2. It has an explicit upgrade in p.upgradeHistory that occurred in this month and is unbilled:
   const projectsInSelectedMonth = useMemo(() => {
     if (!billingMonth) return [];
-    return externalProjects.filter((p) => getProjectYearMonth(p) === billingMonth);
+    return externalProjects.filter((p) => {
+      const isBaseMonth = getProjectYearMonth(p) === billingMonth;
+      if (isBaseMonth) return true;
+      return hasExplicitUpgradeInMonth(p, billingMonth);
+    });
   }, [externalProjects, billingMonth]);
 
   // Directive 2: Filter clients so the dropdown ONLY displays clients who have projects in the chosen month
@@ -659,7 +683,12 @@ export default function BillingModule({
       }
 
       const projYearMonth = getProjectYearMonth(proj);
-      return projYearMonth === targetMonth;
+      if (projYearMonth === targetMonth) {
+        return true;
+      }
+
+      // Past month project is mapped ONLY IF it has an explicit unbilled upgrade in targetMonth
+      return hasExplicitUpgradeInMonth(proj, targetMonth);
     });
 
     let detectedPendingNotices: {
@@ -773,8 +802,18 @@ export default function BillingModule({
           }
 
           // Standard / Upgraded Project Billing Engine:
-          // Check matching previous invoices
-          const matchingInvoices = findMatchingInvoicesForProject(p, invoices).filter((inv) => inv.id !== activeInv.id);
+          // Scan only invoices belonging strictly to this specific client that contain this specific project
+          const matchingInvoices = findMatchingInvoicesForProject(p, invoices).filter((inv) => {
+            if (inv.id === activeInv.id) return false;
+            // Strict client scoping to avoid any invoice cross-contamination
+            const invClientId = String(inv.clientId || '').trim().toLowerCase();
+            const invClientName = String(inv.client?.name || '').trim().toLowerCase();
+            const curClientId = String(targetClientId || '').trim().toLowerCase();
+            const curClientName = String(activeClient?.companyName || activeClient?.name || activeInv.client?.name || '').trim().toLowerCase();
+            const clientMatches = (invClientId && curClientId && invClientId === curClientId) ||
+                                  (invClientName && curClientName && invClientName === curClientName);
+            return clientMatches;
+          });
 
           if (matchingInvoices.length > 0) {
             // Prior Invoice is PAID
@@ -808,7 +847,7 @@ export default function BillingModule({
 
                 return {
                   id: uid('row'),
-                  desc: `${projName} (Upgraded from ${prevScopeName} - ₹${previouslyPaidAmount.toLocaleString('en-IN')} credited from Inv #${paidInvNumbers.join(', ')})`,
+                  desc: `${projName} — Upgraded to ${scope} (Full Package)`,
                   scope,
                   kw,
                   charge: evaluatedFullCost,
@@ -882,7 +921,8 @@ export default function BillingModule({
 
       setPendingNotices(detectedPendingNotices);
 
-      const effectiveAdvance = totalAdvanceCredit > 0 ? totalAdvanceCredit : activeInv.advance;
+      // Strictly scoped to current client: never inherit advance from another client
+      const effectiveAdvance = totalAdvanceCredit > 0 ? totalAdvanceCredit : 0;
 
       const nextTotals = calculateInvoiceTotals(
         mappedRows,
@@ -980,6 +1020,7 @@ export default function BillingModule({
         gstin: gstin,
         address: formattedAddress
       },
+      advance: 0, // Mandatory repair: Immediately reset advance to 0 upon client selection
       quotNo: quotNo || currentInvoice.quotNo,
       cgst: gstRule.cgst,
       sgst: gstRule.sgst,

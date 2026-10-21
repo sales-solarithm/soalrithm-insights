@@ -1,0 +1,290 @@
+const autoMapProjectsForClientAndMonth = (
+    targetClientId: string | null,
+    targetMonth: string,
+    baseInvState?: InvoiceData,
+    pendingResolutionMode: 'delta' | 'full' = 'delta'
+  ) => {
+    if (!targetClientId || !targetMonth) {
+      return;
+    }
+
+    const activeInv = baseInvState || currentInvoice;
+
+    // Retrieve full client object
+    const matchedEntry = filteredClientsForMonth.find((c) => c.id === targetClientId);
+    const activeClient = matchedEntry?.rawClient || externalClients.find((c) => c.id === targetClientId);
+
+    const matchingProjects = externalProjects.filter((proj) => {
+      const pClientId = proj.clientId || proj.matchedClient?.id;
+      const pClientName = String(proj.clientName || proj.matchedClient?.companyName || proj.matchedClient?.name || '').trim().toLowerCase();
+      const currentTargetName = String(activeInv.client?.name || '').trim().toLowerCase();
+
+      const idMatch = Boolean(targetClientId && pClientId === targetClientId);
+      const nameMatch = Boolean(currentTargetName && pClientName && pClientName === currentTargetName);
+
+      if (!idMatch && !nameMatch) {
+        return false;
+      }
+
+      const projYearMonth = getProjectYearMonth(proj);
+      return projYearMonth === targetMonth;
+    });
+
+    let detectedPendingNotices: {
+      projectId: string;
+      projectName: string;
+      invNo: string;
+      oldAmount: number;
+      newAmount: number;
+      deltaAmount: number;
+      invoiceId: string;
+    }[] = [];
+
+    let totalAdvanceCredit = 0;
+    let skippedAlreadyBilledCount = 0;
+    let processedQuotaProjectsCount = 0;
+
+    if (matchingProjects.length > 0) {
+      const mappedRows: InvoiceRow[] = matchingProjects
+        .map((p): InvoiceRow | null => {
+          const rawCapacity = String(p.plantCapacity || p.systemCapacity || p.capacity || p.kw || '0');
+          const kw = parseFloat(rawCapacity.replace(/[^\d.]/g, '')) || 0;
+
+          // Scope resolution
+          const rawScope = String(p.scopeOfWork || p.scope || p.workScope || 'Pre-Design').trim();
+          let scope: string = 'Pre-Design';
+          const foundScope = SCOPE_OPTIONS.find((s) => s.toLowerCase() === rawScope.toLowerCase());
+          if (foundScope) {
+            scope = foundScope;
+          } else if (rawScope.toLowerCase().includes('ceig')) {
+            scope = 'CEIG';
+          } else if (rawScope.toLowerCase().includes('pvsyst')) {
+            scope = 'PVsyst';
+          } else if (rawScope.toLowerCase().includes('detail')) {
+            scope = 'Detailed Engineering';
+          } else if (rawScope.toLowerCase().includes('permit')) {
+            scope = 'Permit Package';
+          } else {
+            scope = 'Standard Design';
+          }
+
+          const projName = p.projectName || p.name || p.projectTitle || (p.projectNumber ? `Project ${p.projectNumber}` : 'Solar Engineering Deliverable');
+
+          // Effective-dated tier resolution for client at project date
+          const pDate = getProjectDate(p) || new Date();
+          const effectiveTier = resolveEffectivePricingCategory(activeClient, pDate);
+
+          // Evaluate project cost
+          let evaluatedFullCost = 0;
+          if (isZeroOrPositive(p.finalCost)) {
+            evaluatedFullCost = Number(p.finalCost);
+          } else if (isZeroOrPositive(p.calculatedCost)) {
+            evaluatedFullCost = Number(p.calculatedCost);
+          } else if (isZeroOrPositive(p.cost)) {
+            evaluatedFullCost = Number(p.cost);
+          } else if (isZeroOrPositive(p.amount)) {
+            evaluatedFullCost = Number(p.amount);
+          } else {
+            // Dynamic evaluation via pricing slab and effective tier
+            const matchedRule = externalPricingRules.find((r) => {
+              const ruleCat = String(r.category || r.tier || 'T1').toUpperCase().trim();
+              const ruleScope = String(r.scope || r.scopeOfWork || '').toLowerCase().trim();
+              return ruleCat === effectiveTier && ruleScope === rawScope.toLowerCase().trim();
+            });
+            if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+              const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, kw);
+              if (matchedRow) {
+                evaluatedFullCost = calculateSlabCost(matchedRow, kw);
+              }
+            } else if (matchedRule && isZeroOrPositive(matchedRule.basePrice || matchedRule.price)) {
+              evaluatedFullCost = Number(matchedRule.basePrice || matchedRule.price || 0);
+            }
+          }
+
+          // Check if client has active Subscription Package
+          if (activeClient && activeClient.commercialModel === 'FIXED_PACKAGE' && activeClient.subscriptionPlan) {
+            const coverage = evaluateSubscriptionCoverage(activeClient, p, processedQuotaProjectsCount);
+
+            if (coverage.isCoveredScope && coverage.isDateWithinPlan) {
+              if (coverage.isQuotaCovered) {
+                processedQuotaProjectsCount += 1;
+                return {
+                  id: uid('row'),
+                  desc: `${projName} — Included in Active ${activeClient.subscriptionPlan.scopeCovered || scope} Package (Quota ${coverage.quotaIndex}/${coverage.totalAllowed})`,
+                  scope,
+                  kw,
+                  charge: 0,
+                  projectId: p.id
+                };
+              } else {
+                // OVER-QUOTA deliverable billed at client's effective Tier rate
+                return {
+                  id: uid('row'),
+                  desc: `${projName} — Over-Quota Deliverable (Billed at ${effectiveTier} kW rate)`,
+                  scope,
+                  kw,
+                  charge: evaluatedFullCost,
+                  projectId: p.id
+                };
+              }
+            } else {
+              // OUT-OF-PLAN Scope (CEIG, IFP, PVsyst, SLD, etc.)
+              return {
+                id: uid('row'),
+                desc: `${projName} — Standard ${scope} (Not covered by package)`,
+                scope,
+                kw,
+                charge: evaluatedFullCost,
+                projectId: p.id
+              };
+            }
+          }
+
+          // Standard / Upgraded Project Billing Engine:
+          // Check matching previous invoices
+          const matchingInvoices = findMatchingInvoicesForProject(p, invoices).filter((inv) => inv.id !== activeInv.id);
+
+          if (matchingInvoices.length > 0) {
+            // Prior Invoice is PAID
+            const paidInvoices = matchingInvoices.filter((inv) => {
+              const st = String(inv.status || '').toUpperCase().trim();
+              return st === 'PAID' || st === 'SETTLED' || st === 'FULL';
+            });
+
+            if (paidInvoices.length > 0) {
+              let previouslyPaidAmount = 0;
+              let paidInvNumbers: string[] = [];
+
+              paidInvoices.forEach((pInv) => {
+                paidInvNumbers.push(pInv.invNo || 'Prior');
+                (pInv.rows || []).forEach((r: any) => {
+                  const rProjId = String(r.projectId || '').trim();
+                  const rDesc = String(r.desc || '').toLowerCase();
+                  if (rProjId === p.id || (p.projectName && rDesc.includes(String(p.projectName).toLowerCase()))) {
+                    previouslyPaidAmount += Number(r.charge) || 0;
+                  }
+                });
+              });
+
+              if (previouslyPaidAmount > 0) {
+                totalAdvanceCredit += previouslyPaidAmount;
+
+                // Old scope from upgrade history or default
+                const prevScopeName = p.upgradeHistory && p.upgradeHistory.length > 0
+                  ? p.upgradeHistory[p.upgradeHistory.length - 1].previousScope
+                  : 'Previous Scope';
+
+                return {
+                  id: uid('row'),
+                  desc: `${projName} (Upgraded from ${prevScopeName} - ₹${previouslyPaidAmount.toLocaleString('en-IN')} credited from Inv #${paidInvNumbers.join(', ')})`,
+                  scope,
+                  kw,
+                  charge: evaluatedFullCost,
+                  projectId: p.id
+                };
+              }
+            }
+
+            // Prior Invoice is PENDING / UNPAID
+            const pendingInvoices = matchingInvoices.filter((inv) => {
+              const st = String(inv.status || '').toUpperCase().trim();
+              return st === 'PENDING' || st === 'PARTIALLY_PAID';
+            });
+
+            if (pendingInvoices.length > 0) {
+              const pInv = pendingInvoices[0];
+              let priorBilledAmount = 0;
+              (pInv.rows || []).forEach((r: any) => {
+                const rProjId = String(r.projectId || '').trim();
+                const rDesc = String(r.desc || '').toLowerCase();
+                if (rProjId === p.id || (p.projectName && rDesc.includes(String(p.projectName).toLowerCase()))) {
+                  priorBilledAmount += Number(r.charge) || 0;
+                }
+              });
+
+              detectedPendingNotices.push({
+                projectId: p.id,
+                projectName: projName,
+                invNo: pInv.invNo || 'Pending',
+                oldAmount: priorBilledAmount,
+                newAmount: evaluatedFullCost,
+                deltaAmount: Math.max(0, evaluatedFullCost - priorBilledAmount),
+                invoiceId: pInv.id
+              });
+
+              if (pendingResolutionMode === 'delta') {
+                const delta = Math.max(0, evaluatedFullCost - priorBilledAmount);
+                return {
+                  id: uid('row'),
+                  desc: `${projName} (Incremental Upgrade Delta - Prior Inv #${pInv.invNo} ₹${priorBilledAmount.toLocaleString('en-IN')})`,
+                  scope,
+                  kw,
+                  charge: delta,
+                  projectId: p.id
+                };
+              } else {
+                // Full amount billing
+                return {
+                  id: uid('row'),
+                  desc: `${projName} (Full Scope Upgrade - Superseding Inv #${pInv.invNo})`,
+                  scope,
+                  kw,
+                  charge: evaluatedFullCost,
+                  projectId: p.id
+                };
+              }
+            }
+          }
+
+          // Standard First-Time Project Billing
+          return {
+            id: uid('row'),
+            desc: projName,
+            scope,
+            kw,
+            charge: evaluatedFullCost,
+            projectId: p.id
+          };
+        })
+        .filter((row): row is InvoiceRow => row !== null);
+
+      setPendingNotices(detectedPendingNotices);
+
+      const effectiveAdvance = totalAdvanceCredit > 0 ? totalAdvanceCredit : activeInv.advance;
+
+      const nextTotals = calculateInvoiceTotals(
+        mappedRows,
+        activeInv.sgst,
+        activeInv.cgst,
+        activeInv.igst,
+        effectiveAdvance
+      );
+
+      setCurrentInvoice((prev) => ({
+        ...prev,
+        rows: mappedRows,
+        advance: effectiveAdvance,
+        totals: nextTotals
+      }));
+
+      setIsDirty(true);
+
+      if (mappedRows.length === 0 && skippedAlreadyBilledCount > 0) {
+        showToast(
+          `All ${skippedAlreadyBilledCount} project(s) for ${targetMonth} are already billed.`,
+          'info'
+        );
+      } else if (totalAdvanceCredit > 0) {
+        showToast(
+          `Auto-mapped ${mappedRows.length} project(s) with ₹${totalAdvanceCredit.toLocaleString('en-IN')} Prior Payment Credit applied ✓`,
+          'success'
+        );
+      } else {
+        showToast(`Auto-mapped ${mappedRows.length} project(s) for ${targetMonth} ✓`, 'success');
+      }
+    } else {
+      setPendingNotices([]);
+      showToast(`No projects found for selected client in ${targetMonth}`, 'info');
+    }
+  };
+  

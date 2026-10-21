@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { 
   X, 
   Save, 
@@ -24,31 +24,45 @@ import {
   toTitleCase, 
   SCOPE_LABELS,
   getEmployeeNameEnhanced,
-  formatTwoPartName
+  formatTwoPartName,
+  toCanonicalScopeKey
 } from '@/src/lib/projectUtils';
+import { useDynamicTaxonomy } from '@/src/lib/taxonomyService';
 
 export interface EditProjectModalProps {
   isOpen: boolean;
   project: any;
   clients?: any[];
   users?: any[];
+  scopes?: any[];
   onClose: () => void;
   onSave: (updatedData: any) => Promise<void> | void;
   isSaving?: boolean;
 }
 
-export const EXTENDED_SCOPE_OPTIONS = [
-  { value: 'preDesign', label: 'Pre-Design' },
-  { value: 'detailedEngineering', label: 'Detailed Engineering' },
-  { value: 'postDesign', label: 'Post-Design' },
-  { value: 'pvsyst', label: 'PVsyst Simulation' },
-  { value: 'sld', label: 'Single Line Diagram (SLD)' },
-  { value: 'peStamping', label: 'PE Stamping Review' },
-  { value: 'ceig', label: 'CEIG Package' },
-  { value: 'asBuilt', label: 'As-Built Drawings' },
-  { value: 'bom', label: 'Bill of Materials (BOM)' },
-  { value: 'interconnection', label: 'Interconnection Package' }
-];
+// Canonical Display Labels for Standard Scopes
+const CANONICAL_SCOPE_DISPLAY_LABELS: Record<string, string> = {
+  preDesign: 'Pre-Design',
+  postDesign: 'Post-Design',
+  detailedEngineering: 'Detailed Engineering',
+  pvsyst: 'PVsyst',
+  ceig: 'CEIG Package',
+  ifp: 'IFP Process',
+  sld: 'Single Line Diagram (SLD)',
+  bom: 'Bill of Materials (BOM)',
+  peStamping: 'PE Stamping Review',
+  asBuilt: 'As-Built Drawings',
+  interconnection: 'Interconnection Package',
+  ceiLayouts: 'CEI Layouts',
+  pipeCalculation: 'Pipe Calculation',
+  preDesignCeigIfp: 'Pre-Design + CEIG + IFP',
+  postDesignCeigIfp: 'Post-Design + CEIG + IFP',
+  preDesignPvsyst: 'Pre-Design + PVsyst',
+  postDesignPvsyst: 'Post-Design + PVsyst',
+  preDesignPvsystCeigIfp: 'Pre-Design + PVsyst + CEIG + IFP',
+  postDesignPvsystCeigIfp: 'Post-Design + PVsyst + CEIG + IFP',
+};
+
 
 function getInitialProjectFormData(project: any) {
   if (!project) {
@@ -101,7 +115,11 @@ function getInitialProjectFormData(project: any) {
     clientId: project.clientId || project.matchedClient?.id || '',
     plantCapacity: numCap,
     capacityUnit: project.capacityUnit || 'KW',
-    scopeOfWork: project.scopeOfWork || project.scope || 'Detailed Engineering',
+    scopeOfWork: (() => {
+      const raw = project.scopeOfWork || project.scope || 'Detailed Engineering';
+      const key = toCanonicalScopeKey(raw);
+      return CANONICAL_SCOPE_DISPLAY_LABELS[key] || toTitleCase(raw);
+    })(),
     subService: project.subService || 'Standard',
     projectDate: dateFormatted,
     designerEmail: project.designerEmail || project.designer_email || project.designer || project.assignedDesigner || '',
@@ -121,10 +139,13 @@ export default function EditProjectModal({
   project,
   clients = [],
   users = [],
+  scopes = [],
   onClose,
   onSave,
   isSaving = false
 }: EditProjectModalProps) {
+  // Dynamic Taxonomy from Firestore (/scopes, /pricingRules, /metadata/taxonomies)
+  const { canonicalScopes } = useDynamicTaxonomy();
   // Sync state cleanly when project prop changes without useEffect
   const [prevProjectId, setPrevProjectId] = useState<string | null>(project?.id || null);
   const [formData, setFormData] = useState<any>(() => getInitialProjectFormData(project));
@@ -137,6 +158,58 @@ export default function EditProjectModal({
   }
 
   if (!isOpen || !project) return null;
+
+  // Deduplicated & Canonical Scope Options (Collapses 'Pre Design' and 'Pre-Design' into one)
+  const dynamicScopeOptions = useMemo(() => {
+    const scopeMap = new Map<string, { value: string; label: string }>();
+
+    // 1. Ingest scopes from Dynamic Firestore Taxonomy & passed scopes prop
+    const rawSources: any[] = [...(canonicalScopes || []), ...(scopes || [])];
+
+    rawSources.forEach((s: any) => {
+      const raw = typeof s === 'string' ? s : (s?.name || s?.scopeOfWork || s?.scope || s?.title || '');
+      if (!raw || !String(raw).trim()) return;
+      const trimmed = String(raw).trim();
+      const canonKey = toCanonicalScopeKey(trimmed);
+      if (!scopeMap.has(canonKey)) {
+        const cleanLabel = CANONICAL_SCOPE_DISPLAY_LABELS[canonKey] || toTitleCase(trimmed);
+        scopeMap.set(canonKey, { value: cleanLabel, label: cleanLabel });
+      }
+    });
+
+    // 2. Ensure standard architectural scopes are always available if DB is loading
+    const defaultFallbacks = [
+      'Pre-Design',
+      'Detailed Engineering',
+      'Post-Design',
+      'PVsyst',
+      'CEI Layouts',
+      'Pipe Calculation',
+      'Single Line Diagram (SLD)',
+      'Pre-Design + PVsyst',
+      'Pre-Design + CEIG + IFP',
+      'Post-Design + CEIG + IFP'
+    ];
+    defaultFallbacks.forEach((fb) => {
+      const canonKey = toCanonicalScopeKey(fb);
+      if (!scopeMap.has(canonKey)) {
+        const cleanLabel = CANONICAL_SCOPE_DISPLAY_LABELS[canonKey] || fb;
+        scopeMap.set(canonKey, { value: cleanLabel, label: cleanLabel });
+      }
+    });
+
+    // 3. Ensure active project's scope is present
+    const projScope = project?.scopeOfWork || project?.scope || formData.scopeOfWork || '';
+    if (projScope && String(projScope).trim()) {
+      const canonKey = toCanonicalScopeKey(String(projScope).trim());
+      if (!scopeMap.has(canonKey)) {
+        const cleanLabel = CANONICAL_SCOPE_DISPLAY_LABELS[canonKey] || toTitleCase(String(projScope).trim());
+        scopeMap.set(canonKey, { value: cleanLabel, label: cleanLabel });
+      }
+    }
+
+    return Array.from(scopeMap.values()).sort((a, b) => a.label.localeCompare(b.label));
+  }, [canonicalScopes, scopes, project, formData.scopeOfWork]);
 
   // Filter designer employees
   const designerOptions = (users || []).filter((u: any) => {
@@ -357,14 +430,8 @@ export default function EditProjectModal({
                 onChange={(e) => setFormData({ ...formData, scopeOfWork: e.target.value })}
                 className="w-full bg-gray-50 dark:bg-[#121212] border border-gray-300 dark:border-[#333333] focus:border-[#D4AF37] rounded-lg px-3 py-2 text-gray-900 dark:text-white cursor-pointer focus:outline-none"
               >
-                {/* Dynamically render current custom scope if not in standard EXTENDED_SCOPE_OPTIONS list */}
-                {formData.scopeOfWork && !EXTENDED_SCOPE_OPTIONS.some(opt => opt.label.toLowerCase() === formData.scopeOfWork.toLowerCase() || opt.value.toLowerCase() === formData.scopeOfWork.toLowerCase()) && (
-                  <option value={formData.scopeOfWork} className="bg-white dark:bg-[#1E1E1E] text-[#D4AF37] font-semibold">
-                    {toTitleCase(formData.scopeOfWork)}
-                  </option>
-                )}
-                {EXTENDED_SCOPE_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.label} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">
+                {dynamicScopeOptions.map((opt: { value: string; label: string }) => (
+                  <option key={opt.value} value={opt.value} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">
                     {opt.label}
                   </option>
                 ))}
