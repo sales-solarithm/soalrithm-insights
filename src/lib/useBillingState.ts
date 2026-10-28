@@ -36,6 +36,7 @@ import { syncInvoiceProjectsToFirestore } from './projectSync';
 export function blankInvoice(settings: InvoiceSettings, companyOverride?: CompanySettings): InvoiceData {
   const company = companyOverride || getInitialCompanySettings();
   const effectiveBank = company.bank || settings.bank;
+
   return {
     id: uid('inv'),
     _isNew: true,
@@ -126,47 +127,59 @@ export function useBillingState() {
   const [isDirty, setIsDirty] = useState<boolean>(false);
   const [isLoaded, setIsLoaded] = useState<boolean>(false);
   const hasMigratedRef = useRef(false);
-  const invoicesRef = useRef<InvoiceData[]>(invoices);
 
+  const invoicesRef = useRef<InvoiceData[]>(invoices);
   useEffect(() => {
     invoicesRef.current = invoices;
   }, [invoices]);
 
-  // Firestore is now the source of truth for invoices. On first load, any
-  // invoice that only ever existed in this browser's localStorage is
-  // additively merged into Firestore by ID -- existing Firestore invoices
-  // are never overwritten, and local storage is never cleared
-  // automatically, so no browser's historical invoices can be silently
-  // lost even if several browsers each held different local invoices.
+  // Firestore subscription for invoices collection
   useEffect(() => {
-    const invoicesRef = collection(db, COLLECTIONS.INVOICES);
-
+    const invoicesCollRef = collection(db, COLLECTIONS.INVOICES);
     const unsubscribe = onSnapshot(
-      invoicesRef,
+      invoicesCollRef,
       async (snapshot) => {
-        const firestoreInvoices = snapshot.docs.map((d) => d.data() as InvoiceData);
+        // Point 1: Explicitly map document ID to prevent ID collisions or undefined drop
+        const firestoreInvoices = snapshot.docs.map((d) => {
+          const raw = d.data() as InvoiceData;
+          return {
+            ...raw,
+            id: d.id || raw.id
+          };
+        });
 
-        if (!hasMigratedRef.current) {
-          hasMigratedRef.current = true;
-          try {
-            const alreadyMigrated = localStorage.getItem('solarithm_billing_migrated_v1') === 'true';
-            if (!alreadyMigrated) {
-              const localInvoices = getInitialInvoices();
-              const existingIds = new Set(firestoreInvoices.map((inv) => inv.id));
-              const missing = localInvoices.filter((inv) => inv.id && !existingIds.has(inv.id));
-              if (missing.length > 0) {
-                await Promise.all(
-                  missing.map((inv) => setDoc(doc(db, COLLECTIONS.INVOICES, inv.id), inv, { merge: true }))
-                );
-              }
-              // Local copies are deliberately left in place -- this only
-              // marks the one-time migration attempt as done so it does not
-              // repeat needlessly on every load.
-              localStorage.setItem('solarithm_billing_migrated_v1', 'true');
+        // Point 4: Self-Healing Local Storage Rescue
+        // Check localStorage for invoices whose invNo or id is missing from Firestore snapshot
+        try {
+          const localInvoices = getInitialInvoices();
+          if (localInvoices.length > 0) {
+            const existingIds = new Set(firestoreInvoices.map((inv) => inv.id));
+            const existingInvNos = new Set(
+              firestoreInvoices.map((inv) => (inv.invNo || '').trim().toLowerCase()).filter(Boolean)
+            );
+
+            const lostInvoices = localInvoices.filter((loc) => {
+              if (!loc) return false;
+              const hasMatchingId = loc.id && existingIds.has(loc.id);
+              const locNo = (loc.invNo || '').trim().toLowerCase();
+              const hasMatchingNo = locNo && existingInvNos.has(locNo);
+              // If neither id nor invNo exists in Firestore, it was lost or unsynced
+              return !hasMatchingId && !hasMatchingNo;
+            });
+
+            if (lostInvoices.length > 0 && db) {
+              console.info(`[BillingRescue] Rescuing ${lostInvoices.length} local invoice(s) missing from Firestore...`);
+              await Promise.all(
+                lostInvoices.map((inv) => {
+                  const targetId = inv.id || uid('inv');
+                  const payload = { ...inv, id: targetId };
+                  return setDoc(doc(db, COLLECTIONS.INVOICES, targetId), payload, { merge: true });
+                })
+              );
             }
-          } catch (e) {
-            console.error('Error migrating local invoices to Firestore:', e);
           }
+        } catch (e) {
+          console.warn('[BillingRescue] Local invoice recovery notice:', e);
         }
 
         setInvoicesState(firestoreInvoices);
@@ -177,7 +190,6 @@ export function useBillingState() {
         setIsLoaded(true);
       }
     );
-
     return () => unsubscribe();
   }, []);
 
@@ -195,27 +207,25 @@ export function useBillingState() {
           email: updatedComp.email,
           address: updatedComp.address,
           logo: updatedComp.logo,
-          bank: { ...prev.bank, ...updatedComp.bank }
+          bank: {
+            name: updatedComp.bank.name,
+            acc: updatedComp.bank.acc,
+            accName: updatedComp.bank.accName,
+            ifsc: updatedComp.bank.ifsc,
+            upi: updatedComp.bank.upi,
+            branch: updatedComp.bank.branch
+          }
         }));
       }
     };
-
-    window.addEventListener('solarithm_company_settings_changed', handleCompanyUpdate);
-    return () => {
-      window.removeEventListener('solarithm_company_settings_changed', handleCompanyUpdate);
-    };
+    window.addEventListener((COMPANY_STORAGE_KEYS as any).updateEvent || 'solarithm_company_settings_updated', handleCompanyUpdate);
+    return () => window.removeEventListener((COMPANY_STORAGE_KEYS as any).updateEvent || 'solarithm_company_settings_updated', handleCompanyUpdate);
   }, []);
 
   const saveSettings = useCallback((newSettings: InvoiceSettings) => {
     setSettingsState(newSettings);
     try {
-      const billingSpecifics = {
-        signature: newSettings.signature,
-        defaultGST: newSettings.defaultGST,
-        terms: newSettings.terms,
-        nextInvNo: newSettings.nextInvNo
-      };
-      localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(billingSpecifics));
+      localStorage.setItem(STORAGE_KEYS.settings, JSON.stringify(newSettings));
     } catch (e) {
       console.error('Error saving settings to localStorage:', e);
     }
@@ -231,108 +241,221 @@ export function useBillingState() {
       } catch (e) {
         console.error('Error mirroring invoices to localStorage:', e);
       }
-
-      // Full reconcile against Firestore: upsert everything present in
-      // newInvoices, and remove anything that existed before but was
-      // dropped from this array (e.g. a bulk "clear all" action) -- so
-      // Firestore never silently diverges from what the UI shows.
-      (async () => {
-        try {
-          const batch = writeBatch(db);
-          const newIds = new Set(newInvoices.filter((inv) => inv.id).map((inv) => inv.id));
-          invoices.forEach((inv) => {
-            if (inv.id && !newIds.has(inv.id)) {
-              batch.delete(doc(db, COLLECTIONS.INVOICES, inv.id));
-            }
-          });
-          newInvoices.forEach((inv) => {
-            if (inv.id) {
-              batch.set(doc(db, COLLECTIONS.INVOICES, inv.id), inv, { merge: true });
-            }
-          });
-          await batch.commit();
-        } catch (e) {
-          console.error('Error syncing invoices to Firestore:', e);
-        }
-      })();
+      // Note: Targeted Firestore updates are executed by saveCurrentDraft, updateInvoiceStatus,
+      // and deleteInvoice. Full-collection batch overwrites have been permanently removed.
     },
-    [invoices]
+    []
   );
 
-  const updateInvoiceStatus = useCallback((id: string, newStatus: string, amountReceived?: number) => {
-    setInvoicesState((prev) => {
-      const updatedInvoices = prev.map((inv) => {
-        if (inv.id === id) {
-          const updated: InvoiceData = {
-            ...inv,
-            status: newStatus,
-            updatedAt: new Date().toISOString()
-          };
-          if (amountReceived !== undefined && !isNaN(amountReceived)) {
-            updated.amountReceived = amountReceived;
-          }
-          return updated;
-        }
-        return inv;
-      });
+  const startNewInvoice = useCallback(() => {
+    const fresh = blankInvoice(settings);
+    setCurrentInvoice(fresh);
+    setIsDirty(false);
+    return fresh;
+  }, [settings]);
 
+  const loadInvoice = useCallback((id: string) => {
+    const found = invoices.find((x) => x.id === id);
+    if (!found) return null;
+    const copy: InvoiceData = JSON.parse(JSON.stringify(found));
+    copy._isNew = false;
+    setCurrentInvoice(copy);
+    setIsDirty(false);
+    return copy;
+  }, [invoices]);
+
+  const duplicateInvoice = useCallback(() => {
+    if (currentInvoice._isNew) return null;
+    const copy: InvoiceData = JSON.parse(JSON.stringify(currentInvoice));
+    copy.id = uid('inv');
+    copy._isNew = true;
+    copy.invNo = settings.nextInvNo;
+    copy.status = 'PENDING';
+    copy.amountReceived = 0;
+    copy.invDate = todayISO();
+    copy.invDue = addDaysISO(todayISO(), 7);
+    copy.rows = copy.rows.map((r) => ({ ...r, id: uid('row') }));
+    copy.createdAt = new Date().toISOString();
+    copy.updatedAt = new Date().toISOString();
+    setCurrentInvoice(copy);
+    setIsDirty(true);
+    return copy;
+  }, [currentInvoice, settings.nextInvNo]);
+
+  const saveCurrentDraft = useCallback(
+    (invoiceToSave: InvoiceData) => {
+      const totals = calculateInvoiceTotals(
+        invoiceToSave.rows,
+        invoiceToSave.sgst,
+        invoiceToSave.cgst,
+        invoiceToSave.igst,
+        invoiceToSave.advance
+      );
+
+      // Point 2: Overwrite Prevention Check
+      // If invoiceToSave.id exists, but its invNo does not match the invoice originally
+      // stored under that ID, the user created a new invoice without clicking '+ New'.
+      // In that case, generate a new id so it never overwrites the previously saved invoice.
+      let effectiveId = invoiceToSave.id || uid('inv');
+      const existingDoc = invoices.find((inv) => inv.id === effectiveId);
+      if (
+        existingDoc &&
+        existingDoc.invNo &&
+        invoiceToSave.invNo &&
+        existingDoc.invNo.trim().toLowerCase() !== invoiceToSave.invNo.trim().toLowerCase()
+      ) {
+        effectiveId = uid('inv');
+      }
+
+      const data: InvoiceData = {
+        ...invoiceToSave,
+        id: effectiveId,
+        totals,
+        updatedAt: new Date().toISOString()
+      };
+
+      if (data._isNew || effectiveId !== invoiceToSave.id) {
+        if (data.invNo === settings.nextInvNo) {
+          const next = generateNextInvoiceNumber(settings.nextInvNo);
+          const updatedSettings = { ...settings, nextInvNo: next };
+          saveSettings(updatedSettings);
+        }
+        delete data._isNew;
+      }
+
+      const updatedInvoices = [...invoices];
+      const idx = updatedInvoices.findIndex((inv) => inv.id === data.id);
+      if (idx >= 0) {
+        updatedInvoices[idx] = data;
+      } else {
+        updatedInvoices.push(data);
+      }
+
+      setInvoicesState(updatedInvoices);
       try {
+        localStorage.setItem('invoices', JSON.stringify(updatedInvoices));
+        localStorage.setItem('billing', JSON.stringify(updatedInvoices));
         localStorage.setItem(STORAGE_KEYS.invoices, JSON.stringify(updatedInvoices));
       } catch (e) {
-        console.error('Error mirroring invoice status locally:', e);
+        console.error('Error mirroring invoices to localStorage:', e);
       }
 
-      return updatedInvoices;
-    });
-
-    const nowIsoStr = new Date().toISOString();
-    const firestoreUpdate: Record<string, any> = { status: newStatus, updatedAt: nowIsoStr };
-    if (amountReceived !== undefined && !isNaN(amountReceived)) {
-      firestoreUpdate.amountReceived = amountReceived;
-    }
-    if (newStatus === 'PAID') {
-      firestoreUpdate.paymentDate = nowIsoStr;
-      firestoreUpdate.salesIncentiveStatus = 'ELIGIBLE';
-    } else {
-      firestoreUpdate.salesIncentiveStatus = 'PENDING';
-    }
-    updateDoc(doc(db, COLLECTIONS.INVOICES, id), firestoreUpdate).catch((e) =>
-      console.error('Error updating invoice status in Firestore:', e)
-    );
-
-    const matchingInv = invoicesRef.current.find((x) => x.id === id);
-    if (matchingInv) {
-      syncInvoiceProjectsToFirestore({ ...matchingInv, status: newStatus }, newStatus).catch((e) =>
-        console.warn('Error syncing projects in updateInvoiceStatus:', e)
+      // Write only the single changed document -- avoids rewriting every invoice in Firestore
+      setDoc(doc(db, COLLECTIONS.INVOICES, data.id), data, { merge: true }).catch((e) =>
+        console.error('Error saving invoice to Firestore:', e)
       );
-    }
 
-    // Also sync currentInvoice if the currently open invoice is being edited
-    setCurrentInvoice((curr) => {
-      if (curr.id === id) {
-        const copy = { ...curr, status: newStatus };
-        if (amountReceived !== undefined && !isNaN(amountReceived)) {
-          copy.amountReceived = amountReceived;
-        }
-        return copy;
+      setCurrentInvoice(data);
+      setIsDirty(false);
+      return data;
+    },
+    [invoices, settings, saveSettings]
+  );
+
+  const deleteInvoice = useCallback(
+    (id: string) => {
+      const updated = invoices.filter((x) => x.id !== id);
+      setInvoicesState(updated);
+      try {
+        localStorage.setItem('invoices', JSON.stringify(updated));
+        localStorage.setItem('billing', JSON.stringify(updated));
+        localStorage.setItem(STORAGE_KEYS.invoices, JSON.stringify(updated));
+      } catch (e) {
+        console.error('Error updating local storage on delete:', e);
       }
-      return curr;
-    });
-  }, []);
+
+      // Mutate ONLY the single deleted document
+      if (db && id) {
+        deleteDoc(doc(db, COLLECTIONS.INVOICES, id)).catch((err) =>
+          console.error('[useBillingState] Error deleting invoice doc:', err)
+        );
+      }
+
+      if (currentInvoice.id === id) {
+        setCurrentInvoice(blankInvoice(settings));
+        setIsDirty(false);
+      }
+    },
+    [invoices, currentInvoice.id, settings]
+  );
+
+  const updateInvoiceStatus = useCallback(
+    (id: string, newStatus: string, amountReceived?: number, knownProjects: any[] = []) => {
+      setInvoicesState((prev) => {
+        const updatedInvoices = prev.map((inv) => {
+          if (inv.id === id) {
+            const updated: InvoiceData = {
+              ...inv,
+              status: newStatus,
+              updatedAt: new Date().toISOString()
+            };
+            if (amountReceived !== undefined && !isNaN(amountReceived)) {
+              updated.amountReceived = amountReceived;
+            }
+            return updated;
+          }
+          return inv;
+        });
+
+        try {
+          localStorage.setItem(STORAGE_KEYS.invoices, JSON.stringify(updatedInvoices));
+        } catch (e) {
+          console.error('Error mirroring invoice status locally:', e);
+        }
+
+        return updatedInvoices;
+      });
+
+      const nowIsoStr = new Date().toISOString();
+      const firestoreUpdate: Record<string, any> = { status: newStatus, updatedAt: nowIsoStr };
+      if (amountReceived !== undefined && !isNaN(amountReceived)) {
+        firestoreUpdate.amountReceived = amountReceived;
+      }
+      if (newStatus === 'PAID') {
+        firestoreUpdate.paymentDate = nowIsoStr;
+        firestoreUpdate.salesIncentiveStatus = 'ELIGIBLE';
+      } else {
+        firestoreUpdate.salesIncentiveStatus = 'PENDING';
+      }
+
+      if (db) {
+        updateDoc(doc(db, COLLECTIONS.INVOICES, id), firestoreUpdate).catch((e) =>
+          console.error('Error updating invoice status in Firestore:', e)
+        );
+      }
+
+      const matchingInv = invoicesRef.current.find((x) => x.id === id);
+      if (matchingInv && knownProjects.length > 0) {
+        syncInvoiceProjectsToFirestore({ ...matchingInv, status: newStatus }, newStatus, knownProjects).catch((e) =>
+          console.warn('Error syncing projects in updateInvoiceStatus:', e)
+        );
+      }
+
+      setCurrentInvoice((curr) => {
+        if (curr.id === id) {
+          const copy = { ...curr, status: newStatus };
+          if (amountReceived !== undefined && !isNaN(amountReceived)) {
+            copy.amountReceived = amountReceived;
+          }
+          return copy;
+        }
+        return curr;
+      });
+    },
+    []
+  );
 
   /**
    * Atomic two-way sync: logs a payment against an invoice and updates that
-   * invoice's status/amountReceived in a single Firestore transaction, so the
-   * income ledger and the invoice can never drift out of sync with each
-   * other. `newAmountReceivedTotal` matches the existing "Record Partial
-   * Payment" modal's semantics -- it's the running total received on this
-   * invoice (the modal's 25/50/75/100% presets are fractions of the total
-   * payable), not a fresh incremental payment. The income document still
-   * records the incremental delta, since that's the actual amount received
-   * in this transaction.
+   * invoice's status/amountReceived in a single Firestore transaction.
    */
   const logRevenueForInvoice = useCallback(
-    async (invoiceId: string, newAmountReceivedTotal: number, meta?: { note?: string; loggedBy?: string }) => {
+    async (
+      invoiceId: string,
+      newAmountReceivedTotal: number,
+      meta?: { note?: string; loggedBy?: string },
+      knownProjects: any[] = []
+    ) => {
       if (!invoiceId || isNaN(newAmountReceivedTotal) || newAmountReceivedTotal < 0) {
         throw new Error('A valid invoice and a non-negative amount received are required to log revenue.');
       }
@@ -384,8 +507,7 @@ export function useBillingState() {
         return { newStatus, newAmountReceived: newAmountReceivedTotal };
       });
 
-      // Optimistic local mirror -- the live onSnapshot listener will confirm
-      // this shortly after, so this just avoids a visible flicker/delay.
+      // Optimistic local mirror
       setInvoicesState((prev) =>
         prev.map((inv) =>
           inv.id === invoiceId
@@ -398,8 +520,8 @@ export function useBillingState() {
       );
 
       const invToSync = invoicesRef.current.find((x) => x.id === invoiceId);
-      if (invToSync) {
-        syncInvoiceProjectsToFirestore({ ...invToSync, status: result.newStatus }, result.newStatus).catch((e) =>
+      if (invToSync && knownProjects.length > 0) {
+        syncInvoiceProjectsToFirestore({ ...invToSync, status: result.newStatus }, result.newStatus, knownProjects).catch((e) =>
           console.warn('Error syncing projects in logRevenueForInvoice:', e)
         );
       }
@@ -408,108 +530,6 @@ export function useBillingState() {
     },
     []
   );
-
-  const saveCurrentDraft = useCallback(
-    (invoiceToSave: InvoiceData) => {
-      const totals = calculateInvoiceTotals(
-        invoiceToSave.rows,
-        invoiceToSave.sgst,
-        invoiceToSave.cgst,
-        invoiceToSave.igst,
-        invoiceToSave.advance
-      );
-
-      const data: InvoiceData = {
-        ...invoiceToSave,
-        totals,
-        updatedAt: new Date().toISOString()
-      };
-
-      if (data._isNew) {
-        if (data.invNo === settings.nextInvNo) {
-          const next = generateNextInvoiceNumber(settings.nextInvNo);
-          const updatedSettings = { ...settings, nextInvNo: next };
-          saveSettings(updatedSettings);
-        }
-        delete data._isNew;
-      }
-
-      const updatedInvoices = [...invoices];
-      const idx = updatedInvoices.findIndex((inv) => inv.id === data.id);
-      if (idx >= 0) {
-        updatedInvoices[idx] = data;
-      } else {
-        updatedInvoices.push(data);
-      }
-
-      setInvoicesState(updatedInvoices);
-      try {
-        localStorage.setItem('invoices', JSON.stringify(updatedInvoices));
-        localStorage.setItem('billing', JSON.stringify(updatedInvoices));
-        localStorage.setItem(STORAGE_KEYS.invoices, JSON.stringify(updatedInvoices));
-      } catch (e) {
-        console.error('Error mirroring invoices to localStorage:', e);
-      }
-
-      // Write only the single changed document -- avoids rewriting every
-      // invoice in Firestore on every draft save.
-      setDoc(doc(db, COLLECTIONS.INVOICES, data.id), data, { merge: true }).catch((e) =>
-        console.error('Error saving invoice to Firestore:', e)
-      );
-
-      setCurrentInvoice(data);
-      setIsDirty(false);
-      return data;
-    },
-    [invoices, settings, saveSettings]
-  );
-
-  const deleteInvoice = useCallback(
-    (id: string) => {
-      const updated = invoices.filter((x) => x.id !== id);
-      saveInvoices(updated);
-      if (currentInvoice.id === id) {
-        setCurrentInvoice(blankInvoice(settings));
-        setIsDirty(false);
-      }
-    },
-    [invoices, currentInvoice.id, settings, saveInvoices]
-  );
-
-  const startNewInvoice = useCallback(() => {
-    const fresh = blankInvoice(settings);
-    setCurrentInvoice(fresh);
-    setIsDirty(false);
-    return fresh;
-  }, [settings]);
-
-  const loadInvoice = useCallback((id: string) => {
-    const found = invoices.find((x) => x.id === id);
-    if (!found) return null;
-    const copy: InvoiceData = JSON.parse(JSON.stringify(found));
-    copy._isNew = false;
-    setCurrentInvoice(copy);
-    setIsDirty(false);
-    return copy;
-  }, [invoices]);
-
-  const duplicateInvoice = useCallback(() => {
-    if (currentInvoice._isNew) return null;
-    const copy: InvoiceData = JSON.parse(JSON.stringify(currentInvoice));
-    copy.id = uid('inv');
-    copy._isNew = true;
-    copy.invNo = settings.nextInvNo;
-    copy.status = 'draft';
-    copy.amountReceived = 0;
-    copy.invDate = todayISO();
-    copy.invDue = addDaysISO(todayISO(), 7);
-    copy.rows = copy.rows.map((r) => ({ ...r, id: uid('row') }));
-    copy.createdAt = new Date().toISOString();
-    copy.updatedAt = new Date().toISOString();
-    setCurrentInvoice(copy);
-    setIsDirty(true);
-    return copy;
-  }, [currentInvoice, settings.nextInvNo]);
 
   return {
     isLoaded,

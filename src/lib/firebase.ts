@@ -1,5 +1,5 @@
 import { initializeApp, getApps, getApp, FirebaseApp } from "firebase/app";
-import { getFirestore, Firestore } from "firebase/firestore";
+import { initializeFirestore, getFirestore, Firestore } from "firebase/firestore";
 import { getAuth, Auth } from "firebase/auth";
 
 const firebaseConfig = {
@@ -17,20 +17,21 @@ let auth: Auth;
 
 try {
   app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
-  db = getFirestore(app);
+  // Force long polling to prevent WebChannel stream timeouts (10-second hang)
+  db = initializeFirestore(app, {
+    experimentalForceLongPolling: true,
+  });
   auth = getAuth(app);
 } catch (initErr) {
-  console.warn("Firebase primary initialization error, instantiating fallback instance:", initErr);
+  app = getApp();
   try {
-    app = initializeApp(firebaseConfig, "solarithm-fallback");
+    db = initializeFirestore(app, {
+      experimentalForceLongPolling: true,
+    });
+  } catch {
     db = getFirestore(app);
-    auth = getAuth(app);
-  } catch (secondErr) {
-    console.error("Critical: Firebase failed to initialize:", secondErr);
-    app = getApp();
-    db = getFirestore(app);
-    auth = getAuth(app);
   }
+  auth = getAuth(app);
 }
 
 export { app, db, auth };

@@ -29,7 +29,9 @@ import {
   resolveProjectPaymentStatus,
   findMatchingInvoicesForProject,
   getEmployeeNameEnhanced,
-  formatTwoPartName
+  formatTwoPartName,
+  normalizeScopeKey,
+  formatScopeTitleCase
 } from '@/src/lib/projectUtils';
 import EditProjectModal from './EditProjectModal';
 
@@ -221,14 +223,29 @@ export default function ProjectsDirectory({
   }, [projects]);
 
   const scopeOptions = useMemo(() => {
-    const set = new Set<string>();
+    const scopeMap = new Map<string, string>(); // normKey -> standardized title-cased label
     projects.forEach(p => {
-      const s1 = p.scopeOfWork;
-      const s2 = p.scope;
-      if (s1 && typeof s1 === 'string' && s1.trim()) set.add(s1.trim());
-      if (s2 && typeof s2 === 'string' && s2.trim()) set.add(s2.trim());
+      const candidates = [
+        p.scopeOfWork,
+        p.scope,
+        ...(Array.isArray(p.scopeList) ? p.scopeList : [])
+      ];
+      candidates.forEach(raw => {
+        if (!raw || typeof raw !== 'string' || !raw.trim()) return;
+        const normKey = normalizeScopeKey(raw);
+        if (!normKey) return;
+        const cleanTitle = formatScopeTitleCase(raw);
+        if (!scopeMap.has(normKey)) {
+          scopeMap.set(normKey, cleanTitle);
+        } else {
+          const existing = scopeMap.get(normKey)!;
+          if (existing === existing.toUpperCase() && cleanTitle !== cleanTitle.toUpperCase()) {
+            scopeMap.set(normKey, cleanTitle);
+          }
+        }
+      });
     });
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
+    return Array.from(scopeMap.values()).sort((a, b) => a.localeCompare(b));
   }, [projects]);
 
   const statusOptions = useMemo(() => {
@@ -310,16 +327,16 @@ export default function ProjectsDirectory({
         if (!matchesClient) return false;
       }
 
-      // 2. Scope Filter: match project.scopeOfWork and project.scope (trimmed and case-insensitive)
+      // 2. Scope Filter: match project.scopeOfWork and project.scope using whitespace/hyphen-agnostic normalization
       if (scopeFilter !== 'all') {
-        const targetScope = scopeFilter.trim().toLowerCase();
-        const rawScopeOfWork = String(p.scopeOfWork || '').trim().toLowerCase();
-        const rawScope = String(p.scope || '').trim().toLowerCase();
-        const matchesScope =
-          rawScopeOfWork === targetScope ||
-          rawScope === targetScope ||
-          rawScopeOfWork.includes(targetScope) ||
-          rawScope.includes(targetScope);
+        const targetNorm = normalizeScopeKey(scopeFilter);
+        const pScopes = [
+          p.scopeOfWork,
+          p.scope,
+          ...(Array.isArray(p.scopeList) ? p.scopeList : [])
+        ].filter(Boolean).map(s => normalizeScopeKey(String(s)));
+
+        const matchesScope = pScopes.some(s => s === targetNorm || s.includes(targetNorm) || targetNorm.includes(s));
         if (!matchesScope) return false;
       }
 
@@ -1090,6 +1107,7 @@ export default function ProjectsDirectory({
           project={editingProject}
           clients={clients}
           users={users}
+          scopes={scopeOptions}
           onClose={() => {
             setIsEditModalOpen(false);
             setEditingProject(null);

@@ -67,7 +67,8 @@ import {
 import { 
   parseSafeDate, 
   formatSafeDate, 
-  getProjectDate, 
+  getProjectDate,
+  resolveProjectDate, 
   formatCurrency, 
   toTitleCase, 
   getFirstName, 
@@ -77,6 +78,7 @@ import {
   buildUpgradeRecordIfChanged, 
   findMatchingCapacityRow,
   calculateSlabCost,
+  calculateCompoundPackagePrice,
   calculateSlabCommission,
   SCOPE_LABELS, 
   MONTH_OPTIONS,
@@ -435,24 +437,32 @@ export default function DashboardPage() {
   }, [authStatus]);
 
   const financialProjects = useMemo(() => {
+    if (!projects || projects.length === 0) return [];
     return projects.map((project) => {
       const matchedClient = clients.find(
         (c) => c.id === project.clientId || c.companyName === project.clientName
       );
+      // Canonical Project Date Hierarchy (Directive 1)
+      const pDate = resolveProjectDate(project) || getProjectDate(project) || new Date();
 
-      const pDate = getProjectDate(project) || new Date();
-      const resolvedTier = project.pricingCategory 
-        ? project.pricingCategory 
-        : (matchedClient ? resolveEffectivePricingCategory(matchedClient, pDate) : 'T1');
+      // Effective-Dated Tier Resolution:
+      // If project has saved pricingCategory, it respects it. Otherwise resolves effective tier for pDate.
+      const resolvedTier = resolveEffectivePricingCategory(
+        matchedClient,
+        pDate,
+        project.pricingCategory
+      );
       const activeCategory = String(resolvedTier).toLowerCase().trim();
 
       const rawCapacity = String(project.plantCapacity || project.systemCapacity || project.capacity || '0');
       const capacity = parseFloat(rawCapacity.replace(/[^\d.]/g, '')) || 0;
       
-      const scope = String(project.scopeOfWork || '').toLowerCase().trim();
-      const subService = String(project.subService || 'Standard').toLowerCase().trim();
+      const scope = String(project.scopeOfWork || project.scope || '').toLowerCase().trim();
+      const subService = normalizeSubService(project.subService);
 
-      // Historical Data Lock
+      // Historical Cost Hard-Lock Preservation (Directive 2):
+      // If a past project already has finalCost, calculatedCost, cost, amount, or totalCost, PRESERVE THAT NUMBER.
+      // Do not dynamically overwrite it when the parent client updates tiers.
       let calculatedCost = 0;
       let isCostLocked = false;
       
@@ -476,29 +486,41 @@ export default function DashboardPage() {
         isCostLocked = true;
       }
 
-      // Dynamic Pricing Fallback
+      // Dynamic Pricing Fallback:
+      // Only runs if the cost was NOT previously hard-locked on the project document
       if (!isCostLocked) {
-        const matchedRule = pricingRules.find(
-          (rule) => {
-            const ruleCategory = String(rule.category || 'Standard').toLowerCase().trim();
-            const ruleScope = String(rule.scope || rule.scopeOfWork || '').toLowerCase().trim();
-            const ruleSubService = String(rule.subService || 'Standard').toLowerCase().trim();
-            
-            return ruleCategory === activeCategory && ruleScope === scope && ruleSubService === subService;
-          }
+        const rawScopeOfWork = String(project.scopeOfWork || project.scope || "").trim();
+        const dynamicPackagePrice = calculateCompoundPackagePrice(
+          rawScopeOfWork,
+          capacity,
+          resolvedTier,
+          subService,
+          pricingRules
         );
 
-        if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
-          const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
-          if (matchedRow) {
-            calculatedCost = calculateSlabCost(matchedRow, capacity);
+        if (dynamicPackagePrice > 0) {
+          calculatedCost = dynamicPackagePrice;
+        } else {
+          const matchedRule = pricingRules.find(
+            (rule) => {
+              const ruleCategory = String(rule.category || 'Standard').toLowerCase().trim();
+              const ruleScope = String(rule.scope || rule.scopeOfWork || '').toLowerCase().trim();
+              const ruleSubService = normalizeSubService(rule.subService);
+              
+              return ruleCategory === activeCategory && ruleScope === scope && (ruleSubService === subService || ruleSubService === 'standard');
+            }
+          );
+          if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+            const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
+            if (matchedRow) {
+              calculatedCost = calculateSlabCost(matchedRow, capacity);
+            }
+          }
+          if (calculatedCost === 0 && matchedRule && (matchedRule.basePrice || matchedRule.price)) {
+            calculatedCost = Number(matchedRule.basePrice || matchedRule.price || 0);
           }
         }
-        if (calculatedCost === 0 && matchedRule && (matchedRule.basePrice || matchedRule.price)) {
-          calculatedCost = Number(matchedRule.basePrice || matchedRule.price || 0);
-        }
       }
-
       // Commission Engine with Zero-Value Safety & Explicit Admin Override Precedence
       // Resilient Staff Attribution (Universal Key Aliasing)
       const resolvedDesignerEmail =
@@ -694,6 +716,11 @@ export default function DashboardPage() {
       calculatedCost: finalCostValue,
       finalCost: finalCostValue,
       cost: finalCostValue,
+      amount: finalCostValue,
+      totalCost: finalCostValue,
+      price: finalCostValue,
+      isCostLocked: false,
+      isCommissionLocked: false,
       // Critical Commission Output Persistence
       salesCommission: salesCommissionValue,
       commission: salesCommissionValue,
@@ -716,6 +743,14 @@ export default function DashboardPage() {
       return {
         ...p,
         ...updatedData,
+        calculatedCost: finalCostValue,
+        finalCost: finalCostValue,
+        cost: finalCostValue,
+        amount: finalCostValue,
+        totalCost: finalCostValue,
+        price: finalCostValue,
+        isCostLocked: false,
+        isCommissionLocked: false,
         designerCommission: designerCommissionValue,
         salesCommission: salesCommissionValue,
         commission: salesCommissionValue,
@@ -750,6 +785,10 @@ export default function DashboardPage() {
       if (targetProject.status && targetProject.status !== originalProject.status) {
         firestoreUpdatePayload.status = targetProject.status;
       }
+      const origScopeNorm = String(originalProject.scopeOfWork || originalProject.scope || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
+      const newScopeNorm = String(targetProject.scopeOfWork || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
+      const scopeChanged = Boolean(newScopeNorm && origScopeNorm && newScopeNorm !== origScopeNorm);
+
       if (targetProject.scopeOfWork && targetProject.scopeOfWork !== originalProject.scopeOfWork) {
         firestoreUpdatePayload.scopeOfWork = targetProject.scopeOfWork;
       }
@@ -771,10 +810,17 @@ export default function DashboardPage() {
         firestoreUpdatePayload.systemCapacity = plantCapacityValue;
         firestoreUpdatePayload.capacity = plantCapacityValue;
       }
-      if (finalCostValue !== safeNumber(originalProject.finalCost)) {
+      if (scopeChanged || finalCostValue !== safeNumber(originalProject.finalCost)) {
         firestoreUpdatePayload.calculatedCost = finalCostValue;
         firestoreUpdatePayload.finalCost = finalCostValue;
         firestoreUpdatePayload.cost = finalCostValue;
+        firestoreUpdatePayload.amount = finalCostValue;
+        firestoreUpdatePayload.totalCost = finalCostValue;
+        firestoreUpdatePayload.price = finalCostValue;
+        firestoreUpdatePayload.isCostLocked = false;
+        firestoreUpdatePayload.isCommissionLocked = false;
+        firestoreUpdatePayload.costOverride = false;
+        firestoreUpdatePayload.isManualCostOverride = false;
       }
       firestoreUpdatePayload.salesCommission = salesCommissionValue;
       firestoreUpdatePayload.commission = salesCommissionValue;

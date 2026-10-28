@@ -1,23 +1,30 @@
-import { collection, doc, writeBatch, getDocs } from 'firebase/firestore';
+import { collection, doc, writeBatch } from 'firebase/firestore';
 import { db } from './firebase';
 import { COLLECTIONS } from '@/src/config/schema';
 import { findMatchingInvoicesForProject } from './projectUtils';
 import { InvoiceData, canonicalInvoiceStatus } from './invoicePdfEngine';
+import { canMutateDocument } from './mutationGuard';
 
 /**
- * Atomically updates the paymentStatus of all projects linked to an invoice in Firestore.
- * Supports:
- * - Direct invoice.projectId / invoice.projectIds
- * - Row-level invoice.rows[].projectId
- * - Dynamic matching via findMatchingInvoicesForProject
- * - Known projects list or dynamic Firestore scan fallback
+ * Atomically updates paymentStatus of projects linked to an invoice.
+ * Guaranteed:
+ * - NO fallback getDocs(collection(...)) to prevent quota leaks.
+ * - Deep dirty-checking before batch.update() (skips write if status already matches).
+ * - Rate-limited via mutationGuard.
  */
 export async function syncInvoiceProjectsToFirestore(
   invoice: Partial<InvoiceData>,
   rawTargetStatus: string,
-  knownProjects?: any[]
+  knownProjects: any[] = []
 ): Promise<string[]> {
-  if (!invoice) return [];
+  if (!invoice || !db) return [];
+  
+  // Guard 1: Never fetch entire collections as fallback
+  if (!Array.isArray(knownProjects) || knownProjects.length === 0) {
+    console.warn('[projectSync] Skipped sync: No in-memory projects provided. Full collection scan suppressed.');
+    return [];
+  }
+
   const canonical = canonicalInvoiceStatus(rawTargetStatus);
   const projectPaymentStatus =
     canonical === 'PAID'
@@ -28,22 +35,9 @@ export async function syncInvoiceProjectsToFirestore(
       ? 'cancelled'
       : 'pending';
 
-  // 1. Gather all candidate projects to scan
-  let projectsToScan: any[] = Array.isArray(knownProjects) && knownProjects.length > 0 ? knownProjects : [];
-
-  if (projectsToScan.length === 0) {
-    try {
-      const snap = await getDocs(collection(db, COLLECTIONS.PROJECTS));
-      projectsToScan = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-    } catch (e) {
-      console.warn('Could not fetch projects to scan for invoice sync:', e);
-    }
-  }
-
-  // 2. Identify all matched project IDs
   const matchedProjectIds = new Set<string>();
 
-  // Direct IDs from invoice
+  // Check direct IDs on invoice
   const anyInvoice = invoice as any;
   if (anyInvoice?.projectId) matchedProjectIds.add(String(anyInvoice.projectId));
   if (Array.isArray(anyInvoice?.projectIds)) {
@@ -55,8 +49,8 @@ export async function syncInvoiceProjectsToFirestore(
     });
   }
 
-  // Cross-reference with projects to scan
-  projectsToScan.forEach((p) => {
+  // Check matching projects from provided in-memory list
+  knownProjects.forEach((p) => {
     if (!p || !p.id) return;
     const matches = findMatchingInvoicesForProject(p, [invoice]);
     if (matches.length > 0) {
@@ -65,81 +59,150 @@ export async function syncInvoiceProjectsToFirestore(
   });
 
   const targetIds = Array.from(matchedProjectIds);
-  if (targetIds.length === 0) {
-    return [];
-  }
+  if (targetIds.length === 0) return [];
 
-  // 3. Atomically update all linked project documents in Firestore
   try {
     const batch = writeBatch(db);
     const nowIso = new Date().toISOString();
+    const billingPeriod = invoice.invDate ? invoice.invDate.slice(0, 7) : nowIso.slice(0, 7);
+    let queuedWrites = 0;
 
     targetIds.forEach((projectId) => {
+      const proj = knownProjects.find((p) => p.id === projectId);
+      if (!proj) return;
+
+      // Guard 2: Dirty check. Do NOT write if values already match!
+      const currentPaymentStatus = String(proj.paymentStatus || proj.payment_status || '').toLowerCase().trim();
+      const currentInvoiceStatus = String(proj.invoiceStatus || '').toUpperCase().trim();
+      const currentInvoiceId = String(proj.invoiceId || '').trim();
+
+      const isStatusIdentical =
+        currentPaymentStatus === projectPaymentStatus &&
+        currentInvoiceStatus === canonical &&
+        (currentInvoiceId === String(invoice.id || '').trim());
+
+      if (isStatusIdentical) {
+        return; // Skip write
+      }
+
+      // Guard 3: Circuit breaker per document
+      if (!canMutateDocument(`projects/${projectId}`, 15000)) {
+        return; // Cooldown active
+      }
+
       const pRef = doc(db, COLLECTIONS.PROJECTS, projectId);
-      batch.update(pRef, {
+
+      let updatedUpgradeHistory = undefined;
+      if (Array.isArray(proj.upgradeHistory) && proj.upgradeHistory.length > 0) {
+        let historyChanged = false;
+        updatedUpgradeHistory = proj.upgradeHistory.map((u: any, idx: number) => {
+          if ((idx === proj.upgradeHistory.length - 1 || !u.invoicedInPeriod) && u.invoicedInPeriod !== billingPeriod) {
+            historyChanged = true;
+            return {
+              ...u,
+              invoicedInPeriod: billingPeriod,
+              invoicedInInvoiceNo: invoice.invNo || ''
+            };
+          }
+          return u;
+        });
+        if (!historyChanged) {
+          updatedUpgradeHistory = undefined;
+        }
+      }
+
+      const updateData: Record<string, any> = {
         paymentStatus: projectPaymentStatus,
         payment_status: projectPaymentStatus,
         invoiceStatus: canonical,
         invoiceId: invoice.id || '',
         invoiceNo: invoice.invNo || '',
         updatedAt: nowIso
-      });
+      };
+
+      if (updatedUpgradeHistory) {
+        updateData.upgradeHistory = updatedUpgradeHistory;
+      }
+
+      batch.update(pRef, updateData);
+      queuedWrites++;
     });
 
-    await batch.commit();
+    if (queuedWrites > 0) {
+      await batch.commit();
+      console.info(`[projectSync] Successfully updated ${queuedWrites} project(s) to status: ${projectPaymentStatus}.`);
+    }
+
     return targetIds;
   } catch (err) {
-    console.error('Failed to atomically sync project payment status to Firestore:', err);
+    console.error('[projectSync] Error updating project payment statuses:', err);
     return [];
   }
 }
 
 /**
- * Historical healer: Cross-audits all invoices and projects in the system.
- * If any project linked to a PAID invoice still shows non-paid status,
- * atomically repairs it in Firestore.
+ * Deterministic status hierarchy to prevent oscillation:
+ * PAID (3) > PARTIALLY_PAID (2) > PENDING (1) > CANCELLED (0)
+ */
+const STATUS_PRIORITY: Record<string, number> = {
+  PAID: 3,
+  PARTIALLY_PAID: 2,
+  PENDING: 1,
+  CANCELLED: 0
+};
+
+/**
+ * Historical healer: Runs ONLY via explicit user command.
+ * Enforces highest-priority status win when multiple invoices match.
  */
 export async function auditAndHealProjectPaymentSync(
   invoices: any[],
   projects: any[]
 ): Promise<number> {
-  if (!Array.isArray(invoices) || !Array.isArray(projects) || invoices.length === 0 || projects.length === 0) {
+  if (!Array.isArray(invoices) || !Array.isArray(projects) || invoices.length === 0 || projects.length === 0 || !db) {
     return 0;
   }
 
-  const projectsToUpdate = new Map<string, { status: string; invNo: string; invId: string }>();
+  const projectStatusCandidateMap = new Map<string, { status: string; invNo: string; invId: string; priority: number }>();
 
+  // Determine highest priority invoice status for each project
   invoices.forEach((inv) => {
     const canonical = canonicalInvoiceStatus(inv.status);
-    if (canonical !== 'PAID' && canonical !== 'PARTIALLY_PAID') return;
-
-    const expectedPaymentStatus = canonical === 'PAID' ? 'paid' : 'partially_paid';
+    const priority = STATUS_PRIORITY[canonical] ?? 0;
 
     projects.forEach((proj) => {
       if (!proj || !proj.id) return;
-      const explicit = String(proj.paymentStatus || proj.payment_status || '').toLowerCase().trim();
-      if (explicit === expectedPaymentStatus) return;
-
       const matches = findMatchingInvoicesForProject(proj, [inv]);
       if (matches.length > 0) {
-        projectsToUpdate.set(proj.id, {
-          status: expectedPaymentStatus,
-          invNo: inv.invNo || '',
-          invId: inv.id || ''
-        });
+        const existing = projectStatusCandidateMap.get(proj.id);
+        if (!existing || priority > existing.priority) {
+          projectStatusCandidateMap.set(proj.id, {
+            status: canonical === 'PAID' ? 'paid' : canonical === 'PARTIALLY_PAID' ? 'partially_paid' : 'pending',
+            invNo: inv.invNo || '',
+            invId: inv.id || '',
+            priority
+          });
+        }
       }
     });
   });
 
-  if (projectsToUpdate.size === 0) {
-    return 0;
-  }
+  if (projectStatusCandidateMap.size === 0) return 0;
 
   try {
     const batch = writeBatch(db);
     const nowIso = new Date().toISOString();
+    let writeCount = 0;
 
-    projectsToUpdate.forEach((info, projectId) => {
+    projectStatusCandidateMap.forEach((info, projectId) => {
+      const proj = projects.find((p) => p.id === projectId);
+      if (!proj) return;
+
+      const currentStatus = String(proj.paymentStatus || proj.payment_status || '').toLowerCase().trim();
+      if (currentStatus === info.status) return; // Already in sync
+
+      if (!canMutateDocument(`projects/${projectId}`, 15000)) return;
+
       const pRef = doc(db, COLLECTIONS.PROJECTS, projectId);
       batch.update(pRef, {
         paymentStatus: info.status,
@@ -149,12 +212,17 @@ export async function auditAndHealProjectPaymentSync(
         invoiceNo: info.invNo,
         updatedAt: nowIso
       });
+      writeCount++;
     });
 
-    await batch.commit();
-    return projectsToUpdate.size;
+    if (writeCount > 0) {
+      await batch.commit();
+      console.info(`[projectSync:heal] Healed ${writeCount} mismatched project payment statuses.`);
+    }
+
+    return writeCount;
   } catch (err) {
-    console.error('Failed during historical project payment sync heal:', err);
+    console.error('[projectSync:heal] Failed during payment sync heal:', err);
     return 0;
   }
 }

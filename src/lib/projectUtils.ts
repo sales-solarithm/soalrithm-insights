@@ -30,6 +30,58 @@ export {
   getCompoundScopeBreakdown 
 } from './taxonomyService';
 
+/**
+ * Case-insensitive and whitespace/hyphen-agnostic scope normalization key
+ * e.g. "Pipe Calculation", "PIPE CALCULATION", "pipe_calculation", "pipe-calculation" -> "pipecalculation"
+ */
+export function normalizeScopeKey(str: any): string {
+  return String(str || '')
+    .toLowerCase()
+    .replace(/[\s\-_]+/g, '')
+    .trim();
+}
+
+/**
+ * Standardized TitleCase scope formatter preserving standard acronyms (CEI, CEIG, PVsyst, SLD, GA, BOM, etc.)
+ */
+export function formatScopeTitleCase(str: any): string {
+  const trimmed = String(str || '').trim();
+  if (!trimmed) return '';
+
+  const specialWords: Record<string, string> = {
+    cei: 'CEI',
+    ceig: 'CEIG',
+    ifp: 'IFP',
+    pvsyst: 'PVsyst',
+    sld: 'SLD',
+    bom: 'BOM',
+    pe: 'PE',
+    kw: 'kW',
+    kwp: 'kWp',
+    mw: 'MW',
+    ga: 'GA'
+  };
+
+  const isAllUpper = trimmed === trimmed.toUpperCase() && /[A-Z]/.test(trimmed);
+
+  const tokens = trimmed.split(/([\s\-_+]+)/);
+  return tokens
+    .map((token) => {
+      if (/^[\s\-_+]+$/.test(token)) {
+        return token === '_' ? ' ' : token;
+      }
+      const lower = token.toLowerCase();
+      if (specialWords[lower]) {
+        return specialWords[lower];
+      }
+      if (isAllUpper || token === token.toLowerCase()) {
+        return token.charAt(0).toUpperCase() + token.slice(1).toLowerCase();
+      }
+      return token.charAt(0).toUpperCase() + token.slice(1);
+    })
+    .join('');
+}
+
 export const MONTH_OPTIONS = [
   { value: 'all', label: 'All Months' },
   { value: '0', label: 'January' },
@@ -972,6 +1024,91 @@ export function calculateSlabCommission(row: any, capacity: number, maxCommissio
   return rawCommission;
 }
 
+/**
+ * Evaluates proposal compound package pricing for any scope (including multi-part packages like Pre-Design + CEIG + IFP).
+ * If an exact compound rule exists in pricingRules for the client's proposal tier, it uses that rate.
+ * If not, it splits the scope by '+', calculates the capacity slab price for each individual constituent scope
+ * under the client's proposal tier, and sums them together.
+ */
+export function calculateCompoundPackagePrice(
+  scopeName: string | undefined | null,
+  capacity: number,
+  tier: string = 'T1',
+  subService: string = 'Standard',
+  pricingRules: any[] = []
+): number {
+  if (!scopeName || !Array.isArray(pricingRules) || pricingRules.length === 0) {
+    return 0;
+  }
+
+  const rawScope = String(scopeName).trim();
+  const normalizedTier = String(tier || 'T1').toUpperCase().trim();
+  const normalizedSub = normalizeSubService(subService);
+  const canonKey = toCanonicalScopeKey(rawScope);
+
+  // Helper to evaluate a single rule or sub-rule for given scope and capacity
+  const evaluateRuleForScope = (targetScope: string): number => {
+    const targetKey = toCanonicalScopeKey(targetScope);
+    const targetLower = targetScope.toLowerCase().trim();
+
+    // 1. Direct match on Tier + Canonical Key + SubService
+    let matchedRule = pricingRules.find((r) => {
+      const rTier = String(r.category || r.tier || 'T1').toUpperCase().trim();
+      const rKey = toCanonicalScopeKey(r.scope || r.scopeOfWork || '');
+      const rLower = String(r.scope || r.scopeOfWork || '').toLowerCase().trim();
+      const rSub = normalizeSubService(r.subService);
+
+      return (
+        rTier === normalizedTier &&
+        (rKey === targetKey || rLower === targetLower) &&
+        (rSub === normalizedSub || rSub === 'standard')
+      );
+    });
+
+    // 2. Direct match on Tier + Scope without subService restriction
+    if (!matchedRule) {
+      matchedRule = pricingRules.find((r) => {
+        const rTier = String(r.category || r.tier || 'T1').toUpperCase().trim();
+        const rKey = toCanonicalScopeKey(r.scope || r.scopeOfWork || '');
+        const rLower = String(r.scope || r.scopeOfWork || '').toLowerCase().trim();
+        return rTier === normalizedTier && (rKey === targetKey || rLower === targetLower);
+      });
+    }
+
+    if (matchedRule) {
+      if (Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+        const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, capacity);
+        if (matchedRow) {
+          return calculateSlabCost(matchedRow, capacity);
+        }
+      } else if (isZeroOrPositive(matchedRule.basePrice || matchedRule.price)) {
+        return Number(matchedRule.basePrice || matchedRule.price || 0);
+      }
+    }
+    return 0;
+  };
+
+  // Step 1: Check for exact composite rule
+  const directPrice = evaluateRuleForScope(rawScope);
+  if (directPrice > 0) {
+    return directPrice;
+  }
+
+  // Step 2: If composite contains '+' and no exact rule exists, split and sum individual sub-scopes
+  if (rawScope.includes('+')) {
+    const subParts = rawScope.split('+').map((s) => s.trim()).filter(Boolean);
+    let compositeSum = 0;
+    for (const part of subParts) {
+      compositeSum += evaluateRuleForScope(part);
+    }
+    if (compositeSum > 0) {
+      return compositeSum;
+    }
+  }
+
+  return 0;
+}
+
 // ============================================================================
 // 12. INVOICE-PROJECT BIDIRECTIONAL SYNC & STATUS RESOLUTION (Audit REQ-05)
 // ============================================================================
@@ -990,7 +1127,6 @@ export function findMatchingInvoicesForProject(project: any, invoices: any[] = [
   if (!project || !Array.isArray(invoices) || invoices.length === 0) return [];
   const projId = String(project.id || '').trim().toLowerCase();
   const projName = String(project.projectName || project.name || '').trim().toLowerCase();
-  const clientName = String(project.clientName || project.matchedClient?.companyName || '').trim().toLowerCase();
   const projInvId = String(project.invoiceId || '').trim().toLowerCase();
   const projInvNo = String(project.invoiceNo || project.invoiceNumber || '').trim().toLowerCase();
 
@@ -998,7 +1134,6 @@ export function findMatchingInvoicesForProject(project: any, invoices: any[] = [
     if (!inv) return false;
     const invId = String(inv.id || '').trim().toLowerCase();
     const invNo = String(inv.invNo || '').trim().toLowerCase();
-    const invClientName = String(inv.client?.name || '').trim().toLowerCase();
 
     // 1. Direct ID / Invoice Number matching
     if (projInvId && invId && projInvId === invId) return true;
@@ -1006,14 +1141,13 @@ export function findMatchingInvoicesForProject(project: any, invoices: any[] = [
     if (projId && inv.projectId && String(inv.projectId).trim().toLowerCase() === projId) return true;
     if (projId && Array.isArray(inv.projectIds) && inv.projectIds.map((x: any) => String(x).trim().toLowerCase()).includes(projId)) return true;
 
-    // 2. Row level matching
+    // 2. Row level matching (strict containment of this specific project in invoice rows)
     if (Array.isArray(inv.rows)) {
       const rowMatch = inv.rows.some((row: any) => {
         if (!row) return false;
         const rowProjId = String(row.projectId || '').trim().toLowerCase();
         if (projId && rowProjId && rowProjId === projId) return true;
         if (projId && String(row.id || '').trim().toLowerCase() === projId) return true;
-
         if (projName) {
           const rowDesc = String(row.desc || row.projectName || '').trim().toLowerCase();
           if (rowDesc && (rowDesc === projName || rowDesc.includes(projName) || projName.includes(rowDesc))) {
@@ -1025,26 +1159,6 @@ export function findMatchingInvoicesForProject(project: any, invoices: any[] = [
       if (rowMatch) return true;
     }
 
-    // 3. Client matching fallback (e.g. Tirupati Sunmart / IN-SRD-2026-30)
-    if (clientName && invClientName && (clientName === invClientName || clientName.includes(invClientName) || invClientName.includes(clientName))) {
-      if (Array.isArray(inv.rows)) {
-        const rowHasProject = inv.rows.some((r: any) => {
-          const desc = String(r.desc || '').toLowerCase();
-          return (
-            (projName && (desc.includes(projName) || projName.includes(desc))) ||
-            (r.kw && project.plantCapacity && Math.abs(Number(r.kw) - Number(project.plantCapacity)) < 0.1)
-          );
-        });
-        if (rowHasProject) return true;
-      }
-      if (invNo === 'in-srd-2026-30' || invNo.includes('2026-30')) {
-        return true;
-      }
-      if (clientName.includes('tirupati') && invClientName.includes('tirupati')) {
-        return true;
-      }
-    }
-
     return false;
   });
 }
@@ -1052,7 +1166,7 @@ export function findMatchingInvoicesForProject(project: any, invoices: any[] = [
 /**
  * Resolves the payment status of a project by dynamically cross-referencing
  * both explicit project fields and real-time linked invoice statuses.
- * Guarantees that if an invoice is PAID, the project displays Paid (emerald badge).
+ * Prioritizes PARTIALLY_PAID before PAID to ensure amber badge accuracy.
  */
 export function resolveProjectPaymentStatus(
   project: any,
@@ -1065,22 +1179,22 @@ export function resolveProjectPaymentStatus(
   // Cross-reference real-time invoices first
   const matchingInvoices = findMatchingInvoicesForProject(project, invoices);
   if (matchingInvoices.length > 0) {
-    // 1. Any matching invoice is PAID
-    const paidInv = matchingInvoices.find((inv) => {
-      const s = String(inv.status || '').toLowerCase().trim();
-      return s === 'paid' || s === 'settled' || s === 'full';
-    });
-    if (paidInv) {
-      return { status: 'paid', label: 'Paid', invoiceNo: paidInv.invNo };
-    }
-
-    // 2. Any matching invoice is PARTIALLY_PAID
+    // 1. Check if the project is linked to an invoice that is PARTIALLY_PAID
     const partialInv = matchingInvoices.find((inv) => {
       const s = String(inv.status || '').toLowerCase().trim();
       return s === 'partially paid' || s === 'partially_paid' || s === 'partial';
     });
     if (partialInv) {
       return { status: 'partially_paid', label: 'Partially Paid', invoiceNo: partialInv.invNo };
+    }
+
+    // 2. Check if the project is linked to an invoice that is PAID
+    const paidInv = matchingInvoices.find((inv) => {
+      const s = String(inv.status || '').toLowerCase().trim();
+      return s === 'paid' || s === 'settled' || s === 'full';
+    });
+    if (paidInv) {
+      return { status: 'paid', label: 'Paid', invoiceNo: paidInv.invNo };
     }
 
     // 3. Any matching invoice is SENT
@@ -1134,8 +1248,14 @@ export interface PricingCategoryHistoryPeriod {
  */
 export function resolveEffectivePricingCategory(
   client: any,
-  projectDateCandidate?: any
+  projectDateCandidate?: any,
+  projectPricingCategory?: string | null
 ): string {
+  // If the project itself has an explicit saved pricingCategory, respect it first (Audit REQ-01)
+  if (projectPricingCategory && String(projectPricingCategory).trim()) {
+    return String(projectPricingCategory).trim().toUpperCase();
+  }
+
   if (!client) return 'T1';
 
   const defaultTier = String(client.pricingCategory || client.category || client.tier || 'T1').trim().toUpperCase();
@@ -1158,7 +1278,14 @@ export function resolveEffectivePricingCategory(
 
   const pTime = pDate.getTime();
 
-  for (const period of history) {
+  // Sort history descending by effectiveFrom so most specific / latest matching window is checked first
+  const sortedHistory = [...history].sort((a, b) => {
+    const tA = parseSafeDate(a.effectiveFrom)?.getTime() || 0;
+    const tB = parseSafeDate(b.effectiveFrom)?.getTime() || 0;
+    return tB - tA;
+  });
+
+  for (const period of sortedHistory) {
     if (!period || !period.tier) continue;
     const fromDate = parseSafeDate(period.effectiveFrom);
     if (!fromDate) continue;

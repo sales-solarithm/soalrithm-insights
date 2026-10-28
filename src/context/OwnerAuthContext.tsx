@@ -2,7 +2,7 @@
 
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { User, signOut as fbSignOut, onAuthStateChanged } from 'firebase/auth';
-import { doc, getDoc, setDoc, collection, query, where, getDocs } from 'firebase/firestore';
+import { doc, getDoc, setDoc, collection, query, where, getDocs, limit } from 'firebase/firestore';
 import { auth, db } from '../lib/firebase';
 import { COLLECTIONS } from '../config/schema';
 import { INACTIVITY_LOGOUT_MESSAGE, isSessionStale, clearStoredActivity } from '../lib/inactivity';
@@ -85,132 +85,54 @@ export async function findOwnerRecordAcrossCollections(
     return { isOwner: false, docData: null, source: null, docId: null };
   }
 
-  let matchedNonOwner: { docData: any; source: 'users' | 'employees'; docId: string } | null = null;
+  let matchedNonOwner: any = null;
 
-  // 1. Query /users collection
-  try {
-    const qEmail = query(collection(dbInstance, COLLECTIONS.USERS), where('email', '==', cleanEmail));
-    const snapEmail = await getDocs(qEmail);
-    for (const docItem of snapEmail.docs) {
-      const data = docItem.data();
-      if (isOwnerRecord(data)) {
-        return { isOwner: true, docData: data, source: 'users', docId: docItem.id };
-      }
-      if (!matchedNonOwner) {
-        matchedNonOwner = { docData: data, source: 'users', docId: docItem.id };
-      }
-    }
-
-    // Direct doc lookup by sanitized email docId
-    const sanitizedDocId = cleanEmail.replace(/[^a-zA-Z0-9_]/g, '_');
-    const directUserSnap = await getDoc(doc(dbInstance, COLLECTIONS.USERS, sanitizedDocId));
-    if (directUserSnap.exists()) {
-      const data = directUserSnap.data();
-      if (isOwnerRecord(data)) {
-        return { isOwner: true, docData: data, source: 'users', docId: directUserSnap.id };
-      }
-      if (!matchedNonOwner) {
-        matchedNonOwner = { docData: data, source: 'users', docId: directUserSnap.id };
-      }
-    }
-  } catch (userErr) {
-    console.warn('[OwnerAuth] /users lookup warning:', userErr);
-  }
-
-  // 2. Query /employees collection
-  try {
-    // 2a. By email
-    const qEmpEmail = query(collection(dbInstance, COLLECTIONS.EMPLOYEES), where('email', '==', cleanEmail));
-    const snapEmpEmail = await getDocs(qEmpEmail);
-    for (const docItem of snapEmpEmail.docs) {
-      const data = docItem.data();
-      if (isOwnerRecord(data)) {
-        return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
-      }
-      if (!matchedNonOwner) {
-        matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
-      }
-    }
-
-    // 2b. By personalEmail
-    const qPersonal = query(collection(dbInstance, COLLECTIONS.EMPLOYEES), where('personalEmail', '==', cleanEmail));
-    const snapPersonal = await getDocs(qPersonal);
-    for (const docItem of snapPersonal.docs) {
-      const data = docItem.data();
-      if (isOwnerRecord(data)) {
-        return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
-      }
-      if (!matchedNonOwner) {
-        matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
-      }
-    }
-
-    // 2c. By personalEmailAddress
-    const qPersonalAddr = query(collection(dbInstance, COLLECTIONS.EMPLOYEES), where('personalEmailAddress', '==', cleanEmail));
-    const snapPersonalAddr = await getDocs(qPersonalAddr);
-    for (const docItem of snapPersonalAddr.docs) {
-      const data = docItem.data();
-      if (isOwnerRecord(data)) {
-        return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
-      }
-      if (!matchedNonOwner) {
-        matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
-      }
-    }
-
-    // 2d. Sanitized docId in /employees
-    const sanitizedEmpDocId = cleanEmail.replace(/[^a-zA-Z0-9_]/g, '_');
-    const directEmpSnap = await getDoc(doc(dbInstance, COLLECTIONS.EMPLOYEES, sanitizedEmpDocId));
-    if (directEmpSnap.exists()) {
-      const data = directEmpSnap.data();
-      if (isOwnerRecord(data)) {
-        return { isOwner: true, docData: data, source: 'employees', docId: directEmpSnap.id };
-      }
-      if (!matchedNonOwner) {
-        matchedNonOwner = { docData: data, source: 'employees', docId: directEmpSnap.id };
-      }
-    }
-
-    // 2e. Comprehensive employee collection scan to catch any casing or format differences
-    const allEmpsSnap = await getDocs(collection(dbInstance, COLLECTIONS.EMPLOYEES));
-    for (const docItem of allEmpsSnap.docs) {
-      const data = docItem.data();
-      const empEmail = (data.email || '').toString().trim().toLowerCase();
-      const pEmail1 = (data.personalEmail || '').toString().trim().toLowerCase();
-      const pEmail2 = (data.personalEmailAddress || '').toString().trim().toLowerCase();
-      if (empEmail === cleanEmail || pEmail1 === cleanEmail || pEmail2 === cleanEmail) {
-        if (isOwnerRecord(data)) {
-          return { isOwner: true, docData: data, source: 'employees', docId: docItem.id };
+  // Targeted query helper
+  const findInCollection = async (collName: string, fieldName: string, value: string) => {
+    try {
+      const q = query(collection(dbInstance, collName), where(fieldName, '==', value), limit(1));
+      const snap = await getDocs(q);
+      if (!snap.empty) {
+        const d = snap.docs[0].data();
+        if (isOwnerRecord(d)) {
+          return { isOwner: true, docData: d, source: collName as 'users' | 'employees', docId: snap.docs[0].id };
         }
         if (!matchedNonOwner) {
-          matchedNonOwner = { docData: data, source: 'employees', docId: docItem.id };
+          matchedNonOwner = { docData: d, source: collName as 'users' | 'employees', docId: snap.docs[0].id };
         }
       }
-    }
-  } catch (empErr) {
-    console.warn('[OwnerAuth] /employees lookup warning:', empErr);
-  }
-
-  // 3. Fallback: comprehensive /users collection scan
-  try {
-    const allUsersSnap = await getDocs(collection(dbInstance, COLLECTIONS.USERS));
-    for (const docItem of allUsersSnap.docs) {
-      const data = docItem.data();
-      const uEmail = (data.email || '').toString().trim().toLowerCase();
-      const pEmail = (data.personalEmail || data.personalEmailAddress || '').toString().trim().toLowerCase();
-      if (uEmail === cleanEmail || pEmail === cleanEmail) {
-        if (isOwnerRecord(data)) {
-          return { isOwner: true, docData: data, source: 'users', docId: docItem.id };
-        }
-        if (!matchedNonOwner) {
-          matchedNonOwner = { docData: data, source: 'users', docId: docItem.id };
-        }
+    } catch (e: any) {
+      console.warn(`[OwnerAuth] Query ${collName}.${fieldName} notice:`, e);
+      const errMsg = String(e?.message || e?.code || e || '').toLowerCase();
+      if (
+        errMsg.includes('offline') || 
+        errMsg.includes('backend') || 
+        errMsg.includes('unavailable') || 
+        errMsg.includes('timeout') ||
+        errMsg.includes('failed-precondition') ||
+        errMsg.includes('deadline-exceeded') ||
+        errMsg.includes('resource-exhausted')
+      ) {
+        throw e;
       }
     }
-  } catch (uErr) {
-    console.warn('[OwnerAuth] /users broad scan warning:', uErr);
+    return null;
+  };
+
+  // Run targeted, indexed queries instead of full collection scans
+  const checks = [
+    findInCollection(COLLECTIONS.USERS, 'email', cleanEmail),
+    findInCollection(COLLECTIONS.EMPLOYEES, 'email', cleanEmail),
+    findInCollection(COLLECTIONS.EMPLOYEES, 'personalEmail', cleanEmail),
+    findInCollection(COLLECTIONS.EMPLOYEES, 'personalEmailAddress', cleanEmail),
+  ];
+
+  for (const check of checks) {
+    const res = await check;
+    if (res && res.isOwner) return res;
   }
 
+  // Broad getDocs(collection(...)) scans have been removed to prevent read exhaustion
   if (matchedNonOwner) {
     return { isOwner: false, docData: matchedNonOwner.docData, source: matchedNonOwner.source, docId: matchedNonOwner.docId };
   }
@@ -394,8 +316,20 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
             foundRole = (d?.role || d?.assignedRole || '').toString().trim();
           }
         }
-      } catch (docErr) {
+      } catch (docErr: any) {
         console.warn('[OwnerAuth] Direct user doc lookup error:', docErr);
+        const errMsg = String(docErr?.message || docErr?.code || docErr || '').toLowerCase();
+        if (
+          errMsg.includes('offline') || 
+          errMsg.includes('backend') || 
+          errMsg.includes('unavailable') || 
+          errMsg.includes('timeout') ||
+          errMsg.includes('failed-precondition') ||
+          errMsg.includes('deadline-exceeded') ||
+          errMsg.includes('resource-exhausted')
+        ) {
+          throw docErr;
+        }
       }
 
       // 2. Dual-collection lookup (/users and /employees) if not yet resolved as owner
@@ -431,8 +365,20 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
           } else if (match.docData && !foundRole) {
             foundRole = (match.docData?.role || match.docData?.assignedRole || '').toString().trim();
           }
-        } catch (lookupErr) {
+        } catch (lookupErr: any) {
           console.warn('[OwnerAuth] Dual-collection lookup error:', lookupErr);
+          const errMsg = String(lookupErr?.message || lookupErr?.code || lookupErr || '').toLowerCase();
+          if (
+            errMsg.includes('offline') || 
+            errMsg.includes('backend') || 
+            errMsg.includes('unavailable') || 
+            errMsg.includes('timeout') ||
+            errMsg.includes('failed-precondition') ||
+            errMsg.includes('deadline-exceeded') ||
+            errMsg.includes('resource-exhausted')
+          ) {
+            throw lookupErr;
+          }
         }
       }
 
@@ -463,33 +409,39 @@ export function OwnerAuthProvider({ children }: { children: React.ReactNode }) {
         setAuthNotice(null);
       }
 
-      if (db && matchedProfile) {
-        try {
-          await setDoc(doc(db, COLLECTIONS.USERS, user.uid), {
-            ...matchedProfile,
-            uid: user.uid,
-            role: 'owner',
-            assignedRole: 'owner',
-            lastVerifiedAt: new Date().toISOString()
-          }, { merge: true });
-        } catch (syncErr) {
-          console.warn('[OwnerAuth] Sync user doc notice:', syncErr);
-        }
-      }
+      // Read-only session authorization: Never write timestamps during auth verification
       return true;
-    } catch (err) {
-      // Fail closed on an unexpected error -- never default to granting access.
-      console.warn('[OwnerAuth] Verification error:', err);
+    } catch (err: any) {
+      const errMsg = String(err?.message || err?.code || err || '').toLowerCase();
+      console.warn('[OwnerAuth] Verification notice:', err?.message || String(err));
+
+      const isNetworkOrOffline = 
+        errMsg.includes('offline') || 
+        errMsg.includes('backend') || 
+        errMsg.includes('unavailable') || 
+        errMsg.includes('timeout') ||
+        errMsg.includes('failed-precondition') ||
+        errMsg.includes('deadline-exceeded') ||
+        errMsg.includes('resource-exhausted');
+
+      if (isNetworkOrOffline) {
+        // DO NOT sign out or show 403 Access Denied on connection errors
+        if (isMountedRef.current) {
+          setStatus('unauthenticated');
+          setAuthNotice('Cloud database connection timeout. Retrying in background...');
+        }
+        return false;
+      }
+
+      // Only sign out if the user account is confirmed to be an unauthorized non-owner
       try {
         await fbSignOut(auth);
-      } catch (signOutErr) {
-        // already in an error path -- nothing further to do
-      }
+      } catch {}
       if (isMountedRef.current) {
         setAuthUser(null);
         setOwnerProfile(null);
         setStatus('unauthorized');
-        setAuthError('Unable to verify access. Please try signing in again.');
+        setAuthError(ACCESS_DENIED_MESSAGE);
       }
       return false;
     }

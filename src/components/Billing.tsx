@@ -26,7 +26,9 @@ import {
   MapPin,
   Calculator,
   Sparkles,
-  Filter
+  Filter,
+  ChevronLeft,
+  ChevronRight
 } from 'lucide-react';
 import {
   ResponsiveContainer,
@@ -78,7 +80,7 @@ import {
   findMatchingCapacityRow,
   calculateSlabCost
 } from '@/src/lib/projectUtils';
-import { syncInvoiceProjectsToFirestore, auditAndHealProjectPaymentSync } from '@/src/lib/projectSync';
+import { syncInvoiceProjectsToFirestore } from '@/src/lib/projectSync';
 
 export type BillingTab = 'dashboard' | 'invoice' | 'history' | 'settings';
 
@@ -144,6 +146,7 @@ export default function BillingModule({
   } = useBillingState();
 
   const [activeBillingTab, setActiveBillingTab] = useState<BillingTab>('dashboard');
+  const [applyGST, setApplyGST] = useState<boolean>(true);
 
   // Partial Payment Modal State
   const [partialPaymentTarget, setPartialPaymentTarget] = useState<{
@@ -159,14 +162,7 @@ export default function BillingModule({
   const [isPdfExporting, setIsPdfExporting] = useState(false);
   const [pdfProgressText, setPdfProgressText] = useState('');
 
-  // Bidirectional payment status healer: ensures existing PAID/PARTIALLY_PAID invoices sync to projects
-  useEffect(() => {
-    if (invoices.length > 0 && externalProjects.length > 0) {
-      auditAndHealProjectPaymentSync(invoices, externalProjects).catch((err) =>
-        console.warn('Background payment sync healer warning:', err)
-      );
-    }
-  }, [invoices, externalProjects]);
+  // Infinite write loop removed: payment sync is performed strictly on explicit user status change actions to prevent Firestore quota exhaustion.
 
   // Toast state
   const [toastMsg, setToastMsg] = useState('');
@@ -202,6 +198,13 @@ export default function BillingModule({
   // Search & Filter states
   const [historySearch, setHistorySearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'PENDING' | 'PARTIALLY_PAID' | 'PAID' | 'CANCELLED'>('all');
+  const [historyCurrentPage, setHistoryCurrentPage] = useState<number>(1);
+  const HISTORY_PAGE_SIZE = 10;
+
+  // Reset page when search or status filter changes
+  useEffect(() => {
+    setHistoryCurrentPage(1);
+  }, [historySearch, statusFilter]);
 
   // Format helper for YYYY-MM -> Human Readable (e.g. '2026-09' -> 'September 2026')
   const formatMonthDisplay = (ym: string): string => {
@@ -463,6 +466,46 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
     );
   };
 
+  // Handler for Client-Specific "Apply GST" Toggle
+  const handleToggleGST = (enabled: boolean) => {
+    setApplyGST(enabled);
+    if (!enabled) {
+      // Non-GST invoice: force tax percentages to 0
+      const nextTotals = calculateInvoiceTotals(
+        currentInvoice.rows,
+        0,
+        0,
+        0,
+        currentInvoice.advance
+      );
+      setCurrentInvoice((prev) => ({
+        ...prev,
+        cgst: 0,
+        sgst: 0,
+        igst: 0,
+        totals: nextTotals
+      }));
+    } else {
+      // Re-enable state-based GST rules: Gujarat -> CGST 9% + SGST 9%, Interstate -> IGST 18%
+      const gstRule = determineClientGSTRule(currentInvoice.client);
+      const nextTotals = calculateInvoiceTotals(
+        currentInvoice.rows,
+        gstRule.sgst,
+        gstRule.cgst,
+        gstRule.igst,
+        currentInvoice.advance
+      );
+      setCurrentInvoice((prev) => ({
+        ...prev,
+        cgst: gstRule.cgst,
+        sgst: gstRule.sgst,
+        igst: gstRule.igst,
+        totals: nextTotals
+      }));
+    }
+    setIsDirty(true);
+  };
+
   // Recalculate totals for active invoice
   const currentTotals: InvoiceTotals = useMemo(() => {
     return calculateInvoiceTotals(
@@ -569,17 +612,16 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
     } else if (canonical === 'PAID') {
       const fullAmount = inv.totals?.payable ?? inv.amountReceived ?? 0;
       try {
-        await logRevenueForInvoice(inv.id, fullAmount);
-        // Atomically sync linked project documents in Firestore to Paid
-        await syncInvoiceProjectsToFirestore({ ...inv, status: 'PAID' }, 'PAID', externalProjects);
+        // Pass externalProjects directly into logRevenueForInvoice so it syncs once without a getDocs scan
+        await logRevenueForInvoice(inv.id, fullAmount, undefined, externalProjects);
         showToast(`Invoice ${inv.invNo} status updated to PAID ✓ (Linked projects synced)`, 'success');
       } catch (e: any) {
         showToast(e?.message || `Failed to mark invoice ${inv.invNo} as paid.`, 'error');
       }
     } else {
       const updatedAmount = canonical === 'CANCELLED' ? 0 : (inv.amountReceived ?? 0);
-      updateInvoiceStatus(inv.id, canonical, updatedAmount);
-      await syncInvoiceProjectsToFirestore({ ...inv, status: canonical }, canonical, externalProjects);
+      // Pass externalProjects directly into updateInvoiceStatus so it syncs once without a getDocs scan
+      updateInvoiceStatus(inv.id, canonical, updatedAmount, externalProjects);
       showToast(`Invoice ${inv.invNo} status updated to ${canonical} ✓ (Linked projects synced)`, 'success');
     }
   };
@@ -590,11 +632,10 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
     const validAmount = isNaN(num) || num < 0 ? 0 : roundCurrency(num);
 
     try {
-      const result = await logRevenueForInvoice(partialPaymentTarget.invoice.id, validAmount);
-      // Atomically sync linked project documents in Firestore
-      await syncInvoiceProjectsToFirestore(
-        { ...partialPaymentTarget.invoice, status: result.newStatus },
-        result.newStatus,
+      const result = await logRevenueForInvoice(
+        partialPaymentTarget.invoice.id,
+        validAmount,
+        undefined,
         externalProjects
       );
       showToast(
@@ -1002,7 +1043,10 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
 
     const quotNo = found.proposalNumber || found.quotFormat || found.quotationNo || currentInvoice.quotNo || '';
 
-    // Directive 4: Location-Based GST Rule Engine
+    // Directive 4: Location-Based GST Rule Engine with GSTIN auto-detection
+    const hasGSTIN = Boolean(gstin && gstin.trim().length > 0);
+    setApplyGST(hasGSTIN);
+
     const gstRule = determineClientGSTRule({
       name: companyName,
       phone,
@@ -1011,8 +1055,18 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
       state: found.state || found.billingState
     });
 
+    const effectiveCGST = hasGSTIN ? gstRule.cgst : 0;
+    const effectiveSGST = hasGSTIN ? gstRule.sgst : 0;
+    const effectiveIGST = hasGSTIN ? gstRule.igst : 0;
+
+    // Point 3: Auto-generate fresh ID on client switch if invoice was already saved
+    const shouldForkNewId = !currentInvoice._isNew;
+    const freshId = shouldForkNewId ? uid('inv') : currentInvoice.id;
+
     const nextInvoiceState: InvoiceData = {
       ...currentInvoice,
+      id: freshId,
+      _isNew: shouldForkNewId ? true : currentInvoice._isNew,
       clientId: found.id || clientId,
       client: {
         name: companyName,
@@ -1022,9 +1076,9 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
       },
       advance: 0, // Mandatory repair: Immediately reset advance to 0 upon client selection
       quotNo: quotNo || currentInvoice.quotNo,
-      cgst: gstRule.cgst,
-      sgst: gstRule.sgst,
-      igst: gstRule.igst
+      cgst: effectiveCGST,
+      sgst: effectiveSGST,
+      igst: effectiveIGST
     };
 
     setCurrentInvoice(nextInvoiceState);
@@ -1047,8 +1101,14 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
       currentInvoice.igst,
       currentInvoice.advance
     );
+    // Point 3: Auto-generate fresh ID on month change if invoice was already saved
+    const shouldForkMonthId = !currentInvoice._isNew;
+    const freshMonthId = shouldForkMonthId ? uid('inv') : currentInvoice.id;
+
     setCurrentInvoice((prev) => ({
       ...prev,
+      id: freshMonthId,
+      _isNew: shouldForkMonthId ? true : prev._isNew,
       clientId: null,
       client: {
         name: '',
@@ -1337,7 +1397,11 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                         <td className="py-3.5 px-4 text-right">
                           <button
                             onClick={() => {
-                              loadInvoice(inv.id);
+                              const loaded = loadInvoice(inv.id);
+                              if (loaded) {
+                                const hasTax = Boolean(loaded.cgst > 0 || loaded.sgst > 0 || loaded.igst > 0 || (loaded.totals && loaded.totals.totalGST > 0));
+                                setApplyGST(hasTax);
+                              }
                               setActiveBillingTab('invoice');
                             }}
                             className="px-3 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-[#2A2A2A] hover:bg-gray-200 dark:hover:bg-[#333333] text-[#D4AF37] border border-gray-300 dark:border-[#333333] font-medium"
@@ -1857,19 +1921,48 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                   </h4>
                 </div>
 
-                {/* GST Rule Indicator Card */}
-                <div className={`p-3 rounded-lg border text-xs mb-3 ${
-                  activeGSTRule.isGujarat
-                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-300'
-                    : 'bg-blue-500/10 border-blue-500/30 text-blue-700 dark:text-blue-300'
-                }`}>
-                  <div className="font-semibold">{activeGSTRule.ruleLabel}</div>
-                  <div className="text-[11px] opacity-80 mt-0.5">
-                    {activeGSTRule.isGujarat
-                      ? 'Intra-State: CGST (9%) + SGST (9%) applied automatically'
-                      : 'Inter-State: IGST (18%) applied automatically'}
-                  </div>
+                {/* Apply GST Checkbox / Toggle */}
+                <div className="p-3 bg-gray-50 dark:bg-[#151515] border border-gray-200 dark:border-[#333333] rounded-lg mb-3">
+                  <label className="flex items-center gap-2 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={applyGST}
+                      onChange={(e) => handleToggleGST(e.target.checked)}
+                      className="w-4 h-4 rounded text-[#D4AF37] focus:ring-[#D4AF37] border-gray-300 dark:border-gray-600 bg-white dark:bg-[#1E1E1E] cursor-pointer"
+                    />
+                    <span className="text-xs font-bold text-gray-900 dark:text-white">
+                      Apply GST to this Invoice (Tax Invoice)
+                    </span>
+                  </label>
+                  <p className="text-[10px] text-gray-500 dark:text-gray-400 mt-1 pl-6">
+                    {applyGST
+                      ? 'GST enabled. Rates calculated dynamically from client state code.'
+                      : 'Non-GST Bill. CGST/SGST/IGST forced to 0% and Total GST = ₹0.00.'}
+                  </p>
                 </div>
+
+                {/* GST Rule Indicator Card (rendered only when GST is applied) */}
+                {applyGST ? (
+                  <div className={`p-3 rounded-lg border text-xs mb-3 ${
+                    activeGSTRule.isGujarat
+                      ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-700 dark:text-emerald-300'
+                      : 'bg-blue-500/10 border-blue-500/30 text-blue-700 dark:text-blue-300'
+                  }`}>
+                    <div className="font-semibold">{activeGSTRule.ruleLabel}</div>
+                    <div className="text-[11px] opacity-80 mt-0.5">
+                      {activeGSTRule.isGujarat
+                        ? 'Intra-State: CGST (9%) + SGST (9%) applied'
+                        : 'Inter-State: IGST (18%) applied'}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="p-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs mb-3">
+                    <div className="font-semibold">Non-GST Commercial Bill</div>
+                    <div className="text-[11px] opacity-80 mt-0.5">
+                      No tax applied. Total payable equals Subtotal minus Advance.
+                    </div>
+                  </div>
+                )}
 
                 <div className="space-y-2 text-xs">
                   <div className="flex justify-between py-1">
@@ -1990,15 +2083,29 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100 dark:divide-[#333333]">
-                  {invoices
-                    .filter((inv) => {
+                  {(() => {
+                    const filtered = invoices.filter((inv) => {
                       const q = historySearch.toLowerCase().trim();
                       const matchSearch = !q || inv.invNo?.toLowerCase().includes(q) || inv.client?.name?.toLowerCase().includes(q);
                       const canonical = canonicalInvoiceStatus(inv.status);
                       const matchStatus = statusFilter === 'all' || canonical === statusFilter;
                       return matchSearch && matchStatus;
-                    })
-                    .map((inv) => {
+                    });
+
+                    if (filtered.length === 0) {
+                      return (
+                        <tr>
+                          <td colSpan={6} className="py-8 text-center text-gray-500 dark:text-gray-400">
+                            No invoices match the selected filter.
+                          </td>
+                        </tr>
+                      );
+                    }
+
+                    const startIndex = (historyCurrentPage - 1) * HISTORY_PAGE_SIZE;
+                    const paginated = filtered.slice(startIndex, startIndex + HISTORY_PAGE_SIZE);
+
+                    return paginated.map((inv) => {
                       const canonical = canonicalInvoiceStatus(inv.status);
                       return (
                         <tr key={inv.id} className="hover:bg-gray-50 dark:hover:bg-[#2A2A2A] transition-colors">
@@ -2009,50 +2116,105 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                             {fmtINR(inv.totals?.payable ?? 0)}
                           </td>
                           <td className="py-3 px-4 text-center">
-                            {canonical === 'PAID' && (
-                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
-                                PAID
-                              </span>
-                            )}
-                            {canonical === 'PARTIALLY_PAID' && (
-                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/10 text-amber-600 dark:text-[#D4AF37] border border-amber-500/30">
-                                PARTIALLY PAID
-                              </span>
-                            )}
-                            {canonical === 'PENDING' && (
-                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/30">
-                                PENDING
-                              </span>
-                            )}
-                            {canonical === 'CANCELLED' && (
-                              <span className="px-2.5 py-0.5 rounded-full text-[11px] font-bold bg-rose-500/10 text-rose-600 dark:text-rose-400 border border-rose-500/30">
-                                CANCELLED
-                              </span>
-                            )}
+                            <select
+                              value={canonical}
+                              onChange={(e) => handleStatusChange(inv, e.target.value)}
+                              className="text-xs font-semibold px-2.5 py-1 rounded-lg border bg-gray-50 dark:bg-[#1A1A1A] border-gray-300 dark:border-gray-600 text-gray-800 dark:text-gray-200 cursor-pointer focus:outline-none focus:border-[#D4AF37]"
+                            >
+                              <option value="PENDING" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">PENDING</option>
+                              <option value="PARTIALLY_PAID" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">PARTIALLY PAID</option>
+                              <option value="PAID" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">PAID</option>
+                              <option value="CANCELLED" className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">CANCELLED</option>
+                            </select>
                           </td>
                           <td className="py-3 px-4 text-right space-x-2">
                             <button
                               onClick={() => {
-                                loadInvoice(inv.id);
+                                const loaded = loadInvoice(inv.id);
+                                if (loaded) {
+                                  const hasTax = Boolean(loaded.cgst > 0 || loaded.sgst > 0 || loaded.igst > 0 || (loaded.totals && loaded.totals.totalGST > 0));
+                                  setApplyGST(hasTax);
+                                }
                                 setActiveBillingTab('invoice');
                               }}
-                              className="px-2.5 py-1 text-xs rounded bg-gray-100 dark:bg-[#2A2A2A] text-gray-800 dark:text-gray-200 hover:text-[#D4AF37]"
+                              className="px-2.5 py-1 text-xs rounded bg-gray-100 dark:bg-[#2A2A2A] text-gray-800 dark:text-gray-200 hover:text-[#D4AF37] cursor-pointer"
                             >
                               Open
                             </button>
                             <button
                               onClick={() => handleOpenPreview(inv)}
-                              className="px-2.5 py-1 text-xs rounded bg-gray-100 dark:bg-[#2A2A2A] text-[#D4AF37]"
+                              className="px-2.5 py-1 text-xs rounded bg-gray-100 dark:bg-[#2A2A2A] text-[#D4AF37] cursor-pointer"
                             >
                               PDF
                             </button>
                           </td>
                         </tr>
                       );
-                    })}
+                    });
+                  })()}
                 </tbody>
               </table>
-            </div>
+            
+            {/* Pagination Controls (Strict 10 per page) */}
+            {(() => {
+              const filtered = invoices.filter((inv) => {
+                const q = historySearch.toLowerCase().trim();
+                const matchSearch = !q || inv.invNo?.toLowerCase().includes(q) || inv.client?.name?.toLowerCase().includes(q);
+                const canonical = canonicalInvoiceStatus(inv.status);
+                const matchStatus = statusFilter === 'all' || canonical === statusFilter;
+                return matchSearch && matchStatus;
+              });
+              const totalItems = filtered.length;
+              const totalPages = Math.max(1, Math.ceil(totalItems / HISTORY_PAGE_SIZE));
+              const startIdx = totalItems === 0 ? 0 : (historyCurrentPage - 1) * HISTORY_PAGE_SIZE + 1;
+              const endIdx = Math.min(totalItems, historyCurrentPage * HISTORY_PAGE_SIZE);
+
+              return (
+                <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-4 mt-4 border-t border-gray-200 dark:border-[#333333] text-xs">
+                  <div className="text-gray-500 dark:text-gray-400">
+                    Showing <span className="font-semibold text-gray-800 dark:text-gray-200 font-mono">{startIdx}</span> to{' '}
+                    <span className="font-semibold text-gray-800 dark:text-gray-200 font-mono">{endIdx}</span> of{' '}
+                    <span className="font-semibold text-gray-800 dark:text-gray-200 font-mono">{totalItems}</span> archived invoices
+                  </div>
+
+                  {totalPages > 1 && (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => setHistoryCurrentPage((prev) => Math.max(1, prev - 1))}
+                        disabled={historyCurrentPage === 1}
+                        className="px-2.5 py-1.5 rounded-lg border border-gray-300 dark:border-[#3A3A3A] bg-gray-50 dark:bg-[#252525] text-gray-700 dark:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 dark:hover:bg-[#333333] transition-colors flex items-center gap-1 cursor-pointer"
+                      >
+                        <ChevronLeft className="w-3.5 h-3.5" />
+                        <span>Prev</span>
+                      </button>
+
+                      {Array.from({ length: totalPages }, (_, i) => i + 1).map((pageNum) => (
+                        <button
+                          key={pageNum}
+                          onClick={() => setHistoryCurrentPage(pageNum)}
+                          className={`w-7 h-7 rounded-lg text-xs font-semibold font-mono transition-colors cursor-pointer ${
+                            historyCurrentPage === pageNum
+                              ? 'bg-[#D4AF37] text-black font-bold shadow-sm'
+                              : 'bg-gray-100 dark:bg-[#252525] text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white border border-gray-300 dark:border-[#3A3A3A]'
+                          }`}
+                        >
+                          {pageNum}
+                        </button>
+                      ))}
+
+                      <button
+                        onClick={() => setHistoryCurrentPage((prev) => Math.min(totalPages, prev + 1))}
+                        disabled={historyCurrentPage === totalPages}
+                        className="px-2.5 py-1.5 rounded-lg border border-gray-300 dark:border-[#3A3A3A] bg-gray-50 dark:bg-[#252525] text-gray-700 dark:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-gray-100 dark:hover:bg-[#333333] transition-colors flex items-center gap-1 cursor-pointer"
+                      >
+                        <span>Next</span>
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}</div>
           </div>
         </div>
       )}
