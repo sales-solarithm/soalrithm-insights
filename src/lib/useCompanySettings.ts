@@ -70,39 +70,47 @@ export function defaultCompanySettings(): CompanySettings {
 /**
  * Normalizes any incoming data payload into canonical CompanySettings
  * with guaranteed string integrity on statutory and banking identifiers.
+ * Enforces strict uppercase on IFSC, GSTIN, PAN, and CIN.
  */
 export function normalizeCompanySettings(raw: any): CompanySettings {
   const defaults = defaultCompanySettings();
   if (!raw || typeof raw !== 'object') return defaults;
 
+  const rawGstin = safeStringIdentifier(raw.gstin ?? defaults.gstin).toUpperCase().trim();
+  const rawPan = safeStringIdentifier(raw.pan ?? defaults.pan).toUpperCase().trim();
+  const rawCin = raw.cin !== undefined && raw.cin !== null
+    ? safeStringIdentifier(raw.cin).toUpperCase().trim()
+    : defaults.cin;
+  const rawIfsc = safeStringIdentifier(raw.bank?.ifsc ?? defaults.bank.ifsc).toUpperCase().trim();
+
   return {
     ...defaults,
     ...raw,
-    companyName: String(raw.companyName ?? defaults.companyName),
-    tagline: String(raw.tagline ?? defaults.tagline),
-    // Enforce string integrity on statutory fields
-    gstin: safeStringIdentifier(raw.gstin ?? defaults.gstin),
-    cin: raw.cin !== undefined && raw.cin !== null ? safeStringIdentifier(raw.cin) : defaults.cin,
-    pan: safeStringIdentifier(raw.pan ?? defaults.pan),
-    website: raw.website ? String(raw.website) : defaults.website,
-    phone: String(raw.phone ?? defaults.phone),
-    email: String(raw.email ?? defaults.email),
-    address: String(raw.address ?? defaults.address),
-    signatoryName: raw.signatoryName ? String(raw.signatoryName) : defaults.signatoryName,
-    signatoryDesignation: raw.signatoryDesignation ? String(raw.signatoryDesignation) : defaults.signatoryDesignation,
+    companyName: String(raw.companyName ?? defaults.companyName).trim(),
+    tagline: String(raw.tagline ?? defaults.tagline).trim(),
+    // Enforce string integrity & uppercase on statutory fields
+    gstin: rawGstin,
+    cin: rawCin,
+    pan: rawPan,
+    website: raw.website ? String(raw.website).trim() : defaults.website,
+    phone: String(raw.phone ?? defaults.phone).trim(),
+    email: String(raw.email ?? defaults.email).trim(),
+    address: String(raw.address ?? defaults.address).trim(),
+    signatoryName: raw.signatoryName ? String(raw.signatoryName).trim() : defaults.signatoryName,
+    signatoryDesignation: raw.signatoryDesignation ? String(raw.signatoryDesignation).trim() : defaults.signatoryDesignation,
     logo: raw.logo ?? null,
     signature: raw.signature ?? null,
     stamp: raw.stamp ?? null,
     bank: {
       ...defaults.bank,
       ...(raw.bank || {}),
-      name: String(raw.bank?.name ?? defaults.bank.name),
+      name: String(raw.bank?.name ?? defaults.bank.name).trim(),
       // Enforce string integrity on banking numbers
-      acc: safeStringIdentifier(raw.bank?.acc ?? defaults.bank.acc),
-      accName: raw.bank?.accName ? String(raw.bank.accName) : defaults.bank.accName,
-      ifsc: safeStringIdentifier(raw.bank?.ifsc ?? defaults.bank.ifsc),
-      upi: raw.bank?.upi ? String(raw.bank.upi) : defaults.bank.upi,
-      branch: raw.bank?.branch ? String(raw.bank.branch) : defaults.bank.branch,
+      acc: safeStringIdentifier(raw.bank?.acc ?? defaults.bank.acc).trim(),
+      accName: raw.bank?.accName ? String(raw.bank.accName).trim() : (defaults.bank.accName || '').trim(),
+      ifsc: rawIfsc,
+      upi: raw.bank?.upi ? String(raw.bank.upi).trim() : (defaults.bank.upi || '').trim(),
+      branch: raw.bank?.branch ? String(raw.bank.branch).trim() : (defaults.bank.branch || '').trim(),
     },
     updatedAt: raw.updatedAt ? String(raw.updatedAt) : undefined,
   };

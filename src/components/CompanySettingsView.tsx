@@ -93,16 +93,24 @@ export default function CompanySettingsView({ onNavigateToBilling }: CompanySett
   };
 
   const handleFieldChange = (field: keyof CompanySettings, value: any) => {
-    setForm((prev) => ({ ...prev, [field]: value }));
+    let cleanVal = value;
+    if (field === 'gstin' || field === 'pan' || field === 'cin') {
+      cleanVal = typeof value === 'string' ? value.toUpperCase() : value;
+    }
+    setForm((prev) => ({ ...prev, [field]: cleanVal }));
     setIsDirty(true);
   };
 
   const handleBankChange = (bankField: keyof typeof form.bank, value: string) => {
+    let cleanVal = value;
+    if (bankField === 'ifsc') {
+      cleanVal = value.toUpperCase();
+    }
     setForm((prev) => ({
       ...prev,
       bank: {
         ...prev.bank,
-        [bankField]: value
+        [bankField]: cleanVal
       }
     }));
     setIsDirty(true);
@@ -345,6 +353,7 @@ export default function CompanySettingsView({ onNavigateToBilling }: CompanySett
                   type="text"
                   value={form.bank?.name || ''}
                   onChange={(e) => handleBankChange('name', e.target.value)}
+                  placeholder="e.g. Bank Of Baroda"
                   className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-gray-900 dark:text-white"
                 />
               </div>
@@ -355,16 +364,29 @@ export default function CompanySettingsView({ onNavigateToBilling }: CompanySett
                   type="text"
                   value={form.bank?.acc || ''}
                   onChange={(e) => handleBankChange('acc', e.target.value)}
+                  placeholder="e.g. 34670100017957"
                   className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-gray-900 dark:text-white font-mono"
                 />
               </div>
 
               <div>
-                <label className="block font-semibold text-gray-700 dark:text-gray-300 mb-1">IFSC Code</label>
+                <label className="block font-semibold text-gray-700 dark:text-gray-300 mb-1">Account Holder / Name</label>
                 <input
                   type="text"
-                  value={form.bank?.ifsc || ''}
+                  value={form.bank?.accName || ''}
+                  onChange={(e) => handleBankChange('accName', e.target.value)}
+                  placeholder="e.g. Solarithm Consultancy"
+                  className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-gray-900 dark:text-white"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-gray-700 dark:text-gray-300 mb-1">IFSC Code (Strict Uppercase)</label>
+                <input
+                  type="text"
+                  value={(form.bank?.ifsc || '').toUpperCase()}
                   onChange={(e) => handleBankChange('ifsc', e.target.value)}
+                  placeholder="e.g. AUBL0002519"
                   className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-gray-900 dark:text-white font-mono uppercase"
                 />
               </div>
@@ -375,7 +397,19 @@ export default function CompanySettingsView({ onNavigateToBilling }: CompanySett
                   type="text"
                   value={form.bank?.upi || ''}
                   onChange={(e) => handleBankChange('upi', e.target.value)}
+                  placeholder="e.g. solarithm@okaxis"
                   className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-gray-900 dark:text-white font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-gray-700 dark:text-gray-300 mb-1">Branch Name</label>
+                <input
+                  type="text"
+                  value={form.bank?.branch || ''}
+                  onChange={(e) => handleBankChange('branch', e.target.value)}
+                  placeholder="e.g. Kamrej Branch"
+                  className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-gray-900 dark:text-white"
                 />
               </div>
             </div>
@@ -390,14 +424,23 @@ export default function CompanySettingsView({ onNavigateToBilling }: CompanySett
               <span>Live Header Snapshot</span>
             </h3>
 
-            <div className="bg-gray-50 dark:bg-[#1A1A1A] rounded-lg p-3 border border-gray-200 dark:border-[#2D2D2D] text-xs">
+            <div className="bg-gray-50 dark:bg-[#1A1A1A] rounded-lg p-3 border border-gray-200 dark:border-[#2D2D2D] text-xs space-y-1">
               <div className="font-bold text-gray-900 dark:text-white">{form.companyName}</div>
               <div className="text-[10px] text-gray-500 dark:text-gray-400 italic">{form.tagline}</div>
-              <div className="text-[10px] text-gray-600 dark:text-gray-300 mt-2 font-mono">
-                GSTIN: {form.gstin}
+              <div className="text-[10px] text-gray-600 dark:text-gray-300 pt-1 font-mono">
+                GSTIN: {(form.gstin || '').toUpperCase()}
               </div>
               <div className="text-[10px] text-gray-600 dark:text-gray-300 font-mono">
-                Bank: {form.bank?.name} ({form.bank?.ifsc})
+                PAN: {(form.pan || '').toUpperCase()}
+              </div>
+              <div className="text-[10px] text-gray-600 dark:text-gray-300 font-mono pt-1">
+                Bank: {form.bank?.name || '—'}
+              </div>
+              <div className="text-[10px] text-gray-600 dark:text-gray-300 font-mono">
+                A/C: {form.bank?.acc || '—'} ({form.bank?.accName || form.companyName})
+              </div>
+              <div className="text-[10px] text-[#D4AF37] font-mono font-semibold">
+                IFSC: {(form.bank?.ifsc || '—').toUpperCase()}
               </div>
             </div>
 

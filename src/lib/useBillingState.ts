@@ -34,8 +34,15 @@ import {
 import { syncInvoiceProjectsToFirestore } from './projectSync';
 
 export function blankInvoice(settings: InvoiceSettings, companyOverride?: CompanySettings): InvoiceData {
-  const company = companyOverride || getInitialCompanySettings();
-  const effectiveBank = company.bank || settings.bank;
+  const company = companyOverride || (typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings());
+  const effectiveBank = {
+    name: (company.bank?.name || settings.bank?.name || '').trim(),
+    acc: (company.bank?.acc || settings.bank?.acc || '').trim(),
+    accName: (company.bank?.accName || settings.bank?.accName || '').trim(),
+    ifsc: (company.bank?.ifsc || settings.bank?.ifsc || '').toUpperCase().trim(),
+    upi: (company.bank?.upi || settings.bank?.upi || '').trim(),
+    branch: (company.bank?.branch || settings.bank?.branch || '').trim()
+  };
 
   return {
     id: uid('inv'),
@@ -57,7 +64,7 @@ export function blankInvoice(settings: InvoiceSettings, companyOverride?: Compan
     cgst: settings.defaultGST.cgst,
     igst: settings.defaultGST.igst,
     advance: 0,
-    bank: Object.assign({}, effectiveBank),
+    bank: effectiveBank,
     terms: settings.terms.slice(),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString()
@@ -248,7 +255,8 @@ export function useBillingState() {
   );
 
   const startNewInvoice = useCallback(() => {
-    const fresh = blankInvoice(settings);
+    const company = typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings();
+    const fresh = blankInvoice(settings, company);
     setCurrentInvoice(fresh);
     setIsDirty(false);
     return fresh;
@@ -259,6 +267,17 @@ export function useBillingState() {
     if (!found) return null;
     const copy: InvoiceData = JSON.parse(JSON.stringify(found));
     copy._isNew = false;
+    const company = typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings();
+    if (company?.bank) {
+      copy.bank = {
+        name: (company.bank.name || copy.bank?.name || '').trim(),
+        acc: (company.bank.acc || copy.bank?.acc || '').trim(),
+        accName: (company.bank.accName || copy.bank?.accName || '').trim(),
+        ifsc: (company.bank.ifsc || copy.bank?.ifsc || '').toUpperCase().trim(),
+        upi: (company.bank.upi || copy.bank?.upi || '').trim(),
+        branch: (company.bank.branch || copy.bank?.branch || '').trim()
+      };
+    }
     setCurrentInvoice(copy);
     setIsDirty(false);
     return copy;

@@ -78,7 +78,10 @@ import {
   evaluateSubscriptionCoverage,
   resolveEffectivePricingCategory,
   findMatchingCapacityRow,
-  calculateSlabCost
+  calculateSlabCost,
+  normalizeScopeKey,
+  formatScopeTitleCase,
+  calculateCompoundPackagePrice
 } from '@/src/lib/projectUtils';
 import { syncInvoiceProjectsToFirestore } from '@/src/lib/projectSync';
 
@@ -260,6 +263,54 @@ export default function BillingModule({
       .map(([ym, count]) => ({ ym, count, label: formatMonthDisplay(ym) }))
       .sort((a, b) => b.ym.localeCompare(a.ym));
   }, [externalProjects]);
+
+  // Dynamic list of scopes available across pricing rules, projects, and presets
+  const availableBillingScopes = useMemo(() => {
+    const scopeMap = new Map<string, string>(); // normalizedKey -> titleCaseLabel
+
+    // 1. Base presets from SCOPE_OPTIONS
+    SCOPE_OPTIONS.forEach((s) => {
+      if (!s) return;
+      const key = normalizeScopeKey(s);
+      if (key && !scopeMap.has(key)) {
+        scopeMap.set(key, formatScopeTitleCase(s));
+      }
+    });
+
+    // 2. Scopes from pricingRules (Admin Console)
+    externalPricingRules.forEach((rule) => {
+      const raw = rule.scope || rule.scopeOfWork || rule.name;
+      if (typeof raw === 'string' && raw.trim()) {
+        const key = normalizeScopeKey(raw);
+        if (key && !scopeMap.has(key)) {
+          scopeMap.set(key, formatScopeTitleCase(raw));
+        }
+      }
+    });
+
+    // 3. Scopes from active projects
+    externalProjects.forEach((proj) => {
+      const raw = proj.scopeOfWork || proj.scope || proj.workScope;
+      if (typeof raw === 'string' && raw.trim()) {
+        const key = normalizeScopeKey(raw);
+        if (key && !scopeMap.has(key)) {
+          scopeMap.set(key, formatScopeTitleCase(raw));
+        }
+      }
+    });
+
+    return Array.from(scopeMap.values()).sort((a, b) => a.localeCompare(b));
+  }, [externalPricingRules, externalProjects]);
+
+  const getRowScopeOptions = (rowScope?: string) => {
+    if (!rowScope || !rowScope.trim()) return availableBillingScopes;
+    const rowKey = normalizeScopeKey(rowScope);
+    const exists = availableBillingScopes.some((s) => normalizeScopeKey(s) === rowKey);
+    if (!exists) {
+      return [formatScopeTitleCase(rowScope), ...availableBillingScopes];
+    }
+    return availableBillingScopes;
+  };
 
   // Directive 2: Cross-reference projects against selected month using canonical date hierarchy
 // Helper to detect if project has an explicit unbilled upgrade in the target billing month
@@ -524,11 +575,51 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
     { id: 'settings', label: 'Settings', icon: Settings }
   ];
 
+  // Live synchronization: ensure currentInvoice.bank automatically refreshes with authoritative companySettings.bank
+  useEffect(() => {
+    if (companySettings?.bank && currentInvoice) {
+      const liveBank = {
+        name: (companySettings.bank.name || currentInvoice.bank?.name || '').trim(),
+        acc: (companySettings.bank.acc || currentInvoice.bank?.acc || '').trim(),
+        accName: (companySettings.bank.accName || currentInvoice.bank?.accName || '').trim(),
+        ifsc: (companySettings.bank.ifsc || currentInvoice.bank?.ifsc || '').toUpperCase().trim(),
+        upi: (companySettings.bank.upi || currentInvoice.bank?.upi || '').trim(),
+        branch: (companySettings.bank.branch || currentInvoice.bank?.branch || '').trim()
+      };
+
+      const isDifferent =
+        (currentInvoice.bank?.name || '').trim() !== liveBank.name ||
+        (currentInvoice.bank?.acc || '').trim() !== liveBank.acc ||
+        (currentInvoice.bank?.accName || '').trim() !== liveBank.accName ||
+        (currentInvoice.bank?.ifsc || '').toUpperCase().trim() !== liveBank.ifsc ||
+        (currentInvoice.bank?.upi || '').trim() !== liveBank.upi ||
+        (currentInvoice.bank?.branch || '').trim() !== liveBank.branch;
+
+      if (isDifferent) {
+        setCurrentInvoice((prev) => ({
+          ...prev,
+          bank: liveBank
+        }));
+      }
+    }
+  }, [companySettings?.bank, currentInvoice.id]);
+
   // Prepare & open preview
   const handleOpenPreview = async (invData?: InvoiceData) => {
-    const dataToPreview = invData || {
-      ...currentInvoice,
-      totals: currentTotals
+    // Authoritative bank details from companySettings
+    const effectiveBank = {
+      name: (companySettings.bank?.name || (invData || currentInvoice).bank?.name || '').trim(),
+      acc: (companySettings.bank?.acc || (invData || currentInvoice).bank?.acc || '').trim(),
+      accName: (companySettings.bank?.accName || (invData || currentInvoice).bank?.accName || '').trim(),
+      ifsc: (companySettings.bank?.ifsc || (invData || currentInvoice).bank?.ifsc || '').toUpperCase().trim(),
+      upi: (companySettings.bank?.upi || (invData || currentInvoice).bank?.upi || '').trim(),
+      branch: (companySettings.bank?.branch || (invData || currentInvoice).bank?.branch || '').trim()
+    };
+
+    const dataToPreview: InvoiceData = {
+      ...(invData || currentInvoice),
+      bank: effectiveBank,
+      totals: invData?.totals || currentTotals
     };
 
     if (!dataToPreview.invNo.trim()) {
@@ -550,15 +641,17 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
     setTimeout(() => {
       const mergedSettings: InvoiceSettings = {
         ...settings,
-        ...companySettings,
-        bank: {
-          ...settings.bank,
-          ...companySettings.bank,
-          accName: companySettings.bank?.accName || settings.bank?.accName || '',
-          upi: companySettings.bank?.upi || settings.bank?.upi || ''
-        }
+        companyName: (companySettings.companyName || settings.companyName || '').trim(),
+        tagline: (companySettings.tagline || settings.tagline || '').trim(),
+        gstin: safeStringIdentifier(companySettings.gstin || settings.gstin).toUpperCase().trim(),
+        phone: (companySettings.phone || settings.phone || '').trim(),
+        email: (companySettings.email || settings.email || '').trim(),
+        address: (companySettings.address || settings.address || '').trim(),
+        logo: companySettings.logo || settings.logo,
+        signature: companySettings.signature || settings.signature,
+        bank: effectiveBank
       };
-      const pageDescs = buildInvoicePages(dataToPreview, mergedSettings);
+      const pageDescs = buildInvoicePages(dataToPreview, mergedSettings, companySettings);
       const rendered = pageDescs.map((p) => ({
         pageNum: p.pageNum || 1,
         totalPages: p.totalPages || 1,
@@ -572,18 +665,34 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
     if (!previewInvoiceData) return;
     setIsPdfExporting(true);
     try {
+      const effectiveBank = {
+        name: (companySettings.bank?.name || previewInvoiceData.bank?.name || '').trim(),
+        acc: (companySettings.bank?.acc || previewInvoiceData.bank?.acc || '').trim(),
+        accName: (companySettings.bank?.accName || previewInvoiceData.bank?.accName || '').trim(),
+        ifsc: (companySettings.bank?.ifsc || previewInvoiceData.bank?.ifsc || '').toUpperCase().trim(),
+        upi: (companySettings.bank?.upi || previewInvoiceData.bank?.upi || '').trim(),
+        branch: (companySettings.bank?.branch || previewInvoiceData.bank?.branch || '').trim()
+      };
+
+      const refreshedData: InvoiceData = {
+        ...previewInvoiceData,
+        bank: effectiveBank
+      };
+
       const mergedSettings: InvoiceSettings = {
         ...settings,
-        ...companySettings,
-        bank: {
-          ...settings.bank,
-          ...companySettings.bank,
-          accName: companySettings.bank?.accName || settings.bank?.accName || '',
-          upi: companySettings.bank?.upi || settings.bank?.upi || ''
-        }
+        companyName: (companySettings.companyName || settings.companyName || '').trim(),
+        tagline: (companySettings.tagline || settings.tagline || '').trim(),
+        gstin: safeStringIdentifier(companySettings.gstin || settings.gstin).toUpperCase().trim(),
+        phone: (companySettings.phone || settings.phone || '').trim(),
+        email: (companySettings.email || settings.email || '').trim(),
+        address: (companySettings.address || settings.address || '').trim(),
+        logo: companySettings.logo || settings.logo,
+        signature: companySettings.signature || settings.signature,
+        bank: effectiveBank
       };
       await exportInvoicePDF(
-        previewInvoiceData,
+        refreshedData,
         mergedSettings,
         (msg) => setPdfProgressText(msg),
         companySettings
@@ -752,23 +861,9 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
           const rawCapacity = String(p.plantCapacity || p.systemCapacity || p.capacity || p.kw || '0');
           const kw = parseFloat(rawCapacity.replace(/[^\d.]/g, '')) || 0;
 
-          // Scope resolution
-          const rawScope = String(p.scopeOfWork || p.scope || p.workScope || 'Pre-Design').trim();
-          let scope: string = 'Pre-Design';
-          const foundScope = SCOPE_OPTIONS.find((s) => s.toLowerCase() === rawScope.toLowerCase());
-          if (foundScope) {
-            scope = foundScope;
-          } else if (rawScope.toLowerCase().includes('ceig')) {
-            scope = 'CEIG';
-          } else if (rawScope.toLowerCase().includes('pvsyst')) {
-            scope = 'PVsyst';
-          } else if (rawScope.toLowerCase().includes('detail')) {
-            scope = 'Detailed Engineering';
-          } else if (rawScope.toLowerCase().includes('permit')) {
-            scope = 'Permit Package';
-          } else {
-            scope = 'Standard Design';
-          }
+          // Scope resolution: Preserve authentic project scope without heuristic degradation
+          const rawScope = String(p.scopeOfWork || p.scope || p.workScope || '').trim();
+          const scope: string = rawScope ? formatScopeTitleCase(rawScope) : 'Pre-Design';
 
           const projName = p.projectName || p.name || p.projectTitle || (p.projectNumber ? `Project ${p.projectNumber}` : 'Solar Engineering Deliverable');
 
@@ -788,10 +883,11 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
             evaluatedFullCost = Number(p.amount);
           } else {
             // Dynamic evaluation via pricing slab and effective tier
+            const normProjectScope = normalizeScopeKey(scope);
             const matchedRule = externalPricingRules.find((r) => {
               const ruleCat = String(r.category || r.tier || 'T1').toUpperCase().trim();
-              const ruleScope = String(r.scope || r.scopeOfWork || '').toLowerCase().trim();
-              return ruleCat === effectiveTier && ruleScope === rawScope.toLowerCase().trim();
+              const ruleScope = normalizeScopeKey(r.scope || r.scopeOfWork || '');
+              return ruleCat === effectiveTier && ruleScope === normProjectScope;
             });
             if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
               const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, kw);
@@ -800,6 +896,12 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
               }
             } else if (matchedRule && isZeroOrPositive(matchedRule.basePrice || matchedRule.price)) {
               evaluatedFullCost = Number(matchedRule.basePrice || matchedRule.price || 0);
+            } else {
+              // Check compound package pricing (e.g., "Pre-Design + PVsyst", "Pipe Calculation")
+              const compoundCost = calculateCompoundPackagePrice(scope, kw, effectiveTier, undefined, externalPricingRules);
+              if (compoundCost > 0) {
+                evaluatedFullCost = compoundCost;
+              }
             }
           }
 
@@ -1857,11 +1959,17 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                             </td>
                             <td className="py-2 px-2">
                               <select
-                                value={row.scope}
+                                value={
+                                  (() => {
+                                    const currentKey = normalizeScopeKey(row.scope || '');
+                                    const matched = getRowScopeOptions(row.scope).find((sc) => normalizeScopeKey(sc) === currentKey);
+                                    return matched || row.scope || '';
+                                  })()
+                                }
                                 onChange={(e) => handleUpdateLineItem(row.id, 'scope', e.target.value)}
                                 className="w-full bg-gray-50 dark:bg-[#181818] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white"
                               >
-                                {SCOPE_OPTIONS.map((sc) => (
+                                {getRowScopeOptions(row.scope).map((sc) => (
                                   <option key={sc} value={sc} className="bg-white dark:bg-[#1E1E1E] text-gray-900 dark:text-white">
                                     {sc}
                                   </option>

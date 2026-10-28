@@ -7,6 +7,11 @@ import OwnerAuthGuard from '@/src/components/OwnerAuthGuard';
 export const metadata: Metadata = {
   title: 'Solarithm Insight',
   description: 'Executive Project & Financial Management Console',
+  icons: {
+    icon: '/solarithm-app-icon.svg',
+    shortcut: '/solarithm-app-icon.svg',
+    apple: '/solarithm-app-icon.svg',
+  },
   openGraph: {
     title: 'Solarithm Insight',
     description: 'Executive Project & Financial Management Console',

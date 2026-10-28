@@ -26,10 +26,18 @@ export const DEFAULT_TERMS = [
   'Invoice covers only agreed design scope; additional revisions/documentation will be chargeable.'
 ];
 
+/**
+ * Non-exhaustive engineering scope presets for quick suggestions and fallbacks.
+ * Valid Admin Console scopes, custom deliverables, and compound scopes (e.g., "Pre-Design + PVsyst", "Pipe Calculation")
+ * are first-class strings and fully supported across invoice rows, state persistence, and PDF rendering.
+ */
 export const SCOPE_OPTIONS = [
-  'Pre Design',
-  'Post Design',
-  'Detail Design',
+  'Pre-Design',
+  'Post-Design',
+  'Detailed Engineering',
+  'Pre-Design + PVsyst',
+  'Post-Design + PVsyst',
+  'Pipe Calculation',
   'SLD',
   'GA Layout',
   'CEIG Layout',
@@ -159,21 +167,21 @@ export interface InvoiceData {
 export function defaultSettings(): InvoiceSettings {
   const company = typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings();
   return {
-    companyName: company.companyName,
-    tagline: company.tagline,
-    gstin: company.gstin,
-    phone: company.phone,
-    email: company.email,
-    address: company.address,
+    companyName: (company.companyName || '').trim(),
+    tagline: (company.tagline || '').trim(),
+    gstin: safeStringIdentifier(company.gstin).toUpperCase().trim(),
+    phone: (company.phone || '').trim(),
+    email: (company.email || '').trim(),
+    address: (company.address || '').trim(),
     logo: company.logo,
     signature: null,
     bank: {
-      name: company.bank.name,
-      acc: company.bank.acc,
-      accName: company.bank.accName,
-      ifsc: company.bank.ifsc,
-      upi: company.bank.upi,
-      branch: company.bank.branch || ''
+      name: (company.bank.name || '').trim(),
+      acc: safeStringIdentifier(company.bank.acc).trim(),
+      accName: (company.bank.accName || '').trim(),
+      ifsc: safeStringIdentifier(company.bank.ifsc).toUpperCase().trim(),
+      upi: (company.bank.upi || '').trim(),
+      branch: (company.bank.branch || '').trim()
     },
     terms: DEFAULT_TERMS.slice(),
     defaultGST: { sgst: 9, cgst: 9, igst: 0 },
@@ -503,27 +511,32 @@ export function renderHeaderBand(
 ): string {
   const company = companySettingsOverride || (typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings());
 
-  const logoHtml = company.logo
-    ? `<img class="pv-logo" src="${company.logo}" alt="Company logo">`
+  const logoHtml = company.logo || settings.logo
+    ? `<img class="pv-logo" src="${company.logo || settings.logo}" alt="Company logo">`
     : logoFallbackSVG();
 
-  const gstinStr = safeStringIdentifier(company.gstin);
-  const panStr = safeStringIdentifier((company as any).pan || (company as any).panNumber);
+  const companyName = (company.companyName || settings.companyName || 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY').trim();
+  const tagline = (company.tagline || settings.tagline || '').trim();
+  const gstinStr = safeStringIdentifier(company.gstin || settings.gstin).toUpperCase().trim();
+  const panStr = safeStringIdentifier((company as any).pan || (company as any).panNumber || (settings as any).pan).toUpperCase().trim();
+  const phone = (company.phone || settings.phone || '').trim();
+  const email = (company.email || settings.email || '').trim();
+  const address = (company.address || settings.address || '').trim();
 
   return `<div class="pv-header-band">
     <div class="pv-company-area">
       ${logoHtml}
       <div class="pv-company-info">
-        <div class="pv-company-name">${escapeHtml(company.companyName)}</div>
-        ${company.tagline ? `<div class="pv-company-tagline">${escapeHtml(company.tagline)}</div>` : ''}
+        <div class="pv-company-name">${escapeHtml(companyName)}</div>
+        ${tagline ? `<div class="pv-company-tagline">${escapeHtml(tagline)}</div>` : ''}
         ${gstinStr ? `<div class="pv-company-gstin">GSTIN : ${escapeHtml(gstinStr)}</div>` : ''}
         ${panStr ? `<div class="pv-company-gstin">PAN : ${escapeHtml(panStr)}</div>` : ''}
       </div>
     </div>
     <div class="pv-contact-block">
-      ${company.phone ? `<div class="pv-contact-line">${iconPhone()}<span>${escapeHtml(safeStringIdentifier(company.phone))}</span></div>` : ''}
-      ${company.email ? `<div class="pv-contact-line">${iconMail()}<span>${escapeHtml(company.email)}</span></div>` : ''}
-      ${company.address ? `<div class="pv-contact-line">${iconPin()}<span>${escapeHtml(company.address)}</span></div>` : ''}
+      ${phone ? `<div class="pv-contact-line">${iconPhone()}<span>${escapeHtml(safeStringIdentifier(phone))}</span></div>` : ''}
+      ${email ? `<div class="pv-contact-line">${iconMail()}<span>${escapeHtml(email)}</span></div>` : ''}
+      ${address ? `<div class="pv-contact-line">${iconPin()}<span>${escapeHtml(address)}</span></div>` : ''}
     </div>
   </div>`;
 }
@@ -552,8 +565,8 @@ export function renderClientProjectGrid(data: InvoiceData): string {
   const t = data.totals || { projectCount: 0, totalKW: 0 };
   const rawAddress = data.client?.address || '';
   const addressHtml = escapeHtml(rawAddress).replace(/\n/g, '<br/>') || '—';
-  const clientGstin = safeStringIdentifier(data.client?.gstin);
-  const clientPan = safeStringIdentifier((data.client as any)?.pan);
+  const clientGstin = safeStringIdentifier(data.client?.gstin).toUpperCase().trim();
+  const clientPan = safeStringIdentifier((data.client as any)?.pan).toUpperCase().trim();
   const clientPhone = safeStringIdentifier(data.client?.phone);
 
   return `<div class="pv-info-grid">
@@ -597,11 +610,14 @@ export function renderContinuedNote(): string {
   return `<div class="pv-continued-note">Continued on Next Page →</div>`;
 }
 
-export function renderFooter(pageNum: number, totalPages: number): string {
+export function renderFooter(pageNum: number, totalPages: number, companyName?: string): string {
+  const cleanComp = (companyName || '').trim();
+  const brandName = cleanComp ? escapeHtml(cleanComp.toUpperCase()) : 'SOLARITHM';
+  const displayComp = cleanComp ? escapeHtml(cleanComp) : 'Solarithm';
   return `<div class="pv-footer">
-    <div class="pv-footer-text">Thank you for your trust in Solarithm.</div>
+    <div class="pv-footer-text">Thank you for your trust in ${displayComp}.</div>
     <div class="pv-footer-page">Page ${pageNum} of ${totalPages}</div>
-    <div class="pv-footer-brand">SOLARITHM</div>
+    <div class="pv-footer-brand">${brandName}</div>
   </div>`;
 }
 
@@ -622,16 +638,23 @@ export function renderBottomSection(
     projectCount: 0
   };
   const company = companySettingsOverride || (typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings());
-  const fallbackBank = company.bank || settings.bank || {};
+
+  // INVERT FALLBACK PRIORITY: Global Company Settings is authoritative Single Source of Truth
+  // Only fall back to data.bank or settings.bank if a specific field in company.bank is empty or undefined
+  const compBank = company.bank || settings.bank || ({} as any);
+  const dataBank = data.bank || ({} as any);
+  const rawIfsc = compBank.ifsc || dataBank.ifsc || settings.bank?.ifsc || '';
+
   const bank = {
-    name: data.bank?.name || fallbackBank.name,
-    acc: safeStringIdentifier(data.bank?.acc || fallbackBank.acc),
-    accName: data.bank?.accName || fallbackBank.accName,
-    ifsc: safeStringIdentifier(data.bank?.ifsc || fallbackBank.ifsc),
-    upi: data.bank?.upi || fallbackBank.upi,
-    branch: data.bank?.branch || fallbackBank.branch
+    name: (compBank.name || dataBank.name || settings.bank?.name || '').trim(),
+    acc: safeStringIdentifier(compBank.acc || dataBank.acc || settings.bank?.acc || '').trim(),
+    accName: (compBank.accName || dataBank.accName || settings.bank?.accName || '').trim(),
+    ifsc: safeStringIdentifier(rawIfsc).toUpperCase().trim(),
+    upi: (compBank.upi || dataBank.upi || settings.bank?.upi || '').trim(),
+    branch: (compBank.branch || dataBank.branch || settings.bank?.branch || '').trim()
   };
-  const companyName = company.companyName || settings.companyName;
+
+  const companyName = (company.companyName || settings.companyName || 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY').trim();
   const subtotal = roundCurrency(t.subtotal || 0);
   const sgstAmt = roundCurrency(t.sgstAmount ?? ((subtotal * (t.sgst || 0)) / 100));
   const cgstAmt = roundCurrency(t.cgstAmount ?? ((subtotal * (t.cgst || 0)) / 100));
@@ -648,7 +671,7 @@ export function renderBottomSection(
         <div class="pv-bank-row"><span class="pv-label">Account No.</span><span>${escapeHtml(bank.acc || '—')}</span></div>
         <div class="pv-bank-row"><span class="pv-label">Account Name</span><span>${escapeHtml(bank.accName || '—')}</span></div>
         <div class="pv-bank-row"><span class="pv-label">IFSC Code</span><span>${escapeHtml(bank.ifsc || '—')}</span></div>
-        <div class="pv-bank-row"><span class="pv-label">UPI ID</span><span>${escapeHtml(bank.upi || '—')}</span></div>
+        ${bank.upi ? `<div class="pv-bank-row"><span class="pv-label">UPI ID</span><span>${escapeHtml(bank.upi)}</span></div>` : ''}
         ${bank.branch ? `<div class="pv-bank-row"><span class="pv-label">Branch</span><span>${escapeHtml(bank.branch)}</span></div>` : ''}
       </div>
       <div>
@@ -772,7 +795,7 @@ export function buildInvoicePages(
   const theadH = measure(`<table class="pv-table">${renderTableHead()}</table>`);
   const continuedH = measure(renderContinuedNote());
   const bottomH = measure(renderBottomSection(data, settings, globalCompany));
-  const footerH = measure(renderFooter(1, 1));
+  const footerH = measure(renderFooter(1, 1, globalCompany.companyName));
 
   let rowHeights: number[] = [];
   if (data.rows.length) {
@@ -849,8 +872,10 @@ export function renderPageHTML(
   settings: InvoiceSettings,
   companySettingsOverride?: CompanySettings
 ): string {
+  const effectiveCompany = companySettingsOverride || (typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings());
+
   let inner = '';
-  inner += renderHeaderBand(data, settings, companySettingsOverride);
+  inner += renderHeaderBand(data, settings, effectiveCompany);
   inner += renderMetaStrip(data);
   if (pageData.isFirst) inner += renderClientProjectGrid(data);
 
@@ -861,9 +886,9 @@ export function renderPageHTML(
   inner += `</tbody></table></div>`;
 
   if (!pageData.isLast) inner += renderContinuedNote();
-  if (pageData.hasBottom) inner += renderBottomSection(data, settings, companySettingsOverride);
+  if (pageData.hasBottom) inner += renderBottomSection(data, settings, effectiveCompany);
 
-  return `<div class="a4-content">${inner}</div>` + renderFooter(pageData.pageNum || 1, pageData.totalPages || 1);
+  return `<div class="a4-content">${inner}</div>` + renderFooter(pageData.pageNum || 1, pageData.totalPages || 1, effectiveCompany.companyName);
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -879,16 +904,31 @@ export async function exportInvoicePDF(
 
   const effectiveCompany = companySettingsOverride || (typeof window !== 'undefined' ? getInitialCompanySettings() : defaultCompanySettings());
 
+  const effectiveBank = {
+    name: (effectiveCompany.bank?.name || settings.bank?.name || data.bank?.name || '').trim(),
+    acc: safeStringIdentifier(effectiveCompany.bank?.acc || settings.bank?.acc || data.bank?.acc || '').trim(),
+    accName: (effectiveCompany.bank?.accName || settings.bank?.accName || data.bank?.accName || '').trim(),
+    ifsc: safeStringIdentifier(effectiveCompany.bank?.ifsc || settings.bank?.ifsc || data.bank?.ifsc || '').toUpperCase().trim(),
+    upi: (effectiveCompany.bank?.upi || settings.bank?.upi || data.bank?.upi || '').trim(),
+    branch: (effectiveCompany.bank?.branch || settings.bank?.branch || data.bank?.branch || '').trim()
+  };
+
+  const refreshedData: InvoiceData = {
+    ...data,
+    bank: effectiveBank
+  };
+
   const mergedSettings: InvoiceSettings = {
     ...settings,
-    companyName: effectiveCompany.companyName,
-    tagline: effectiveCompany.tagline,
-    gstin: effectiveCompany.gstin,
-    phone: effectiveCompany.phone,
-    email: effectiveCompany.email,
-    address: effectiveCompany.address,
-    logo: effectiveCompany.logo,
-    bank: effectiveCompany.bank
+    companyName: (effectiveCompany.companyName || settings.companyName || '').trim(),
+    tagline: (effectiveCompany.tagline || settings.tagline || '').trim(),
+    gstin: safeStringIdentifier(effectiveCompany.gstin || settings.gstin).toUpperCase().trim(),
+    phone: (effectiveCompany.phone || settings.phone || '').trim(),
+    email: (effectiveCompany.email || settings.email || '').trim(),
+    address: (effectiveCompany.address || settings.address || '').trim(),
+    logo: effectiveCompany.logo || settings.logo,
+    signature: effectiveCompany.signature || settings.signature,
+    bank: effectiveBank
   };
 
   let root = document.getElementById('pdf-render-root');
@@ -901,13 +941,13 @@ export async function exportInvoicePDF(
 
   try {
     onProgress?.('Preparing pages…');
-    const pageDescs = buildInvoicePages(data, mergedSettings, effectiveCompany);
+    const pageDescs = buildInvoicePages(refreshedData, mergedSettings, effectiveCompany);
     const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
 
     for (let i = 0; i < pageDescs.length; i++) {
       onProgress?.(`Rendering page ${i + 1} of ${pageDescs.length}…`);
       const p = pageDescs[i];
-      const pageHtml = renderPageHTML(p, data, mergedSettings, effectiveCompany);
+      const pageHtml = renderPageHTML(p, refreshedData, mergedSettings, effectiveCompany);
 
       const pageEl = document.createElement('div');
       pageEl.className = 'a4-page';

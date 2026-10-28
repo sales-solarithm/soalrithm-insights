@@ -1,0 +1,198 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Sharp vector styling, 2D flat corporate UI -->
+    <clipPath id="squircleClip">
+      <rect x="16" y="16" width="480" height="480" rx="96" ry="96" />
+    </clipPath>
+  </defs>
+
+  <!-- 1. Dark Charcoal-Slate Squircle Background (#1C2127) with Matte Gold Border (#C5A059) -->
+  <rect 
+    x="16" 
+    y="16" 
+    width="480" 
+    height="480" 
+    rx="96" 
+    ry="96" 
+    fill="#1C2127" 
+    stroke="#C5A059" 
+    stroke-width="4" 
+  />
+
+  <!-- 2. Top-Center Subtle Grey Uppercase Text: "SOLARITHM" -->
+  <text 
+    x="256" 
+    y="78" 
+    text-anchor="middle" 
+    font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" 
+    font-size="18" 
+    font-weight="600" 
+    letter-spacing="5" 
+    fill="#8E9AA8"
+  >SOLARITHM</text>
+
+  <!-- 3. Top-Right Corner Dark Rounded Square Badge with White "S" -->
+  <g transform="translate(420, 48)">
+    <rect 
+      x="0" 
+      y="0" 
+      width="40" 
+      height="40" 
+      rx="10" 
+      fill="#14181D" 
+      stroke="#C5A059" 
+      stroke-width="1.8" 
+    />
+    <text 
+      x="20" 
+      y="27" 
+      text-anchor="middle" 
+      font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" 
+      font-size="22" 
+      font-weight="800" 
+      fill="#FFFFFF"
+    >S</text>
+  </g>
+
+  <!-- 4. Small Trend Chart Icon at Top-Center (below SOLARITHM) -->
+  <g transform="translate(242, 94)">
+    <rect x="0" y="0" width="28" height="22" rx="4" fill="none" stroke="#C5A059" stroke-width="1.8" opacity="0.85" />
+    <polyline points="4,16 11,9 17,13 24,6" fill="none" stroke="#C5A059" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+
+  <!-- 5. Central Financial Analytics Graphic -->
+  <!-- Crisp White Baseline -->
+  <line 
+    x1="126" 
+    y1="344" 
+    x2="386" 
+    y2="344" 
+    stroke="#FFFFFF" 
+    stroke-width="3" 
+    stroke-linecap="round" 
+  />
+
+  <!-- Four Ascending Vertical Bar Chart Columns alternating Matte Gold (#C5A059) and White (#FFFFFF) -->
+  <!-- Column 1: Matte Gold -->
+  <rect 
+    x="152" 
+    y="266" 
+    width="40" 
+    height="78" 
+    rx="5" 
+    fill="#C5A059" 
+  />
+
+  <!-- Column 2: White -->
+  <rect 
+    x="210" 
+    y="220" 
+    width="40" 
+    height="124" 
+    rx="5" 
+    fill="#FFFFFF" 
+  />
+
+  <!-- Column 3: Matte Gold -->
+  <rect 
+    x="268" 
+    y="174" 
+    width="40" 
+    height="170" 
+    rx="5" 
+    fill="#C5A059" 
+  />
+
+  <!-- Column 4: White -->
+  <rect 
+    x="326" 
+    y="126" 
+    width="40" 
+    height="218" 
+    rx="5" 
+    fill="#FFFFFF" 
+  />
+
+  <!-- Upward-Trending Gold Line Graph with Nodes and Arrow -->
+  <g>
+    <!-- Connecting Gold Line -->
+    <polyline 
+      points="172,242 230,196 288,148 346,96 384,66" 
+      fill="none" 
+      stroke="#C5A059" 
+      stroke-width="3.5" 
+      stroke-linecap="round" 
+      stroke-linejoin="round" 
+    />
+
+    <!-- Arrowhead at Top-Right of Line Graph -->
+    <polygon 
+      points="386,64 370,68 379,79" 
+      fill="#C5A059" 
+    />
+
+    <!-- Circular Nodes on each bar's inflection point -->
+    <circle cx="172" cy="242" r="5.5" fill="#1C2127" stroke="#C5A059" stroke-width="2.5" />
+    <circle cx="230" cy="196" r="5.5" fill="#1C2127" stroke="#C5A059" stroke-width="2.5" />
+    <circle cx="288" cy="148" r="5.5" fill="#1C2127" stroke="#C5A059" stroke-width="2.5" />
+    <circle cx="346" cy="96"  r="5.5" fill="#1C2127" stroke="#C5A059" stroke-width="2.5" />
+  </g>
+
+  <!-- 6. Three Circular Indian Rupee (₹) Coins -->
+  <!-- Coin 1: Matte Gold Coin at Top-Left -->
+  <g transform="translate(98, 165)">
+    <circle cx="0" cy="0" r="24" fill="#C5A059" stroke="#E2C485" stroke-width="1.5" />
+    <circle cx="0" cy="0" r="19" fill="none" stroke="#1C2127" stroke-width="1.2" opacity="0.6" stroke-dasharray="3,2" />
+    <text 
+      x="0" 
+      y="8" 
+      text-anchor="middle" 
+      font-family="system-ui, -apple-system, sans-serif" 
+      font-size="24" 
+      font-weight="bold" 
+      fill="#1C2127"
+    >₹</text>
+  </g>
+
+  <!-- Coin 2: White Coin Flanking Bars on Left -->
+  <g transform="translate(104, 304)">
+    <circle cx="0" cy="0" r="20" fill="#FFFFFF" stroke="#C5A059" stroke-width="1.5" />
+    <circle cx="0" cy="0" r="16" fill="none" stroke="#1C2127" stroke-width="1" opacity="0.5" stroke-dasharray="2,2" />
+    <text 
+      x="0" 
+      y="7" 
+      text-anchor="middle" 
+      font-family="system-ui, -apple-system, sans-serif" 
+      font-size="20" 
+      font-weight="bold" 
+      fill="#1C2127"
+    >₹</text>
+  </g>
+
+  <!-- Coin 3: White Coin Flanking Bars on Right -->
+  <g transform="translate(408, 304)">
+    <circle cx="0" cy="0" r="20" fill="#FFFFFF" stroke="#C5A059" stroke-width="1.5" />
+    <circle cx="0" cy="0" r="16" fill="none" stroke="#1C2127" stroke-width="1" opacity="0.5" stroke-dasharray="2,2" />
+    <text 
+      x="0" 
+      y="7" 
+      text-anchor="middle" 
+      font-family="system-ui, -apple-system, sans-serif" 
+      font-size="20" 
+      font-weight="bold" 
+      fill="#1C2127"
+    >₹</text>
+  </g>
+
+  <!-- 7. Bottom-Center Bold White Uppercase Text: "INSIGHTS" -->
+  <text 
+    x="256" 
+    y="442" 
+    text-anchor="middle" 
+    font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" 
+    font-size="36" 
+    font-weight="900" 
+    letter-spacing="9" 
+    fill="#FFFFFF"
+  >INSIGHTS</text>
+</svg>
