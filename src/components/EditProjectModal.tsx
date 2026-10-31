@@ -413,7 +413,7 @@ export default function EditProjectModal({
             return rRole === role && rScope === targetScopeKey;
           });
         }
-        if (!rule && (targetScopeKey.includes('pipe') || targetScopeKey.includes('cei'))) {
+        if (!rule && targetScopeKey.includes('cei')) {
           rule = rawCommissionRules.find((cr: any) => {
             const rRole = String(cr.role || '').toLowerCase().trim();
             const rScope = normalizeKey(cr.scope || cr.scopeOfWork || '');

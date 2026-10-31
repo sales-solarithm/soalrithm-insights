@@ -757,6 +757,22 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
     }
   };
 
+  const handleDeleteInvoice = (inv: InvoiceData) => {
+    triggerConfirm(
+      `Delete Invoice ${inv.invNo}?`,
+      `Are you sure you want to permanently delete invoice #${inv.invNo} (${inv.client?.name || 'Client'})? This action cannot be undone.`,
+      async () => {
+        try {
+          await deleteInvoice(inv.id);
+          showToast(`Invoice ${inv.invNo} permanently deleted ✓`, 'success');
+        } catch (err) {
+          console.error('Error deleting invoice:', err);
+          showToast('Failed to delete invoice. Please try again.', 'error');
+        }
+      }
+    );
+  };
+
   // Line item handlers
   const handleAddLineItem = () => {
     const updatedRows = [...currentInvoice.rows, blankLineItem()];
@@ -895,7 +911,10 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                 evaluatedFullCost = calculateSlabCost(matchedRow, kw);
               }
             } else if (matchedRule && isZeroOrPositive(matchedRule.basePrice || matchedRule.price)) {
-              evaluatedFullCost = Number(matchedRule.basePrice || matchedRule.price || 0);
+              const base = Number(matchedRule.basePrice || matchedRule.price || 0);
+              const pType = String(matchedRule.priceType || '').toLowerCase();
+              const isPerKw = pType.includes('kw') || pType === 'per kw' || pType === 'per_kw' || matchedRule.ratePerKw !== undefined || matchedRule.pricePerKw !== undefined;
+              evaluatedFullCost = isPerKw ? base * kw : base;
             } else {
               // Check compound package pricing (e.g., "Pre-Design + PVsyst", "Pipe Calculation")
               const compoundCost = calculateCompoundPackagePrice(scope, kw, effectiveTier, undefined, externalPricingRules);
@@ -1496,7 +1515,7 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                             </select>
                           </div>
                         </td>
-                        <td className="py-3.5 px-4 text-right">
+                        <td className="py-3.5 px-4 text-right space-x-2">
                           <button
                             onClick={() => {
                               const loaded = loadInvoice(inv.id);
@@ -1506,9 +1525,17 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                               }
                               setActiveBillingTab('invoice');
                             }}
-                            className="px-3 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-[#2A2A2A] hover:bg-gray-200 dark:hover:bg-[#333333] text-[#D4AF37] border border-gray-300 dark:border-[#333333] font-medium"
+                            className="px-3 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-[#2A2A2A] hover:bg-gray-200 dark:hover:bg-[#333333] text-[#D4AF37] border border-gray-300 dark:border-[#333333] font-medium cursor-pointer"
                           >
                             Open
+                          </button>
+                          <button
+                            onClick={() => handleDeleteInvoice(inv)}
+                            title="Delete Invoice"
+                            aria-label={`Delete Invoice ${inv.invNo}`}
+                            className="px-2.5 py-1.5 text-xs rounded-lg bg-gray-100 dark:bg-[#2A2A2A] hover:bg-gray-200 dark:hover:bg-[#333333] text-gray-500 hover:text-rose-500 dark:text-gray-400 dark:hover:text-rose-500 border border-gray-300 dark:border-[#333333] transition-colors inline-flex items-center justify-center cursor-pointer align-middle"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
                           </button>
                         </td>
                       </tr>
@@ -2254,6 +2281,14 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                               className="px-2.5 py-1 text-xs rounded bg-gray-100 dark:bg-[#2A2A2A] text-[#D4AF37] cursor-pointer"
                             >
                               PDF
+                            </button>
+                            <button
+                              onClick={() => handleDeleteInvoice(inv)}
+                              title="Delete Invoice"
+                              aria-label={`Delete Invoice ${inv.invNo}`}
+                              className="px-2.5 py-1 text-xs rounded bg-gray-100 dark:bg-[#2A2A2A] text-gray-500 hover:text-rose-500 dark:text-gray-400 dark:hover:text-rose-500 cursor-pointer transition-colors inline-flex items-center justify-center align-middle"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
                             </button>
                           </td>
                         </tr>

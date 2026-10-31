@@ -30,6 +30,7 @@ import {
   findMatchingInvoicesForProject,
   getEmployeeNameEnhanced,
   formatTwoPartName,
+  areIndianNamesMatching,
   normalizeScopeKey,
   formatScopeTitleCase
 } from '@/src/lib/projectUtils';
@@ -117,6 +118,17 @@ function resolveSalesCommission(p: any): number {
   if (isZeroOrPositive(p?.salesCommission)) return Number(p.salesCommission);
   if (isZeroOrPositive(p?.commission)) return Number(p.commission);
   return 0;
+}
+
+export function normalizeStatusCanonical(status: string | undefined | null): string {
+  if (!status) return '';
+  const s = String(status).trim().toLowerCase().replace(/[\s\-_]+/g, '');
+  if (s === 'completed' || s === 'finished') return 'Completed';
+  if (s === 'approved' || s === 'designapproved') return 'Approved';
+  if (s === 'inprogress' || s === 'pendingdesignapproval' || s === 'active') return 'In Progress';
+  if (s === 'inrevision' || s === 'revision') return 'In Revision';
+  if (s === 'notstarted' || s === 'cancelled' || s === 'rejected') return 'Not Started';
+  return toTitleCase(String(status).replace(/[_\-]+/g, ' '));
 }
 
 export default function ProjectsDirectory({
@@ -248,18 +260,28 @@ export default function ProjectsDirectory({
     return Array.from(scopeMap.values()).sort((a, b) => a.localeCompare(b));
   }, [projects]);
 
+
   const statusOptions = useMemo(() => {
     const set = new Set<string>();
     projects.forEach(p => {
       if (p.status && typeof p.status === 'string' && p.status.trim()) {
-        set.add(p.status.trim());
+        const canonical = normalizeStatusCanonical(p.status);
+        if (canonical) set.add(canonical);
       }
     });
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
+    const canonicalOrder = ['Approved', 'In Progress', 'Completed', 'In Revision', 'Not Started'];
+    return Array.from(set).sort((a, b) => {
+      const idxA = canonicalOrder.indexOf(a);
+      const idxB = canonicalOrder.indexOf(b);
+      if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+      if (idxA !== -1) return -1;
+      if (idxB !== -1) return 1;
+      return a.localeCompare(b);
+    });
   }, [projects]);
 
   const designerOptions = useMemo(() => {
-    const set = new Set<string>();
+    const uniqueNames: string[] = [];
     projects.forEach(p => {
       const candidates = [
         p.assignedDesigner,
@@ -267,16 +289,27 @@ export default function ProjectsDirectory({
         p.designer,
         p.assignedEngineer,
         p.designerId,
-        p.designerEmail ? formatIndianName(getEmployeeName(p.designerEmail)) : null
+        p.designerEmail
       ];
       candidates.forEach(d => {
-        if (d && typeof d === 'string' && d.trim() && d.trim().toLowerCase() !== 'n/a' && d.trim().toLowerCase() !== 'unassigned') {
-          set.add(d.trim());
+        if (!d || typeof d !== 'string') return;
+        const trimmed = d.trim();
+        if (!trimmed || trimmed === '—' || trimmed === 'N/A' || trimmed.toLowerCase() === 'unassigned') return;
+
+        // Resolve enhanced name then format as 2-part name (Surname Firstname)
+        const resolved = getEmployeeNameEnhanced(trimmed, users);
+        const twoPart = formatTwoPartName(resolved);
+        if (!twoPart || twoPart.toLowerCase() === 'unassigned') return;
+
+        // Deduplicate with existing items using areIndianNamesMatching
+        const alreadyExists = uniqueNames.some(name => areIndianNamesMatching(name, twoPart));
+        if (!alreadyExists) {
+          uniqueNames.push(twoPart);
         }
       });
     });
-    return Array.from(set).sort((a, b) => a.localeCompare(b));
-  }, [projects, getEmployeeName]);
+    return uniqueNames.sort((a, b) => a.localeCompare(b));
+  }, [projects, users]);
 
   const availableYears = useMemo(() => {
     const set = new Set<string>();
@@ -340,29 +373,39 @@ export default function ProjectsDirectory({
         if (!matchesScope) return false;
       }
 
-      // 3. Designer Filter: check project.assignedDesigner, project.designerName, project.designer, project.assignedEngineer, project.designerId
+      // 3. Designer Filter: check using areIndianNamesMatching on 2-part names
       if (designerFilter !== 'all') {
-        const targetDes = designerFilter.trim().toLowerCase();
+        const targetDes = designerFilter.trim();
         const designerCandidates = [
           p.assignedDesigner,
           p.designerName,
           p.designer,
           p.assignedEngineer,
           p.designerId,
-          p.designerEmail ? getEmployeeName(p.designerEmail) : null,
-          p.designerEmail ? formatIndianName(getEmployeeName(p.designerEmail)) : null,
           p.designerEmail
-        ].filter(Boolean).map(d => String(d).trim().toLowerCase());
+        ].filter(Boolean).map(d => {
+          const resolved = getEmployeeNameEnhanced(String(d), users);
+          return formatTwoPartName(resolved);
+        });
 
-        const matchesDesigner = designerCandidates.some(d => d === targetDes || d.includes(targetDes) || targetDes.includes(d));
+        const matchesDesigner = designerCandidates.some(d => 
+          areIndianNamesMatching(d, targetDes) ||
+          d.toLowerCase() === targetDes.toLowerCase() ||
+          d.toLowerCase().includes(targetDes.toLowerCase()) ||
+          targetDes.toLowerCase().includes(d.toLowerCase())
+        );
         if (!matchesDesigner) return false;
       }
 
-      // 4. Status Filter: case-insensitive match on project.status
+      // 4. Status Filter: case/underscore-insensitive canonical match on project.status
       if (statusFilter !== 'all') {
-        const targetStatus = statusFilter.trim().toLowerCase();
-        const pStatus = String(p.status || '').trim().toLowerCase();
-        if (pStatus !== targetStatus) return false;
+        const targetCanonical = normalizeStatusCanonical(statusFilter);
+        const pCanonical = normalizeStatusCanonical(p.status);
+        if (pCanonical !== targetCanonical) {
+          const targetClean = statusFilter.trim().toLowerCase().replace(/[\s\-_]+/g, '');
+          const pClean = String(p.status || '').trim().toLowerCase().replace(/[\s\-_]+/g, '');
+          if (targetClean !== pClean) return false;
+        }
       }
 
       // 5. Timeline Filter (Year & Month): resolve date using project.projectDate || project.date || project.createdAt

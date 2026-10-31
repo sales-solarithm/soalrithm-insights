@@ -22,7 +22,10 @@ export const SCOPE_LABELS: Record<string, string> = {
   sld: 'Single Line Diagram',
   bom: 'Bill of Materials',
   peStamping: 'PE Stamping',
-  interconnection: 'Interconnection Package'
+  interconnection: 'Interconnection Package',
+  pipeCalculation: 'Pipe Calculation',
+  gaLayout: 'GA Layout',
+  ceiLayouts: 'CEI Layouts'
 };
 
 export { 
@@ -753,7 +756,9 @@ export function toCanonicalScopeKey(scopeName: string): string {
   if (lower.includes('stamp')) return 'peStamping';
   if (lower.includes('as-built') || lower.includes('asbuilt')) return 'asBuilt';
   if (lower.includes('interconnection')) return 'interconnection';
-  if (lower.includes('cei') || lower.includes('ga layout') || lower.includes('pipe')) return 'ceiLayouts';
+  if (lower.includes('pipe')) return 'pipeCalculation';
+  if (lower.includes('ga layout') || lower.includes('ga_layout') || lower === 'ga' || lower.includes('ga drawing') || lower.includes('ga drawings')) return 'gaLayout';
+  if (lower.includes('cei')) return 'ceiLayouts';
 
   const clean = lower.replace(/[^a-z0-9\s_-]/g, '');
   const parts = clean.split(/[\s_-]+/).filter(Boolean);
@@ -1081,8 +1086,13 @@ export function calculateCompoundPackagePrice(
         if (matchedRow) {
           return calculateSlabCost(matchedRow, capacity);
         }
-      } else if (isZeroOrPositive(matchedRule.basePrice || matchedRule.price)) {
-        return Number(matchedRule.basePrice || matchedRule.price || 0);
+      } else {
+        const baseRate = safeNumber(
+          matchedRule.ratePerKw ?? matchedRule.rate ?? matchedRule.pricePerKw ?? matchedRule.basePrice ?? matchedRule.price ?? 0
+        );
+        const priceType = String(matchedRule.priceType || '').toLowerCase();
+        const isPerKw = priceType.includes('kw') || priceType === 'per kw' || priceType === 'per_kw' || matchedRule.ratePerKw !== undefined || matchedRule.pricePerKw !== undefined;
+        return isPerKw ? baseRate * capacity : baseRate;
       }
     }
     return 0;

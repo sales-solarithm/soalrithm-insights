@@ -463,27 +463,38 @@ export default function DashboardPage() {
       // Historical Cost Hard-Lock Preservation (Directive 2):
       // If a past project already has finalCost, calculatedCost, cost, amount, or totalCost, PRESERVE THAT NUMBER.
       // Do not dynamically overwrite it when the parent client updates tiers.
+      // EXCEPTION: When scopeOfWork changes or cost was locked to a legacy mismatched scope (e.g. legacy CEI ₹1500 for Pipe Calculation),
+      // or if project.isCostLocked === false, allow dynamic recalculation based on the new scope rule.
       let calculatedCost = 0;
       let isCostLocked = false;
-      
-      if (isZeroOrPositive(project.finalCost)) {
-        calculatedCost = Number(project.finalCost);
-        isCostLocked = true;
-      } else if (isZeroOrPositive(project.calculatedCost)) {
-        calculatedCost = Number(project.calculatedCost);
-        isCostLocked = true;
-      } else if (isZeroOrPositive(project.cost)) {
-        calculatedCost = Number(project.cost);
-        isCostLocked = true;
-      } else if (isZeroOrPositive(project.amount)) {
-        calculatedCost = Number(project.amount);
-        isCostLocked = true;
-      } else if (isZeroOrPositive(project.totalCost)) {
-        calculatedCost = Number(project.totalCost);
-        isCostLocked = true;
-      } else if (isZeroOrPositive(project.price)) {
-        calculatedCost = Number(project.price);
-        isCostLocked = true;
+
+      const canonicalScopeKey = toCanonicalScopeKey(project.scopeOfWork || project.scope || '');
+      const isLegacyPipeCeiBug = canonicalScopeKey === 'pipeCalculation' && 
+        (Number(project.finalCost) === 1500 || Number(project.calculatedCost) === 1500 || Number(project.cost) === 1500) && 
+        !project.isManualCostOverride;
+
+      const shouldInvalidateCostLock = project.isCostLocked === false || project.scopeChanged === true || isLegacyPipeCeiBug;
+
+      if (!shouldInvalidateCostLock) {
+        if (isZeroOrPositive(project.finalCost)) {
+          calculatedCost = Number(project.finalCost);
+          isCostLocked = true;
+        } else if (isZeroOrPositive(project.calculatedCost)) {
+          calculatedCost = Number(project.calculatedCost);
+          isCostLocked = true;
+        } else if (isZeroOrPositive(project.cost)) {
+          calculatedCost = Number(project.cost);
+          isCostLocked = true;
+        } else if (isZeroOrPositive(project.amount)) {
+          calculatedCost = Number(project.amount);
+          isCostLocked = true;
+        } else if (isZeroOrPositive(project.totalCost)) {
+          calculatedCost = Number(project.totalCost);
+          isCostLocked = true;
+        } else if (isZeroOrPositive(project.price)) {
+          calculatedCost = Number(project.price);
+          isCostLocked = true;
+        }
       }
 
       // Dynamic Pricing Fallback:
@@ -501,13 +512,17 @@ export default function DashboardPage() {
         if (dynamicPackagePrice > 0) {
           calculatedCost = dynamicPackagePrice;
         } else {
+          const targetKey = toCanonicalScopeKey(rawScopeOfWork);
           const matchedRule = pricingRules.find(
             (rule) => {
-              const ruleCategory = String(rule.category || 'Standard').toLowerCase().trim();
+              const ruleCategory = String(rule.category || rule.tier || 'Standard').toLowerCase().trim();
               const ruleScope = String(rule.scope || rule.scopeOfWork || '').toLowerCase().trim();
+              const ruleKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || '');
               const ruleSubService = normalizeSubService(rule.subService);
               
-              return ruleCategory === activeCategory && ruleScope === scope && (ruleSubService === subService || ruleSubService === 'standard');
+              return (ruleCategory === activeCategory || ruleCategory === String(resolvedTier).toLowerCase().trim()) &&
+                (ruleKey === targetKey || ruleScope === scope) &&
+                (ruleSubService === subService || ruleSubService === 'standard');
             }
           );
           if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
@@ -515,9 +530,11 @@ export default function DashboardPage() {
             if (matchedRow) {
               calculatedCost = calculateSlabCost(matchedRow, capacity);
             }
-          }
-          if (calculatedCost === 0 && matchedRule && (matchedRule.basePrice || matchedRule.price)) {
-            calculatedCost = Number(matchedRule.basePrice || matchedRule.price || 0);
+          } else if (matchedRule) {
+            const baseRate = safeNumber(matchedRule.ratePerKw ?? matchedRule.rate ?? matchedRule.pricePerKw ?? matchedRule.basePrice ?? matchedRule.price ?? 0);
+            const priceType = String(matchedRule.priceType || '').toLowerCase();
+            const isPerKw = priceType.includes('kw') || priceType === 'per kw' || priceType === 'per_kw' || matchedRule.ratePerKw !== undefined || matchedRule.pricePerKw !== undefined;
+            calculatedCost = isPerKw ? baseRate * capacity : baseRate;
           }
         }
       }
@@ -576,8 +593,8 @@ export default function DashboardPage() {
           });
         }
 
-        // Secondary Fallback for auxiliary scopes (e.g. Pipe Calculation, Ga Layout -> CEI Layouts)
-        if (!matchedRule && (projectScopeKey === "ceiLayouts" || projectScopeKey === "pipeCalculation")) {
+        // Secondary Fallback for CEI Layouts
+        if (!matchedRule && projectScopeKey === "ceiLayouts") {
           matchedRule = commissionRules.find(rule => {
             const ruleRole = String(rule.role || "").toLowerCase().trim();
             const ruleScopeKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || "");
@@ -678,10 +695,61 @@ export default function DashboardPage() {
     if (!targetProject || !targetProject.id) return;
     const originalProject = projects.find(p => p.id === targetProject.id) || {};
 
-    const finalCostValue = safeNumber(targetProject.finalCost ?? targetProject.calculatedCost ?? targetProject.cost);
-    const salesCommissionValue = safeNumber(targetProject.salesCommission ?? targetProject.commission);
-    const designerCommissionValue = safeNumber(targetProject.designerCommission ?? targetProject.designerFee);
+    const origScopeNorm = String(originalProject.scopeOfWork || originalProject.scope || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
+    const newScopeNorm = String(targetProject.scopeOfWork || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
+    const scopeChanged = Boolean(newScopeNorm && origScopeNorm && newScopeNorm !== origScopeNorm);
+
+    let finalCostValue = safeNumber(targetProject.finalCost ?? targetProject.calculatedCost ?? targetProject.cost);
+    let salesCommissionValue = safeNumber(targetProject.salesCommission ?? targetProject.commission);
+    let designerCommissionValue = safeNumber(targetProject.designerCommission ?? targetProject.designerFee);
     const plantCapacityValue = safeNumber(targetProject.plantCapacity ?? targetProject.systemCapacity ?? targetProject.capacity);
+
+    // Directive: Invalidate historical cost lock on scope change and recalculate dynamically
+    if (scopeChanged) {
+      const matchedClient = clients.find(
+        (c) => c.id === (targetProject.clientId || originalProject.clientId) || c.companyName === targetProject.clientName
+      );
+      const pDate = resolveProjectDate(targetProject) || getProjectDate(targetProject) || new Date();
+      const resolvedTier = resolveEffectivePricingCategory(
+        matchedClient,
+        pDate,
+        targetProject.pricingCategory || originalProject.pricingCategory
+      );
+      const subService = normalizeSubService(targetProject.subService || originalProject.subService);
+
+      const dynamicPrice = calculateCompoundPackagePrice(
+        targetProject.scopeOfWork,
+        plantCapacityValue,
+        resolvedTier,
+        subService,
+        pricingRules
+      );
+
+      if (dynamicPrice > 0) {
+        finalCostValue = dynamicPrice;
+      } else {
+        const targetScopeKey = toCanonicalScopeKey(targetProject.scopeOfWork);
+        const activeCategory = String(resolvedTier).toLowerCase().trim();
+        const matchedRule = pricingRules.find((rule) => {
+          const rTier = String(rule.category || rule.tier || 'T1').toLowerCase().trim();
+          const rKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || '');
+          const rSub = normalizeSubService(rule.subService);
+          return (rTier === activeCategory) && (rKey === targetScopeKey) && (rSub === subService || rSub === 'standard');
+        });
+
+        if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
+          const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, plantCapacityValue);
+          if (matchedRow) {
+            finalCostValue = calculateSlabCost(matchedRow, plantCapacityValue);
+          }
+        } else if (matchedRule) {
+          const baseRate = safeNumber(matchedRule.ratePerKw ?? matchedRule.rate ?? matchedRule.pricePerKw ?? matchedRule.basePrice ?? matchedRule.price ?? 0);
+          const priceType = String(matchedRule.priceType || '').toLowerCase();
+          const isPerKw = priceType.includes('kw') || priceType === 'per kw' || priceType === 'per_kw' || matchedRule.ratePerKw !== undefined || matchedRule.pricePerKw !== undefined;
+          finalCostValue = isPerKw ? baseRate * plantCapacityValue : baseRate;
+        }
+      }
+    }
 
     // CRITICAL DATE PRESERVATION (Audit Task 5):
     // Preserve existing date strictly: project.projectDate || project.date || project.createdAt
@@ -785,9 +853,7 @@ export default function DashboardPage() {
       if (targetProject.status && targetProject.status !== originalProject.status) {
         firestoreUpdatePayload.status = targetProject.status;
       }
-      const origScopeNorm = String(originalProject.scopeOfWork || originalProject.scope || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
-      const newScopeNorm = String(targetProject.scopeOfWork || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
-      const scopeChanged = Boolean(newScopeNorm && origScopeNorm && newScopeNorm !== origScopeNorm);
+
 
       if (targetProject.scopeOfWork && targetProject.scopeOfWork !== originalProject.scopeOfWork) {
         firestoreUpdatePayload.scopeOfWork = targetProject.scopeOfWork;

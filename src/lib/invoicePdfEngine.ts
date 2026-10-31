@@ -1,4 +1,3 @@
-import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
 import {
   CompanySettings,
@@ -7,6 +6,7 @@ import {
   COMPANY_STORAGE_KEYS
 } from './useCompanySettings';
 import { safeStringIdentifier, isZeroOrPositive } from './projectUtils';
+import { safeHtml2Canvas } from './pdfColorSanitizer';
 
 /* ════════════════════════════════════════════════════════════
    1. CONSTANTS & DEFAULTS
@@ -959,9 +959,10 @@ export async function exportInvoicePDF(
 
       await new Promise((r) => setTimeout(r, 60));
 
-      const canvas = await html2canvas(pageEl, {
+      const canvas = await safeHtml2Canvas(pageEl, {
         scale: 2,
         useCORS: true,
+        allowTaint: false,
         backgroundColor: '#ffffff',
         logging: false,
         windowWidth: pageEl.scrollWidth,

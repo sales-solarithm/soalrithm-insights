@@ -165,10 +165,15 @@ export function useBillingState() {
               firestoreInvoices.map((inv) => (inv.invNo || '').trim().toLowerCase()).filter(Boolean)
             );
 
+            const deletedIdsRaw = typeof window !== 'undefined' ? localStorage.getItem('solarithm_deleted_invoice_ids') : null;
+            const deletedIds = new Set<string>(deletedIdsRaw ? JSON.parse(deletedIdsRaw) : []);
+
             const lostInvoices = localInvoices.filter((loc) => {
               if (!loc) return false;
-              const hasMatchingId = loc.id && existingIds.has(loc.id);
+              if (loc.id && deletedIds.has(loc.id)) return false;
               const locNo = (loc.invNo || '').trim().toLowerCase();
+              if (locNo && deletedIds.has(locNo)) return false;
+              const hasMatchingId = loc.id && existingIds.has(loc.id);
               const hasMatchingNo = locNo && existingInvNos.has(locNo);
               // If neither id nor invNo exists in Firestore, it was lost or unsynced
               return !hasMatchingId && !hasMatchingNo;
@@ -372,9 +377,27 @@ export function useBillingState() {
   );
 
   const deleteInvoice = useCallback(
-    (id: string) => {
-      const updated = invoices.filter((x) => x.id !== id);
+    async (id: string) => {
+      const targetInv = invoicesRef.current.find((x) => x.id === id);
+      const targetNo = targetInv?.invNo ? targetInv.invNo.trim().toLowerCase() : '';
+
+      // Persist deleted ID and invNo to prevent self-healing resurrection
+      if (typeof window !== 'undefined') {
+        try {
+          const rawDel = localStorage.getItem('solarithm_deleted_invoice_ids');
+          const deletedSet = new Set<string>(rawDel ? JSON.parse(rawDel) : []);
+          if (id) deletedSet.add(id);
+          if (targetNo) deletedSet.add(targetNo);
+          localStorage.setItem('solarithm_deleted_invoice_ids', JSON.stringify(Array.from(deletedSet)));
+        } catch (e) {
+          console.warn('Error saving deleted invoice ID:', e);
+        }
+      }
+
+      const updated = invoicesRef.current.filter((x) => x.id !== id);
+      invoicesRef.current = updated;
       setInvoicesState(updated);
+
       try {
         localStorage.setItem('invoices', JSON.stringify(updated));
         localStorage.setItem('billing', JSON.stringify(updated));
@@ -383,11 +406,14 @@ export function useBillingState() {
         console.error('Error updating local storage on delete:', e);
       }
 
-      // Mutate ONLY the single deleted document
+      // Mutate ONLY the single deleted document in Firestore
       if (db && id) {
-        deleteDoc(doc(db, COLLECTIONS.INVOICES, id)).catch((err) =>
-          console.error('[useBillingState] Error deleting invoice doc:', err)
-        );
+        try {
+          await deleteDoc(doc(db, COLLECTIONS.INVOICES, id));
+        } catch (err) {
+          console.error('[useBillingState] Error deleting invoice doc:', err);
+          throw err;
+        }
       }
 
       if (currentInvoice.id === id) {
@@ -395,7 +421,7 @@ export function useBillingState() {
         setIsDirty(false);
       }
     },
-    [invoices, currentInvoice.id, settings]
+    [currentInvoice.id, settings]
   );
 
   const updateInvoiceStatus = useCallback(

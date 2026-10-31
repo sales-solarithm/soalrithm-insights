@@ -1,7 +1,6 @@
 'use client';
 
 import React, { useState, useEffect, useMemo } from 'react';
-import Image from 'next/image';
 import {
   LayoutGrid,
   FileText,
@@ -23,9 +22,10 @@ import {
   CreditCard
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
-import html2canvas from 'html2canvas';
+import { safeHtml2Canvas } from '@/src/lib/pdfColorSanitizer';
 import { useCompanySettings } from '@/src/lib/useCompanySettings';
 import { useDynamicTaxonomy } from '@/src/lib/taxonomyService';
+import { sanitizeFirestorePayload } from '@/src/lib/userService';
 import { doc, getDoc, updateDoc, setDoc, collection, getDocs, onSnapshot, serverTimestamp } from 'firebase/firestore';
 import { db, auth } from '@/src/lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
@@ -152,12 +152,12 @@ export interface AdditionalEarningsData {
 }
 
 export interface DeductionsData {
-  pf: number;
-  esic: number;
-  pt: number;
-  tds: number;
-  advance: number;
-  other: number;
+  pf: number | string;
+  esic: number | string;
+  pt: number | string;
+  tds: number | string;
+  advance: number | string;
+  other: number | string;
 }
 
 export interface SalarySlipRecord {
@@ -615,7 +615,7 @@ export const getProjectIncentiveForEmployee = (
         return rRole === role && rKey === canScopeKey;
       });
     }
-    if (!rule && (canScopeKey === "ceiLayouts" || canScopeKey === "pipeCalculation")) {
+    if (!rule && canScopeKey === "ceiLayouts") {
       rule = (commissionRules || []).find((r) => {
         const rRole = String(r.role || "").toLowerCase().trim();
         const rKey = toCanonicalScopeKey(r.scope || r.scopeOfWork || "");
@@ -1109,14 +1109,24 @@ export default function SalaryStudio({
       if (raw) {
         try {
           const parsed = JSON.parse(raw);
-          if (parsed.deductions) return parsed.deductions;
+          if (parsed.deductions) {
+            return {
+              pf: parsed.deductions.pf ?? 0,
+              esic: parsed.deductions.esic ?? 0,
+              // Directive 3: Stop automatically deducting ₹200 PT. Default is 0.
+              pt: parsed.deductions.pt === 200 ? 0 : (parsed.deductions.pt ?? 0),
+              tds: parsed.deductions.tds ?? 0,
+              advance: parsed.deductions.advance ?? 0,
+              other: parsed.deductions.other ?? 0
+            };
+          }
         } catch {}
       }
     }
     return {
       pf: 0,
       esic: 0,
-      pt: 200,
+      pt: 0,
       tds: 0,
       advance: 0,
       other: 0
@@ -1469,12 +1479,12 @@ export default function SalaryStudio({
 
   const totalDeductions = useMemo(() => {
     return (
-      (isZeroOrPositive(deductions.pf) ? Number(deductions.pf) : 0) +
-      (isZeroOrPositive(deductions.esic) ? Number(deductions.esic) : 0) +
-      (isZeroOrPositive(deductions.pt) ? Number(deductions.pt) : 0) +
-      (isZeroOrPositive(deductions.tds) ? Number(deductions.tds) : 0) +
-      (isZeroOrPositive(deductions.advance) ? Number(deductions.advance) : 0) +
-      (isZeroOrPositive(deductions.other) ? Number(deductions.other) : 0)
+      (Number(deductions.pf) || 0) +
+      (Number(deductions.esic) || 0) +
+      (Number(deductions.pt) || 0) +
+      (Number(deductions.tds) || 0) +
+      (Number(deductions.advance) || 0) +
+      (Number(deductions.other) || 0)
     );
   }, [deductions]);
 
@@ -1521,7 +1531,14 @@ export default function SalaryStudio({
       },
       attendance: { ...attendance },
       earnings: { ...calculatedEarnings },
-      deductions: { ...deductions },
+      deductions: {
+        pf: Number(deductions.pf) || 0,
+        esic: Number(deductions.esic) || 0,
+        pt: Number(deductions.pt) || 0,
+        tds: Number(deductions.tds) || 0,
+        advance: Number(deductions.advance) || 0,
+        other: Number(deductions.other) || 0
+      },
       incentivesList: [...activeIncentives],
       incentiveSummary: {
         cycleMonth: incentiveCyclePeriod.month,
@@ -1536,11 +1553,11 @@ export default function SalaryStudio({
         gstin: companySettings?.gstin || '',
         phone: companySettings?.phone || '+91 94295 00746 / 63',
         email: companySettings?.email || 'info.solarithm@gmail.com',
-        web: 'www.solarithm.com',
-        signName: 'Authorized Signatory',
+        web: companySettings?.website || 'www.solarithm.com',
+        signName: companySettings?.signatoryName || 'Authorized Signatory',
         logo: companySettings?.logo || null,
-        sig: null,
-        stamp: null
+        sig: companySettings?.signature || null,
+        stamp: companySettings?.stamp || null
       },
       employeeSnapshot: currentEmployee ? { ...currentEmployee } : ({} as any)
     };
@@ -1585,7 +1602,8 @@ export default function SalaryStudio({
           // Mandatory pre-check: verify document exists before executing updateDoc
           const snap = await getDoc(projRef);
           if (snap.exists()) {
-            await updateDoc(projRef, updates);
+            const sanitizedUpdates = sanitizeFirestorePayload(updates);
+            await updateDoc(projRef, sanitizedUpdates);
           } else {
             console.warn(`[SalaryStudio] Project document "${projectId}" was not found in Firestore. Bypassing mutation safely.`);
             showToast(`Project record (${projectId}) not found in database. Payout writeback skipped safely.`, 'info');
@@ -1687,7 +1705,8 @@ export default function SalaryStudio({
           serverTimestamp: serverTimestamp(),
           updatedAt: new Date().toISOString()
         };
-        await setDoc(doc(db, 'salarySlips', finalizedRecord.slipNo), fullPayrollSnapshot, { merge: true });
+        const sanitizedPayload = sanitizeFirestorePayload(fullPayrollSnapshot);
+        await setDoc(doc(db, 'salarySlips', finalizedRecord.slipNo), sanitizedPayload, { merge: true });
       } catch (err) {
         console.error('[SalaryStudio] Failed to persist salary slip to Firestore /salarySlips:', err);
         showToast('Notice: Cloud sync pending. Slip saved to local session.', 'info');
@@ -1722,28 +1741,23 @@ export default function SalaryStudio({
     }
     setIsPdfExporting(true);
     try {
-      const canvas = await html2canvas(printArea, {
+      const canvas = await safeHtml2Canvas(printArea, {
         scale: 2,
         useCORS: true,
-        allowTaint: true,
+        allowTaint: false,
         backgroundColor: '#FFFFFF',
-        logging: false,
-        windowWidth: 794
+        logging: false
       });
 
-      const imgData = canvas.toDataURL('image/png');
+      const imgData = canvas.toDataURL('image/jpeg', 0.98);
       const pdf = new jsPDF({
         orientation: 'portrait',
-        unit: 'pt',
-        format: 'a4'
+        unit: 'mm',
+        format: 'a4',
+        compress: true
       });
 
-      const pageWidth = 595.28;
-      const margin = 24;
-      const renderWidth = pageWidth - margin * 2;
-      const renderHeight = (canvas.height * renderWidth) / canvas.width;
-
-      pdf.addImage(imgData, 'PNG', margin, margin, renderWidth, renderHeight);
+      pdf.addImage(imgData, 'JPEG', 0, 0, 210, 297, undefined, 'FAST');
 
       const safeEmpName = (previewSlipData?.empName || 'Employee').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
       const safeMonth = (previewSlipData?.month || 'Month').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -2018,6 +2032,109 @@ export default function SalaryStudio({
                     onChange={e => setAttendance({ ...attendance, lopDays: Number(e.target.value) || 0 })}
                     className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded px-2 py-1 text-gray-900 dark:text-white font-mono"
                   />
+                </div>
+              </div>
+            </div>
+
+            {/* Deductions & Adjustments (Editable Controls) */}
+            <div className="bg-white dark:bg-[#1E1E1E] border border-gray-200 dark:border-[#333333] rounded-xl p-5 shadow-sm transition-colors">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between pb-2 border-b border-gray-200 dark:border-[#333333] mb-4 gap-2">
+                <div>
+                  <h3 className="text-xs font-bold text-gray-900 dark:text-white uppercase tracking-wider">
+                    Deductions &amp; Adjustments
+                  </h3>
+                  <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                    Set applicable deductions or leave at 0 for ₹0 deduction
+                  </span>
+                </div>
+                <span className="text-xs font-mono font-bold text-rose-600 dark:text-rose-400">
+                  Total Deductions: -{formatCurrency(totalDeductions)}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3 text-xs">
+                <div>
+                  <label className="block text-[10px] text-gray-500 dark:text-gray-400 font-semibold mb-1">
+                    Prof. Tax (PT)
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs">₹</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={deductions.pt}
+                      onChange={e => setDeductions(prev => ({ ...prev, pt: e.target.value }))}
+                      placeholder="0"
+                      className="w-full pl-6 pr-2 py-1.5 bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded text-gray-900 dark:text-white font-mono text-xs focus:outline-none focus:border-[#D4AF37]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] text-gray-500 dark:text-gray-400 font-semibold mb-1">
+                    TDS / Income Tax
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs">₹</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={deductions.tds}
+                      onChange={e => setDeductions(prev => ({ ...prev, tds: e.target.value }))}
+                      placeholder="0"
+                      className="w-full pl-6 pr-2 py-1.5 bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded text-gray-900 dark:text-white font-mono text-xs focus:outline-none focus:border-[#D4AF37]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] text-gray-500 dark:text-gray-400 font-semibold mb-1">
+                    Provident Fund (PF)
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs">₹</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={deductions.pf}
+                      onChange={e => setDeductions(prev => ({ ...prev, pf: e.target.value }))}
+                      placeholder="0"
+                      className="w-full pl-6 pr-2 py-1.5 bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded text-gray-900 dark:text-white font-mono text-xs focus:outline-none focus:border-[#D4AF37]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] text-gray-500 dark:text-gray-400 font-semibold mb-1">
+                    ESIC
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs">₹</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={deductions.esic}
+                      onChange={e => setDeductions(prev => ({ ...prev, esic: e.target.value }))}
+                      placeholder="0"
+                      className="w-full pl-6 pr-2 py-1.5 bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded text-gray-900 dark:text-white font-mono text-xs focus:outline-none focus:border-[#D4AF37]"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-[10px] text-gray-500 dark:text-gray-400 font-semibold mb-1">
+                    Advance Recovery
+                  </label>
+                  <div className="relative">
+                    <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400 text-xs">₹</span>
+                    <input
+                      type="number"
+                      min="0"
+                      value={deductions.advance}
+                      onChange={e => setDeductions(prev => ({ ...prev, advance: e.target.value }))}
+                      placeholder="0"
+                      className="w-full pl-6 pr-2 py-1.5 bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded text-gray-900 dark:text-white font-mono text-xs focus:outline-none focus:border-[#D4AF37]"
+                    />
+                  </div>
                 </div>
               </div>
             </div>
@@ -2309,80 +2426,318 @@ export default function SalaryStudio({
             <div className="flex-1 overflow-y-auto p-6 bg-gray-100 dark:bg-[#0E0E0E] flex justify-center">
               <div
                 id="salarySlipPrintContainer"
-                style={{ width: '794px' }}
-                className="bg-white text-[#1A202C] font-sans relative shadow-2xl"
+                style={{
+                  width: '210mm',
+                  height: '297mm',
+                  minHeight: '297mm',
+                  boxSizing: 'border-box',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  justifyContent: 'space-between',
+                  padding: '10mm'
+                }}
+                className="bg-white text-[#1A202C] font-sans relative shadow-2xl overflow-hidden"
               >
-                {/* Header */}
-                <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 50%, #1B2A4A 100%)' }} className="p-6 flex items-center justify-between gap-4 text-white border-b-2 border-[#D4AF37]">
-                  <div className="flex items-center gap-4 flex-1">
-                    {previewSlipData.companySnapshot.logo && (
-                      <div className="w-16 h-16 bg-white rounded-lg p-1.5 flex items-center justify-center shrink-0 border border-[#D4AF37]/40 shadow-sm">
-                        <Image src={previewSlipData.companySnapshot.logo} alt="Company Logo" width={60} height={60} className="max-h-full max-w-full object-contain" />
+                {/* 1. Header Section */}
+                <div className="border border-[#D4AF37]/40 rounded-xl overflow-hidden bg-[#FFFFFF] shadow-sm shrink-0">
+                  <div
+                    style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 55%, #1B2A4A 100%)' }}
+                    className="px-6 py-4 flex items-center justify-between gap-4 text-[#FFFFFF] border-b-2 border-[#D4AF37]"
+                  >
+                    <div className="flex items-center gap-4 flex-1 min-w-0">
+                      {previewSlipData.companySnapshot.logo ? (
+                        <div className="w-16 h-16 bg-[#FFFFFF] rounded-lg p-1.5 flex items-center justify-center shrink-0 border border-[#D4AF37]/50 shadow-md">
+                          <img
+                            src={previewSlipData.companySnapshot.logo}
+                            alt="Company Logo"
+                            crossOrigin="anonymous"
+                            className="max-h-full max-w-full object-contain"
+                          />
+                        </div>
+                      ) : (
+                        <div className="w-16 h-16 bg-[#1A2640] rounded-lg border-2 border-[#D4AF37] flex flex-col items-center justify-center shrink-0 text-[#D4AF37] font-serif shadow-md">
+                          <span className="text-xl font-black">SOL</span>
+                          <span className="text-[8px] font-bold tracking-widest text-[#D1D5DB]">INSIGHT</span>
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <h1 className="text-base font-extrabold uppercase text-[#FFFFFF] font-serif tracking-wide leading-tight truncate">
+                          {previewSlipData.companySnapshot.name}
+                        </h1>
+                        <p className="text-[10px] text-[#D1D5DB] mt-0.5 font-medium leading-relaxed truncate">
+                          {previewSlipData.companySnapshot.address}
+                        </p>
+                        <div className="flex flex-wrap items-center gap-x-2.5 text-[9.5px] text-[#9CA3AF] mt-1">
+                          <span>Phone: {previewSlipData.companySnapshot.phone}</span>
+                          <span>•</span>
+                          <span>Email: {previewSlipData.companySnapshot.email}</span>
+                          {previewSlipData.companySnapshot.gstin && (
+                            <>
+                              <span>•</span>
+                              <span className="font-mono text-[#D1D5DB]">GSTIN: {previewSlipData.companySnapshot.gstin}</span>
+                            </>
+                          )}
+                        </div>
                       </div>
-                    )}
-                    <div>
-                      <h1 className="text-base font-extrabold uppercase text-white font-serif">
-                        {previewSlipData.companySnapshot.name}
-                      </h1>
-                      <p className="text-[11px] text-gray-300 mt-0.5">{previewSlipData.companySnapshot.address}</p>
-                      <p className="text-[10px] text-gray-400 mt-0.5">Phone: {previewSlipData.companySnapshot.phone}</p>
                     </div>
-                  </div>
-                  <div className="text-right shrink-0">
-                    <div className="px-3 py-1 bg-[#D4AF37] text-[#0F1C35] rounded font-black text-xs uppercase">
-                      SALARY SLIP
-                    </div>
-                    <div className="text-xs font-bold text-[#D4AF37] mt-1">
-                      {previewSlipData.month} {previewSlipData.fy}
+                    <div className="text-right shrink-0">
+                      <div className="px-3.5 py-1.5 bg-[#D4AF37] text-[#0F1C35] rounded-md font-black text-xs uppercase tracking-wider shadow-sm">
+                        SALARY SLIP
+                      </div>
+                      <div className="text-xs font-bold text-[#FFFFFF] mt-1.5 font-mono">
+                        {previewSlipData.month} {previewSlipData.fy}
+                      </div>
+                      <div className="text-[9.5px] text-[#D1D5DB] font-mono mt-0.5">
+                        Ref: #{previewSlipData.slipNo}
+                      </div>
                     </div>
                   </div>
                 </div>
 
-                {/* Info Bar */}
-                <div style={{ background: 'linear-gradient(135deg, #D4AF37 0%, #E6C65A 50%, #D4AF37 100%)' }} className="px-6 py-2 grid grid-cols-4 gap-4 text-[#0F1C35]">
-                  <div>
-                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">Employee</div>
-                    <div className="text-xs font-black">{previewSlipData.empName}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">ID</div>
-                    <div className="text-xs font-black font-mono">{previewSlipData.empEmpId}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">Designation</div>
-                    <div className="text-xs font-black">{previewSlipData.employeeSnapshot.designation}</div>
-                  </div>
-                  <div>
-                    <div className="text-[9px] uppercase font-bold text-[#0F1C35]/80">Department</div>
-                    <div className="text-xs font-black">{previewSlipData.employeeSnapshot.department}</div>
+                {/* 2. Employee & Account Grid */}
+                <div className="bg-[#FAF8F5] border border-[#E2D9C4] rounded-xl p-3 text-[#1A202C] shrink-0">
+                  <div className="grid grid-cols-4 gap-3 text-xs">
+                    <div className="space-y-1.5">
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Employee Name</div>
+                        <div className="text-xs font-bold text-[#111827] mt-0.5 truncate">{previewSlipData.empName}</div>
+                      </div>
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Bank Name</div>
+                        <div className="text-xs font-semibold text-[#1F2937] mt-0.5 truncate">
+                          {previewSlipData.employeeBankSnapshot?.bankName || previewSlipData.employeeSnapshot?.bank || 'N/A'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5 border-l border-[#E5E7EB] pl-3">
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Employee ID</div>
+                        <div className="text-xs font-bold font-mono text-[#0F1C35] mt-0.5">{previewSlipData.empEmpId}</div>
+                      </div>
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Masked Account No.</div>
+                        <div className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5">
+                          {previewSlipData.employeeBankSnapshot?.maskedAccountNumber || maskAccountNumber(previewSlipData.employeeSnapshot?.accNo)}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5 border-l border-[#E5E7EB] pl-3">
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Designation</div>
+                        <div className="text-xs font-semibold text-[#1F2937] mt-0.5 truncate">
+                          {previewSlipData.employeeSnapshot?.designation || 'Solar Engineer'}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">IFSC Code</div>
+                        <div className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5">
+                          {previewSlipData.employeeSnapshot?.ifsc?.toUpperCase() || 'N/A'}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="space-y-1.5 border-l border-[#E5E7EB] pl-3">
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Department</div>
+                        <div className="text-xs font-semibold text-[#1F2937] mt-0.5 truncate">
+                          {previewSlipData.employeeSnapshot?.department || 'Engineering'}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">PAN / UAN</div>
+                        <div className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5 truncate">
+                          {previewSlipData.employeeSnapshot?.pan || 'N/A'} / {previewSlipData.employeeSnapshot?.uan || 'N/A'}
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
 
-                {/* Body Table */}
-                <div className="p-6 space-y-4">
-                  <div className="grid grid-cols-2 gap-4 text-xs">
-                    <div className="border border-gray-200 rounded p-3 bg-gray-50/50">
-                      <div className="font-bold text-gray-700 mb-2">Earnings</div>
-                      <div className="flex justify-between py-1"><span>Basic Salary</span><span className="font-mono font-semibold">{formatCurrency(previewSlipData.earnings.basic)}</span></div>
-                      <div className="flex justify-between py-1 text-emerald-700 font-semibold"><span>Project Incentives</span><span className="font-mono">+{formatCurrency(previewSlipData.earnings.incentive)}</span></div>
-                      <div className="flex justify-between py-1.5 border-t border-gray-300 font-bold text-gray-900 mt-2"><span>Gross Earnings</span><span className="font-mono">{formatCurrency(previewSlipData.gross)}</span></div>
+                {/* 3. Attendance Summary Bar */}
+                <div className="bg-[#FFFFFF] border border-[#E5E7EB] rounded-xl px-4 py-2 grid grid-cols-5 gap-2 text-center shrink-0">
+                  <div className="border-r border-[#F3F4F6] pr-2">
+                    <div className="text-[8px] uppercase font-bold text-[#6B7280] tracking-wider">Total Working Days</div>
+                    <div className="text-sm font-bold font-mono text-[#111827] mt-0.5">{previewSlipData.attendance?.totalDays ?? 30}</div>
+                  </div>
+                  <div className="border-r border-[#F3F4F6] pr-2">
+                    <div className="text-[8px] uppercase font-bold text-[#059669] tracking-wider">Days Present</div>
+                    <div className="text-sm font-bold font-mono text-[#047857] mt-0.5">{previewSlipData.attendance?.presentDays ?? 30}</div>
+                  </div>
+                  <div className="border-r border-[#F3F4F6] pr-2">
+                    <div className="text-[8px] uppercase font-bold text-[#2563EB] tracking-wider">Approved Leave</div>
+                    <div className="text-sm font-bold font-mono text-[#1D4ED8] mt-0.5">{previewSlipData.attendance?.paidLeave ?? previewSlipData.attendance?.leaveDays ?? 0}</div>
+                  </div>
+                  <div className="border-r border-[#F3F4F6] pr-2">
+                    <div className="text-[8px] uppercase font-bold text-[#E11D48] tracking-wider">Loss of Pay (LOP)</div>
+                    <div className="text-sm font-bold font-mono text-[#BE123C] mt-0.5">{previewSlipData.attendance?.lopDays ?? 0}</div>
+                  </div>
+                  <div>
+                    <div className="text-[8px] uppercase font-bold text-[#D97706] tracking-wider">Overtime Hours</div>
+                    <div className="text-sm font-bold font-mono text-[#B45309] mt-0.5">{previewSlipData.attendance?.otHours ?? 0} hrs</div>
+                  </div>
+                </div>
+
+                {/* 4. Earnings & Deductions Ledger */}
+                <div className="grid grid-cols-2 gap-4 flex-1 my-1">
+                  {/* Earnings Table */}
+                  <div className="border border-[#E5E7EB] rounded-xl overflow-hidden bg-[#FFFFFF] flex flex-col justify-between">
+                    <div>
+                      <div className="bg-[#0F1C35] text-[#D4AF37] px-3.5 py-2 font-bold text-[11px] uppercase tracking-wider flex justify-between items-center">
+                        <span>Earnings Component</span>
+                        <span>Amount (₹)</span>
+                      </div>
+                      <div className="divide-y divide-[#F3F4F6] text-xs">
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Basic Pay</span>
+                          <span className="font-mono font-semibold text-[#111827]">{formatCurrency(previewSlipData.earnings.basic)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center bg-[#ECFDF5]">
+                          <div>
+                            <div className="text-[#065F46] font-semibold">Project Commissions / Incentives</div>
+                            {previewSlipData.incentiveSummary?.totalProjects > 0 && (
+                              <div className="text-[9.5px] text-[#059669]">
+                                {previewSlipData.incentiveSummary.totalProjects} Deliverables • {previewSlipData.incentiveSummary.totalKwp} kWp
+                              </div>
+                            )}
+                          </div>
+                          <span className="font-mono font-bold text-[#047857]">+{formatCurrency(previewSlipData.earnings.incentive)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Overtime Allowance</span>
+                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.ot || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Other / Special Allowances</span>
+                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.otherAllowance || previewSlipData.earnings.othAllow || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Performance Bonus</span>
+                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.bonus || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Travel & Official Reimbursements</span>
+                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.reimbursement || 0)}</span>
+                        </div>
+                      </div>
                     </div>
-                    <div className="border border-gray-200 rounded p-3 bg-gray-50/50">
-                      <div className="font-bold text-gray-700 mb-2">Deductions</div>
-                      <div className="flex justify-between py-1 text-rose-600"><span>Professional Tax (PT)</span><span className="font-mono">-{formatCurrency(previewSlipData.deductions.pt)}</span></div>
-                      <div className="flex justify-between py-1.5 border-t border-gray-300 font-bold text-rose-700 mt-2"><span>Total Deductions</span><span className="font-mono">-{formatCurrency(previewSlipData.totalDed)}</span></div>
+                    <div className="bg-[#FAF8F5] border-t-2 border-[#D1D5DB] px-3.5 py-2.5 flex justify-between items-center">
+                      <span className="font-bold text-xs uppercase text-[#111827]">Total Gross Earnings</span>
+                      <span className="font-mono font-extrabold text-sm text-[#111827]">{formatCurrency(previewSlipData.gross)}</span>
                     </div>
                   </div>
 
-                  <div style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 100%)' }} className="border-2 border-[#D4AF37] text-white rounded-xl p-4 flex items-center justify-between">
+                  {/* Deductions Table */}
+                  <div className="border border-[#E5E7EB] rounded-xl overflow-hidden bg-[#FFFFFF] flex flex-col justify-between">
                     <div>
-                      <div className="text-[10px] font-bold uppercase text-[#D4AF37]">NET SALARY PAYABLE</div>
-                      <div className="text-xs text-gray-300 italic mt-0.5">{numberToWordsINR(previewSlipData.net)}</div>
+                      <div className="bg-[#0F1C35] text-[#FFFFFF] px-3.5 py-2 font-bold text-[11px] uppercase tracking-wider flex justify-between items-center">
+                        <span>Deductions Component</span>
+                        <span>Amount (₹)</span>
+                      </div>
+                      <div className="divide-y divide-[#F3F4F6] text-xs">
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Professional Tax (PT)</span>
+                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.pt || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Provident Fund (PF)</span>
+                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.pf || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">ESIC Contribution</span>
+                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.esic || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">TDS (Income Tax)</span>
+                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.tds || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Salary Advance Recovery</span>
+                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.advance || 0)}</span>
+                        </div>
+                        <div className="px-3.5 py-2 flex justify-between items-center">
+                          <span className="text-[#374151] font-medium">Other Deductions / Penalties</span>
+                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.other || 0)}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="bg-[#FAF8F5] border-t-2 border-[#D1D5DB] px-3.5 py-2.5 flex justify-between items-center">
+                      <span className="font-bold text-xs uppercase text-[#111827]">Total Deductions</span>
+                      <span className="font-mono font-extrabold text-sm text-[#BE123C]">-{formatCurrency(previewSlipData.totalDed)}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 5. Net Payable Block & Disbursement Row */}
+                <div className="shrink-0 space-y-1.5">
+                  <div
+                    style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 60%, #1B2A4A 100%)' }}
+                    className="border-2 border-[#D4AF37] text-[#FFFFFF] rounded-xl px-5 py-3 flex items-center justify-between shadow-sm"
+                  >
+                    <div>
+                      <div className="text-[10px] font-black uppercase tracking-wider text-[#D4AF37]">
+                        NET SALARY PAYABLE
+                      </div>
+                      <div className="text-xs text-[#E5E7EB] italic mt-0.5 font-serif">
+                        {numberToWordsINR(previewSlipData.net)}
+                      </div>
                     </div>
                     <div className="text-2xl font-black font-mono text-[#D4AF37]">
                       {formatCurrency(previewSlipData.net)}
                     </div>
                   </div>
+
+                  {/* Disbursement Row */}
+                  <div className="bg-[#FAF8F5] border border-[#E2D9C4] rounded-lg px-4 py-2 grid grid-cols-3 gap-2 text-xs">
+                    <div>
+                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Payment Mode: </span>
+                      <span className="font-semibold text-[#111827]">{previewSlipData.paymentMode || 'Bank Transfer'}</span>
+                    </div>
+                    <div className="text-center border-x border-[#E5E7EB]">
+                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Txn / Ref ID: </span>
+                      <span className="font-mono font-semibold text-[#111827]">{previewSlipData.transactionId || 'TXN-SETTLED'}</span>
+                    </div>
+                    <div className="text-right">
+                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Disbursement Date: </span>
+                      <span className="font-semibold text-[#111827]">{previewSlipData.paymentDate || previewSlipData.payDate || 'Settled'}</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 6. Authorized Signatory Block (Company Signatory Only) */}
+                <div className="shrink-0 pt-3 border-t border-[#E5E7EB] flex justify-end items-end text-xs">
+                  <div className="w-64 text-center flex flex-col items-center justify-end">
+                    {previewSlipData.companySnapshot.sig ? (
+                      <img
+                        src={previewSlipData.companySnapshot.sig}
+                        alt="Digital Signature"
+                        crossOrigin="anonymous"
+                        className="max-h-12 max-w-28 object-contain mb-1"
+                      />
+                    ) : (
+                      <div className="h-10 flex items-center justify-center text-[10px] font-serif italic text-[#9CA3AF]">
+                        Digitally Verified
+                      </div>
+                    )}
+                    <div className="border-t border-[#9CA3AF] pt-1 w-full">
+                      <div className="font-bold text-[#111827] text-[11px] truncate">
+                        {previewSlipData.companySnapshot.signName || companySettings?.signatoryName || 'Authorized Signatory'}
+                      </div>
+                      <div className="text-[9px] text-[#6B7280] font-medium truncate">
+                        {companySettings?.signatoryDesignation || 'Managing Director / Partner'}
+                      </div>
+                      <div className="text-[8px] text-[#9CA3AF] font-semibold uppercase tracking-wider mt-0.5">
+                        {previewSlipData.companySnapshot.name || 'Solarithm Consultancy'}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 7. Footer / Legal Notice */}
+                <div className="shrink-0 pt-1.5 border-t border-[#E5E7EB] text-[8px] text-[#6B7280] flex items-center justify-between">
+                  <span>This is a computer-generated salary slip and does not require a physical signature if digitally verified.</span>
+                  <span className="font-mono">Solarithm Insight • {previewSlipData.companySnapshot.web || 'www.solarithm.com'}</span>
                 </div>
               </div>
             </div>
