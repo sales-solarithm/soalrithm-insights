@@ -96,6 +96,7 @@ import PricingRulesView from '@/src/components/PricingRulesView';
 import ProposalsView from '@/src/components/ProposalsView';
 import EditProjectModal from '@/src/components/EditProjectModal';
 import ProjectsDirectory from '@/src/components/ProjectsDirectory';
+import { sanitizeFirestorePayload } from '@/src/lib/userService';
 
 export default function DashboardPage() {
   const { theme, toggleTheme } = useTheme();
@@ -473,7 +474,8 @@ export default function DashboardPage() {
         (Number(project.finalCost) === 1500 || Number(project.calculatedCost) === 1500 || Number(project.cost) === 1500) && 
         !project.isManualCostOverride;
 
-      const shouldInvalidateCostLock = project.isCostLocked === false || project.scopeChanged === true || isLegacyPipeCeiBug;
+      const isExplicitManualOverride = Boolean(project.isManualCostOverride || project.costOverride);
+      const shouldInvalidateCostLock = !isExplicitManualOverride && (project.isCostLocked === false || project.scopeChanged === true || isLegacyPipeCeiBug);
 
       if (!shouldInvalidateCostLock) {
         if (isZeroOrPositive(project.finalCost)) {
@@ -695,61 +697,20 @@ export default function DashboardPage() {
     if (!targetProject || !targetProject.id) return;
     const originalProject = projects.find(p => p.id === targetProject.id) || {};
 
-    const origScopeNorm = String(originalProject.scopeOfWork || originalProject.scope || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
-    const newScopeNorm = String(targetProject.scopeOfWork || '').toLowerCase().replace(/[\s\-_]+/g, '').trim();
-    const scopeChanged = Boolean(newScopeNorm && origScopeNorm && newScopeNorm !== origScopeNorm);
+    // Final cost value: directly take the user's intended cost from targetProject
+    const finalCostValue = isZeroOrPositive(targetProject.finalCost)
+      ? Number(targetProject.finalCost)
+      : safeNumber(targetProject.calculatedCost ?? targetProject.cost, 0);
 
-    let finalCostValue = safeNumber(targetProject.finalCost ?? targetProject.calculatedCost ?? targetProject.cost);
-    let salesCommissionValue = safeNumber(targetProject.salesCommission ?? targetProject.commission);
-    let designerCommissionValue = safeNumber(targetProject.designerCommission ?? targetProject.designerFee);
-    const plantCapacityValue = safeNumber(targetProject.plantCapacity ?? targetProject.systemCapacity ?? targetProject.capacity);
+    const salesCommissionValue = isZeroOrPositive(targetProject.salesCommission)
+      ? Number(targetProject.salesCommission)
+      : safeNumber(targetProject.commission, 0);
 
-    // Directive: Invalidate historical cost lock on scope change and recalculate dynamically
-    if (scopeChanged) {
-      const matchedClient = clients.find(
-        (c) => c.id === (targetProject.clientId || originalProject.clientId) || c.companyName === targetProject.clientName
-      );
-      const pDate = resolveProjectDate(targetProject) || getProjectDate(targetProject) || new Date();
-      const resolvedTier = resolveEffectivePricingCategory(
-        matchedClient,
-        pDate,
-        targetProject.pricingCategory || originalProject.pricingCategory
-      );
-      const subService = normalizeSubService(targetProject.subService || originalProject.subService);
+    const designerCommissionValue = isZeroOrPositive(targetProject.designerCommission)
+      ? Number(targetProject.designerCommission)
+      : safeNumber(targetProject.designerFee, 0);
 
-      const dynamicPrice = calculateCompoundPackagePrice(
-        targetProject.scopeOfWork,
-        plantCapacityValue,
-        resolvedTier,
-        subService,
-        pricingRules
-      );
-
-      if (dynamicPrice > 0) {
-        finalCostValue = dynamicPrice;
-      } else {
-        const targetScopeKey = toCanonicalScopeKey(targetProject.scopeOfWork);
-        const activeCategory = String(resolvedTier).toLowerCase().trim();
-        const matchedRule = pricingRules.find((rule) => {
-          const rTier = String(rule.category || rule.tier || 'T1').toLowerCase().trim();
-          const rKey = toCanonicalScopeKey(rule.scope || rule.scopeOfWork || '');
-          const rSub = normalizeSubService(rule.subService);
-          return (rTier === activeCategory) && (rKey === targetScopeKey) && (rSub === subService || rSub === 'standard');
-        });
-
-        if (matchedRule && Array.isArray(matchedRule.capacityRows) && matchedRule.capacityRows.length > 0) {
-          const matchedRow = findMatchingCapacityRow(matchedRule.capacityRows, plantCapacityValue);
-          if (matchedRow) {
-            finalCostValue = calculateSlabCost(matchedRow, plantCapacityValue);
-          }
-        } else if (matchedRule) {
-          const baseRate = safeNumber(matchedRule.ratePerKw ?? matchedRule.rate ?? matchedRule.pricePerKw ?? matchedRule.basePrice ?? matchedRule.price ?? 0);
-          const priceType = String(matchedRule.priceType || '').toLowerCase();
-          const isPerKw = priceType.includes('kw') || priceType === 'per kw' || priceType === 'per_kw' || matchedRule.ratePerKw !== undefined || matchedRule.pricePerKw !== undefined;
-          finalCostValue = isPerKw ? baseRate * plantCapacityValue : baseRate;
-        }
-      }
-    }
+    const plantCapacityValue = safeNumber(targetProject.plantCapacity ?? targetProject.systemCapacity ?? targetProject.capacity, 0);
 
     // CRITICAL DATE PRESERVATION (Audit Task 5):
     // Preserve existing date strictly: project.projectDate || project.date || project.createdAt
@@ -763,9 +724,11 @@ export default function DashboardPage() {
     );
     const finalProjectDate = dateExplicitlyChanged ? targetProject.projectDate : (originalDate || targetProject.projectDate || '');
 
+    const upgradeRecord = buildUpgradeRecordIfChanged(originalProject, targetProject);
+
     const updatedData: any = {
-      projectName: (targetProject.projectName || '').trim(),
-      clientName: (targetProject.clientName || '').trim(),
+      projectName: (targetProject.projectName || originalProject.projectName || '').trim(),
+      clientName: (targetProject.clientName || originalProject.clientName || '').trim(),
       clientId: targetProject.clientId || originalProject.clientId || '',
       status: targetProject.status || originalProject.status || 'Active',
       scopeOfWork: targetProject.scopeOfWork || originalProject.scopeOfWork || 'Detailed Engineering',
@@ -787,18 +750,19 @@ export default function DashboardPage() {
       amount: finalCostValue,
       totalCost: finalCostValue,
       price: finalCostValue,
-      isCostLocked: false,
-      isCommissionLocked: false,
+      isCostLocked: true,
+      isManualCostOverride: true,
+      costOverride: true,
       // Critical Commission Output Persistence
       salesCommission: salesCommissionValue,
       commission: salesCommissionValue,
       totalCommission: salesCommissionValue + designerCommissionValue,
       designerCommission: designerCommissionValue,
       designerFee: designerCommissionValue,
+      isCommissionLocked: true,
       updatedAt: new Date().toISOString()
     };
 
-    const upgradeRecord = buildUpgradeRecordIfChanged(originalProject, targetProject);
     if (upgradeRecord) {
       updatedData.upgradeHistory = [...(originalProject.upgradeHistory || []), upgradeRecord];
     }
@@ -817,9 +781,11 @@ export default function DashboardPage() {
         amount: finalCostValue,
         totalCost: finalCostValue,
         price: finalCostValue,
-        isCostLocked: false,
-        isCommissionLocked: false,
+        isCostLocked: true,
+        isManualCostOverride: true,
+        costOverride: true,
         designerCommission: designerCommissionValue,
+        designerFee: designerCommissionValue,
         salesCommission: salesCommissionValue,
         commission: salesCommissionValue,
         totalCommissionExpense: totComm,
@@ -834,80 +800,54 @@ export default function DashboardPage() {
       };
     }));
 
-    // Firestore updates must only modify fields that were changed by the user (Audit Task 5)
+    // Unconditional Firestore persistence across all pricing aliases and parameters
     try {
       const projectRef = doc(db, COLLECTIONS.PROJECTS, targetProject.id);
       const firestoreUpdatePayload: Record<string, any> = {
+        projectName: updatedData.projectName,
+        clientName: updatedData.clientName,
+        clientId: updatedData.clientId,
+        status: updatedData.status,
+        scopeOfWork: updatedData.scopeOfWork,
+        subService: updatedData.subService,
+        pricingCategory: updatedData.pricingCategory,
+        designerEmail: updatedData.designerEmail,
+        designerName: updatedData.designerName,
+        salesPersonEmail: updatedData.salesPersonEmail,
+        plantCapacity: plantCapacityValue,
+        systemCapacity: plantCapacityValue,
+        capacity: plantCapacityValue,
+        capacityUnit: updatedData.capacityUnit,
+        calculatedCost: finalCostValue,
+        finalCost: finalCostValue,
+        cost: finalCostValue,
+        amount: finalCostValue,
+        totalCost: finalCostValue,
+        price: finalCostValue,
+        isCostLocked: true,
+        isManualCostOverride: true,
+        costOverride: true,
+        salesCommission: salesCommissionValue,
+        commission: salesCommissionValue,
+        designerCommission: designerCommissionValue,
+        designerFee: designerCommissionValue,
+        totalCommission: salesCommissionValue + designerCommissionValue,
+        isCommissionLocked: true,
+        projectDate: finalProjectDate,
+        date: finalProjectDate,
         updatedAt: new Date().toISOString()
       };
-
-      if (targetProject.projectName && targetProject.projectName !== originalProject.projectName) {
-        firestoreUpdatePayload.projectName = targetProject.projectName.trim();
-      }
-      if (targetProject.clientName && targetProject.clientName !== originalProject.clientName) {
-        firestoreUpdatePayload.clientName = targetProject.clientName.trim();
-      }
-      if (targetProject.clientId && targetProject.clientId !== originalProject.clientId) {
-        firestoreUpdatePayload.clientId = targetProject.clientId;
-      }
-      if (targetProject.status && targetProject.status !== originalProject.status) {
-        firestoreUpdatePayload.status = targetProject.status;
-      }
-
-
-      if (targetProject.scopeOfWork && targetProject.scopeOfWork !== originalProject.scopeOfWork) {
-        firestoreUpdatePayload.scopeOfWork = targetProject.scopeOfWork;
-      }
-      if (targetProject.subService && targetProject.subService !== originalProject.subService) {
-        firestoreUpdatePayload.subService = targetProject.subService;
-      }
-      if (targetProject.pricingCategory && targetProject.pricingCategory !== originalProject.pricingCategory) {
-        firestoreUpdatePayload.pricingCategory = targetProject.pricingCategory;
-      }
-      if (targetProject.designerEmail !== originalProject.designerEmail) {
-        firestoreUpdatePayload.designerEmail = targetProject.designerEmail || '';
-        firestoreUpdatePayload.designerName = targetProject.designerName || (targetProject.designerEmail ? getEmployeeName(targetProject.designerEmail) : '');
-      }
-      if (targetProject.salesPersonEmail !== originalProject.salesPersonEmail) {
-        firestoreUpdatePayload.salesPersonEmail = targetProject.salesPersonEmail || '';
-      }
-      if (plantCapacityValue !== safeNumber(originalProject.plantCapacity)) {
-        firestoreUpdatePayload.plantCapacity = plantCapacityValue;
-        firestoreUpdatePayload.systemCapacity = plantCapacityValue;
-        firestoreUpdatePayload.capacity = plantCapacityValue;
-      }
-      if (scopeChanged || finalCostValue !== safeNumber(originalProject.finalCost)) {
-        firestoreUpdatePayload.calculatedCost = finalCostValue;
-        firestoreUpdatePayload.finalCost = finalCostValue;
-        firestoreUpdatePayload.cost = finalCostValue;
-        firestoreUpdatePayload.amount = finalCostValue;
-        firestoreUpdatePayload.totalCost = finalCostValue;
-        firestoreUpdatePayload.price = finalCostValue;
-        firestoreUpdatePayload.isCostLocked = false;
-        firestoreUpdatePayload.isCommissionLocked = false;
-        firestoreUpdatePayload.costOverride = false;
-        firestoreUpdatePayload.isManualCostOverride = false;
-      }
-      firestoreUpdatePayload.salesCommission = salesCommissionValue;
-      firestoreUpdatePayload.commission = salesCommissionValue;
-      firestoreUpdatePayload.designerCommission = designerCommissionValue;
-      firestoreUpdatePayload.designerFee = designerCommissionValue;
-      firestoreUpdatePayload.totalCommission = salesCommissionValue + designerCommissionValue;
-
-      // Strict Date preservation in Firestore: only write if explicitly changed by user
-      if (dateExplicitlyChanged) {
-        firestoreUpdatePayload.projectDate = finalProjectDate;
-        firestoreUpdatePayload.date = finalProjectDate;
-      }
 
       if (upgradeRecord) {
         firestoreUpdatePayload.upgradeHistory = [...(originalProject.upgradeHistory || []), upgradeRecord];
       }
 
-      await updateDoc(projectRef, firestoreUpdatePayload);
+      const cleanPayload = sanitizeFirestorePayload(firestoreUpdatePayload);
+      await updateDoc(projectRef, cleanPayload);
     } catch (error) {
-      console.warn("Could not sync project update to Firestore, rolling back:", error);
+      console.error("Could not sync project update to Firestore, rolling back:", error);
       setProjects(previousProjects);
+      throw error;
     }
     
     setIsEditProjectModalOpen(false);

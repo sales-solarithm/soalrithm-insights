@@ -174,6 +174,7 @@ export default function EditProjectModal({
   const [prevProjectId, setPrevProjectId] = useState<string | null>(project?.id || null);
   const [formData, setFormData] = useState<any>(() => getInitialProjectFormData(project));
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [recalcFeedback, setRecalcFeedback] = useState<{
     tier: string;
     rateSummary: string;
@@ -633,9 +634,15 @@ export default function EditProjectModal({
       return;
     }
 
-    const finalCostValue = safeNumber(formData.finalCost !== '' && Number(formData.finalCost) > 0 ? formData.finalCost : formData.calculatedCost, 0);
-    const salesCommissionValue = safeNumber(formData.salesCommission, 0);
-    const designerCommissionValue = safeNumber(formData.designerCommission, 0);
+    const finalCostValue = isZeroOrPositive(formData.finalCost)
+      ? Number(formData.finalCost)
+      : safeNumber(formData.calculatedCost, 0);
+    const salesCommissionValue = isZeroOrPositive(formData.salesCommission)
+      ? Number(formData.salesCommission)
+      : 0;
+    const designerCommissionValue = isZeroOrPositive(formData.designerCommission)
+      ? Number(formData.designerCommission)
+      : 0;
     const plantCapacityValue = safeNumber(formData.plantCapacity, 0);
 
     // CRITICAL DATE PRESERVATION (Audit Task 5):
@@ -667,33 +674,44 @@ export default function EditProjectModal({
       calculatedCost: finalCostValue,
       finalCost: finalCostValue,
       cost: finalCostValue,
+      amount: finalCostValue,
+      totalCost: finalCostValue,
+      price: finalCostValue,
+      isCostLocked: true,
+      isManualCostOverride: true,
+      costOverride: true,
       // CRITICAL COMMISSION PERSISTENCE: Write across all common key aliases
       salesCommission: salesCommissionValue,
       commission: salesCommissionValue,
       totalCommission: salesCommissionValue + designerCommissionValue,
       designerCommission: designerCommissionValue,
       designerFee: designerCommissionValue,
+      isCommissionLocked: true,
       status: formData.status,
       pricingCategory: formData.pricingCategory,
       updatedAt: new Date().toISOString()
     };
 
-    // Optimistic UI Updates (Directive 4 / WRK-01):
-    // Close modal instantly (0 ms delay) and run state update and persistence in background
-    onClose();
+    setIsSubmitting(true);
+    setValidationError(null);
     try {
       await onSave(submissionPayload);
+      onClose();
     } catch (err: any) {
       console.error('[EditProjectModal] Failed to persist project changes:', err);
+      setValidationError(err?.message || 'Failed to persist project changes to Firestore. Please try again.');
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
   // Calculation summaries with zero-safe math (empty string '' evaluates as 0)
-  const cost = safeNumber(formData.finalCost !== '' && Number(formData.finalCost) > 0 ? formData.finalCost : formData.calculatedCost, 0);
+  const cost = isZeroOrPositive(formData.finalCost) ? Number(formData.finalCost) : safeNumber(formData.calculatedCost, 0);
   const desComm = safeNumber(formData.designerCommission, 0);
   const salesComm = safeNumber(formData.salesCommission, 0);
   const totalCommissions = desComm + salesComm;
   const netCompanyBalance = cost - totalCommissions;
+  const isPending = isSaving || isSubmitting;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
@@ -1008,19 +1026,19 @@ export default function EditProjectModal({
           <button
             type="button"
             onClick={onClose}
-            disabled={isSaving}
-            className="px-4 py-2 rounded-lg text-xs font-semibold text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-[#252525] transition-colors"
+            disabled={isPending}
+            className="px-4 py-2 rounded-lg text-xs font-semibold text-gray-600 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-[#252525] transition-colors disabled:opacity-50"
           >
             Cancel
           </button>
           <button
             type="button"
             onClick={handleSubmit}
-            disabled={isSaving}
-            className="px-5 py-2 rounded-lg text-xs font-semibold bg-[#D4AF37] hover:bg-[#c49f2c] text-black shadow-sm flex items-center gap-1.5 transition-all cursor-pointer"
+            disabled={isPending}
+            className="px-5 py-2 rounded-lg text-xs font-semibold bg-[#D4AF37] hover:bg-[#c49f2c] text-black shadow-sm flex items-center gap-1.5 transition-all cursor-pointer disabled:opacity-50"
           >
             <Save className="w-4 h-4" />
-            <span>{isSaving ? 'Saving Project...' : 'Save & Persist Changes'}</span>
+            <span>{isPending ? 'Saving Project...' : 'Save & Persist Changes'}</span>
           </button>
         </div>
       </div>

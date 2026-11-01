@@ -5,7 +5,7 @@ import {
   getInitialCompanySettings,
   COMPANY_STORAGE_KEYS
 } from './useCompanySettings';
-import { safeStringIdentifier, isZeroOrPositive } from './projectUtils';
+import { safeStringIdentifier, isZeroOrPositive, parseSafeDate } from './projectUtils';
 import { safeHtml2Canvas } from './pdfColorSanitizer';
 
 /* ════════════════════════════════════════════════════════════
@@ -162,6 +162,31 @@ export interface InvoiceData {
   salesIncentiveStatus?: 'ELIGIBLE' | 'PENDING' | string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * Strict descending date comparator for invoices.
+ * 1. Primary: Invoice Date (invDate || date || createdAt) descending (most recent date first).
+ * 2. Tie-break 1: Creation timestamp (createdAt) descending.
+ * 3. Tie-break 2: Invoice Number (invNo) descending (natural alphanumeric comparison).
+ */
+export function compareInvoicesDateDesc(a: InvoiceData, b: InvoiceData): number {
+  if (!a && !b) return 0;
+  if (!a) return 1;
+  if (!b) return -1;
+  const dateA = parseSafeDate(a.invDate || (a as any).date || a.createdAt);
+  const dateB = parseSafeDate(b.invDate || (b as any).date || b.createdAt);
+  const timeA = dateA ? dateA.getTime() : 0;
+  const timeB = dateB ? dateB.getTime() : 0;
+  if (timeB !== timeA) return timeB - timeA;
+
+  const createdA = parseSafeDate(a.createdAt)?.getTime() || 0;
+  const createdB = parseSafeDate(b.createdAt)?.getTime() || 0;
+  if (createdB !== createdA) return createdB - createdA;
+
+  const noA = String(a.invNo || '').trim();
+  const noB = String(b.invNo || '').trim();
+  return noB.localeCompare(noA, undefined, { numeric: true, sensitivity: 'base' });
 }
 
 export function defaultSettings(): InvoiceSettings {

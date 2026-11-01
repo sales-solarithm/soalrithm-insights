@@ -63,7 +63,8 @@ import {
   CanonicalInvoiceStatus,
   roundCurrency,
   determineClientGSTRule,
-  ClientGSTRule
+  ClientGSTRule,
+  compareInvoicesDateDesc
 } from '@/src/lib/invoicePdfEngine';
 import { useBillingState, blankInvoice, blankLineItem } from '@/src/lib/useBillingState';
 import { useCompanySettings } from '@/src/lib/useCompanySettings';
@@ -208,6 +209,24 @@ export default function BillingModule({
   useEffect(() => {
     setHistoryCurrentPage(1);
   }, [historySearch, statusFilter]);
+
+  // Chronologically sorted recent invoices (latest date first)
+  const recentInvoices = useMemo(() => {
+    return [...invoices].sort(compareInvoicesDateDesc).slice(0, 8);
+  }, [invoices]);
+
+  // Chronologically sorted & filtered history invoices
+  const filteredHistoryInvoices = useMemo(() => {
+    const q = historySearch.toLowerCase().trim();
+    return invoices
+      .filter((inv) => {
+        const matchSearch = !q || inv.invNo?.toLowerCase().includes(q) || inv.client?.name?.toLowerCase().includes(q);
+        const canonical = canonicalInvoiceStatus(inv.status);
+        const matchStatus = statusFilter === 'all' || canonical === statusFilter;
+        return matchSearch && matchStatus;
+      })
+      .sort(compareInvoicesDateDesc);
+  }, [invoices, historySearch, statusFilter]);
 
   // Format helper for YYYY-MM -> Human Readable (e.g. '2026-09' -> 'September 2026')
   const formatMonthDisplay = (ym: string): string => {
@@ -1493,7 +1512,7 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-gray-100 dark:divide-[#333333]">
-                    {invoices.slice(0, 8).map((inv) => (
+                    {recentInvoices.map((inv) => (
                       <tr key={inv.id} className="hover:bg-gray-50 dark:hover:bg-[#2A2A2A] transition-colors">
                         <td className="py-3.5 px-4 font-semibold text-[#D4AF37]">{inv.invNo}</td>
                         <td className="py-3.5 px-4 text-gray-800 dark:text-gray-200">{inv.client?.name || '—'}</td>
@@ -2219,15 +2238,7 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                 </thead>
                 <tbody className="divide-y divide-gray-100 dark:divide-[#333333]">
                   {(() => {
-                    const filtered = invoices.filter((inv) => {
-                      const q = historySearch.toLowerCase().trim();
-                      const matchSearch = !q || inv.invNo?.toLowerCase().includes(q) || inv.client?.name?.toLowerCase().includes(q);
-                      const canonical = canonicalInvoiceStatus(inv.status);
-                      const matchStatus = statusFilter === 'all' || canonical === statusFilter;
-                      return matchSearch && matchStatus;
-                    });
-
-                    if (filtered.length === 0) {
+                    if (filteredHistoryInvoices.length === 0) {
                       return (
                         <tr>
                           <td colSpan={6} className="py-8 text-center text-gray-500 dark:text-gray-400">
@@ -2238,7 +2249,7 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
                     }
 
                     const startIndex = (historyCurrentPage - 1) * HISTORY_PAGE_SIZE;
-                    const paginated = filtered.slice(startIndex, startIndex + HISTORY_PAGE_SIZE);
+                    const paginated = filteredHistoryInvoices.slice(startIndex, startIndex + HISTORY_PAGE_SIZE);
 
                     return paginated.map((inv) => {
                       const canonical = canonicalInvoiceStatus(inv.status);
@@ -2300,14 +2311,7 @@ function hasExplicitUpgradeInMonth(project: any, month: string): boolean {
             
             {/* Pagination Controls (Strict 10 per page) */}
             {(() => {
-              const filtered = invoices.filter((inv) => {
-                const q = historySearch.toLowerCase().trim();
-                const matchSearch = !q || inv.invNo?.toLowerCase().includes(q) || inv.client?.name?.toLowerCase().includes(q);
-                const canonical = canonicalInvoiceStatus(inv.status);
-                const matchStatus = statusFilter === 'all' || canonical === statusFilter;
-                return matchSearch && matchStatus;
-              });
-              const totalItems = filtered.length;
+              const totalItems = filteredHistoryInvoices.length;
               const totalPages = Math.max(1, Math.ceil(totalItems / HISTORY_PAGE_SIZE));
               const startIdx = totalItems === 0 ? 0 : (historyCurrentPage - 1) * HISTORY_PAGE_SIZE + 1;
               const endIdx = Math.min(totalItems, historyCurrentPage * HISTORY_PAGE_SIZE);

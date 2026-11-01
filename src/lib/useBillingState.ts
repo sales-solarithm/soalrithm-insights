@@ -23,7 +23,8 @@ import {
   uid,
   calculateInvoiceTotals,
   generateNextInvoiceNumber,
-  safeNum
+  safeNum,
+  compareInvoicesDateDesc
 } from './invoicePdfEngine';
 import {
   CompanySettings,
@@ -119,7 +120,7 @@ function getInitialInvoices(): InvoiceData[] {
     const rawInvoices = localStorage.getItem('invoices') || localStorage.getItem('billing') || localStorage.getItem(STORAGE_KEYS.invoices);
     if (rawInvoices) {
       const parsedI = JSON.parse(rawInvoices);
-      if (Array.isArray(parsedI)) return parsedI;
+      if (Array.isArray(parsedI)) return [...parsedI].sort(compareInvoicesDateDesc);
     }
   } catch (e) {
     console.error('Error reading invoices from localStorage:', e);
@@ -194,7 +195,8 @@ export function useBillingState() {
           console.warn('[BillingRescue] Local invoice recovery notice:', e);
         }
 
-        setInvoicesState(firestoreInvoices);
+        const sortedInvoices = [...firestoreInvoices].sort(compareInvoicesDateDesc);
+        setInvoicesState(sortedInvoices);
         setIsLoaded(true);
       },
       (err) => {
@@ -245,11 +247,12 @@ export function useBillingState() {
 
   const saveInvoices = useCallback(
     (newInvoices: InvoiceData[]) => {
-      setInvoicesState(newInvoices);
+      const sorted = [...newInvoices].sort(compareInvoicesDateDesc);
+      setInvoicesState(sorted);
       try {
-        localStorage.setItem('invoices', JSON.stringify(newInvoices));
-        localStorage.setItem('billing', JSON.stringify(newInvoices));
-        localStorage.setItem(STORAGE_KEYS.invoices, JSON.stringify(newInvoices));
+        localStorage.setItem('invoices', JSON.stringify(sorted));
+        localStorage.setItem('billing', JSON.stringify(sorted));
+        localStorage.setItem(STORAGE_KEYS.invoices, JSON.stringify(sorted));
       } catch (e) {
         console.error('Error mirroring invoices to localStorage:', e);
       }
@@ -354,6 +357,7 @@ export function useBillingState() {
       } else {
         updatedInvoices.push(data);
       }
+      updatedInvoices.sort(compareInvoicesDateDesc);
 
       setInvoicesState(updatedInvoices);
       try {
@@ -394,7 +398,7 @@ export function useBillingState() {
         }
       }
 
-      const updated = invoicesRef.current.filter((x) => x.id !== id);
+      const updated = invoicesRef.current.filter((x) => x.id !== id).sort(compareInvoicesDateDesc);
       invoicesRef.current = updated;
       setInvoicesState(updated);
 
@@ -441,6 +445,7 @@ export function useBillingState() {
           }
           return inv;
         });
+        updatedInvoices.sort(compareInvoicesDateDesc);
 
         try {
           localStorage.setItem(STORAGE_KEYS.invoices, JSON.stringify(updatedInvoices));

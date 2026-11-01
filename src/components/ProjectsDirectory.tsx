@@ -158,6 +158,7 @@ export default function ProjectsDirectory({
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [detailsProject, setDetailsProject] = useState<any | null>(null);
   const [projectToDelete, setProjectToDelete] = useState<any | null>(null);
+  const [isSavingProject, setIsSavingProject] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
   // Enhanced Helper to resolve employee name with 2-part formatting (Surname & Firstname)
@@ -493,11 +494,16 @@ export default function ProjectsDirectory({
 
   // Save updated project
   const handleSaveProject = async (updated: any) => {
-    if (onUpdateProject) {
-      await onUpdateProject(updated);
+    setIsSavingProject(true);
+    try {
+      if (onUpdateProject) {
+        await onUpdateProject(updated);
+      }
+      setIsEditModalOpen(false);
+      setEditingProject(null);
+    } finally {
+      setIsSavingProject(false);
     }
-    setIsEditModalOpen(false);
-    setEditingProject(null);
   };
 
   // Confirm delete project
@@ -1156,6 +1162,7 @@ export default function ProjectsDirectory({
             setEditingProject(null);
           }}
           onSave={handleSaveProject}
+          isSaving={isSavingProject}
         />
       )}
 
