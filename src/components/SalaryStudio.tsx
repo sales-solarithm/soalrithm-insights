@@ -1553,7 +1553,7 @@ export default function SalaryStudio({
         gstin: companySettings?.gstin || '',
         phone: companySettings?.phone || '+91 94295 00746 / 63',
         email: companySettings?.email || 'info.solarithm@gmail.com',
-        web: companySettings?.website || 'www.solarithm.com',
+        web: companySettings?.website || 'https://solarithmdesign.com',
         signName: companySettings?.signatoryName || 'Authorized Signatory',
         logo: companySettings?.logo || null,
         sig: companySettings?.signature || null,
@@ -1741,6 +1741,9 @@ export default function SalaryStudio({
     }
     setIsPdfExporting(true);
     try {
+      // Retain a short 100ms render stabilization delay to ensure all layout metrics, font glyphs, and baselines are fully settled in the DOM before rasterization
+      await new Promise((r) => setTimeout(r, 100));
+
       const canvas = await safeHtml2Canvas(printArea, {
         scale: 2,
         useCORS: true,
@@ -2434,15 +2437,16 @@ export default function SalaryStudio({
                   display: 'flex',
                   flexDirection: 'column',
                   justifyContent: 'space-between',
-                  padding: '10mm'
+                  padding: '10mm',
+                  fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif'
                 }}
-                className="bg-white text-[#1A202C] font-sans relative shadow-2xl overflow-hidden"
+                className="bg-white text-[#1A202C] relative shadow-2xl"
               >
                 {/* 1. Header Section */}
-                <div className="border border-[#D4AF37]/40 rounded-xl overflow-hidden bg-[#FFFFFF] shadow-sm shrink-0">
+                <div className="border border-[#D4AF37]/40 rounded-xl bg-[#FFFFFF] shadow-sm shrink-0">
                   <div
                     style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 55%, #1B2A4A 100%)' }}
-                    className="px-6 py-4 flex items-center justify-between gap-4 text-[#FFFFFF] border-b-2 border-[#D4AF37]"
+                    className="px-6 py-4 flex items-center justify-between gap-4 text-[#FFFFFF] border-b-2 border-[#D4AF37] rounded-xl"
                   >
                     <div className="flex items-center gap-4 flex-1 min-w-0">
                       {previewSlipData.companySnapshot.logo ? (
@@ -2455,19 +2459,28 @@ export default function SalaryStudio({
                           />
                         </div>
                       ) : (
-                        <div className="w-16 h-16 bg-[#1A2640] rounded-lg border-2 border-[#D4AF37] flex flex-col items-center justify-center shrink-0 text-[#D4AF37] font-serif shadow-md">
+                        <div className="w-16 h-16 bg-[#1A2640] rounded-lg border-2 border-[#D4AF37] flex flex-col items-center justify-center shrink-0 text-[#D4AF37] shadow-md">
                           <span className="text-xl font-black">SOL</span>
                           <span className="text-[8px] font-bold tracking-widest text-[#D1D5DB]">INSIGHT</span>
                         </div>
                       )}
-                      <div className="min-w-0">
-                        <h1 className="text-base font-extrabold uppercase text-[#FFFFFF] font-serif tracking-wide leading-tight truncate">
+                      <div className="min-w-0" style={{ overflow: 'visible' }}>
+                        <h1 
+                          style={{ lineHeight: 1.45, overflow: 'visible' }} 
+                          className="text-base font-extrabold uppercase text-[#FFFFFF] tracking-wide"
+                        >
                           {previewSlipData.companySnapshot.name}
                         </h1>
-                        <p className="text-[10px] text-[#D1D5DB] mt-0.5 font-medium leading-relaxed truncate">
+                        <p 
+                          style={{ lineHeight: 1.45, overflow: 'visible' }} 
+                          className="text-[10px] text-[#D1D5DB] mt-1 font-medium"
+                        >
                           {previewSlipData.companySnapshot.address}
                         </p>
-                        <div className="flex flex-wrap items-center gap-x-2.5 text-[9.5px] text-[#9CA3AF] mt-1">
+                        <div 
+                          style={{ lineHeight: 1.4, overflow: 'visible' }}
+                          className="flex flex-wrap items-center gap-x-2.5 text-[9.5px] text-[#9CA3AF] mt-1"
+                        >
                           <span>Phone: {previewSlipData.companySnapshot.phone}</span>
                           <span>•</span>
                           <span>Email: {previewSlipData.companySnapshot.email}</span>
@@ -2480,14 +2493,14 @@ export default function SalaryStudio({
                         </div>
                       </div>
                     </div>
-                    <div className="text-right shrink-0">
-                      <div className="px-3.5 py-1.5 bg-[#D4AF37] text-[#0F1C35] rounded-md font-black text-xs uppercase tracking-wider shadow-sm">
+                    <div className="text-right shrink-0" style={{ overflow: 'visible' }}>
+                      <div className="px-3.5 py-1.5 bg-[#D4AF37] text-[#0F1C35] rounded-md font-black text-xs uppercase tracking-wider shadow-sm" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         SALARY SLIP
                       </div>
-                      <div className="text-xs font-bold text-[#FFFFFF] mt-1.5 font-mono">
+                      <div className="text-xs font-bold text-[#FFFFFF] mt-1.5 font-mono" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         {previewSlipData.month} {previewSlipData.fy}
                       </div>
-                      <div className="text-[9.5px] text-[#D1D5DB] font-mono mt-0.5">
+                      <div className="text-[9.5px] text-[#D1D5DB] font-mono mt-0.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         Ref: #{previewSlipData.slipNo}
                       </div>
                     </div>
@@ -2495,59 +2508,87 @@ export default function SalaryStudio({
                 </div>
 
                 {/* 2. Employee & Account Grid */}
-                <div className="bg-[#FAF8F5] border border-[#E2D9C4] rounded-xl p-3 text-[#1A202C] shrink-0">
-                  <div className="grid grid-cols-4 gap-3 text-xs">
-                    <div className="space-y-1.5">
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Employee Name</div>
-                        <div className="text-xs font-bold text-[#111827] mt-0.5 truncate">{previewSlipData.empName}</div>
+                <div className="bg-[#FAF8F5] border border-[#E2D9C4] rounded-xl p-3 text-[#1A202C] shrink-0" style={{ boxSizing: 'border-box' }}>
+                  <div className="grid grid-cols-4 gap-3 text-xs" style={{ minHeight: 'auto' }}>
+                    <div className="space-y-1">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Employee Name</div>
+                        <div 
+                          className="text-xs font-bold text-[#111827] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
+                          {previewSlipData.empName}
+                        </div>
                       </div>
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Bank Name</div>
-                        <div className="text-xs font-semibold text-[#1F2937] mt-0.5 truncate">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Bank Name</div>
+                        <div 
+                          className="text-xs font-semibold text-[#1F2937] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
                           {previewSlipData.employeeBankSnapshot?.bankName || previewSlipData.employeeSnapshot?.bank || 'N/A'}
                         </div>
                       </div>
                     </div>
 
-                    <div className="space-y-1.5 border-l border-[#E5E7EB] pl-3">
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Employee ID</div>
-                        <div className="text-xs font-bold font-mono text-[#0F1C35] mt-0.5">{previewSlipData.empEmpId}</div>
+                    <div className="space-y-1 border-l border-[#E5E7EB] pl-3">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Employee ID</div>
+                        <div 
+                          className="text-xs font-bold font-mono text-[#0F1C35] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
+                          {previewSlipData.empEmpId}
+                        </div>
                       </div>
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Masked Account No.</div>
-                        <div className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Masked Account No.</div>
+                        <div 
+                          className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
                           {previewSlipData.employeeBankSnapshot?.maskedAccountNumber || maskAccountNumber(previewSlipData.employeeSnapshot?.accNo)}
                         </div>
                       </div>
                     </div>
 
-                    <div className="space-y-1.5 border-l border-[#E5E7EB] pl-3">
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Designation</div>
-                        <div className="text-xs font-semibold text-[#1F2937] mt-0.5 truncate">
+                    <div className="space-y-1 border-l border-[#E5E7EB] pl-3">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Designation</div>
+                        <div 
+                          className="text-xs font-semibold text-[#1F2937] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
                           {previewSlipData.employeeSnapshot?.designation || 'Solar Engineer'}
                         </div>
                       </div>
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">IFSC Code</div>
-                        <div className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>IFSC Code</div>
+                        <div 
+                          className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
                           {previewSlipData.employeeSnapshot?.ifsc?.toUpperCase() || 'N/A'}
                         </div>
                       </div>
                     </div>
 
-                    <div className="space-y-1.5 border-l border-[#E5E7EB] pl-3">
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">Department</div>
-                        <div className="text-xs font-semibold text-[#1F2937] mt-0.5 truncate">
+                    <div className="space-y-1 border-l border-[#E5E7EB] pl-3">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Department</div>
+                        <div 
+                          className="text-xs font-semibold text-[#1F2937] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
                           {previewSlipData.employeeSnapshot?.department || 'Engineering'}
                         </div>
                       </div>
-                      <div>
-                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider">PAN / UAN</div>
-                        <div className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5 truncate">
+                      <div style={{ paddingTop: '2px', paddingBottom: '4px' }}>
+                        <div className="text-[8.5px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>PAN / UAN</div>
+                        <div 
+                          className="text-xs font-mono font-semibold text-[#1F2937] mt-0.5"
+                          style={{ display: 'block', lineHeight: 1.35, paddingBottom: '2px', overflow: 'visible' }}
+                        >
                           {previewSlipData.employeeSnapshot?.pan || 'N/A'} / {previewSlipData.employeeSnapshot?.uan || 'N/A'}
                         </div>
                       </div>
@@ -2556,158 +2597,168 @@ export default function SalaryStudio({
                 </div>
 
                 {/* 3. Attendance Summary Bar */}
-                <div className="bg-[#FFFFFF] border border-[#E5E7EB] rounded-xl px-4 py-2 grid grid-cols-5 gap-2 text-center shrink-0">
+                <div className="bg-[#FFFFFF] border border-[#E5E7EB] rounded-xl px-4 py-2.5 grid grid-cols-5 gap-2 text-center shrink-0" style={{ boxSizing: 'border-box' }}>
                   <div className="border-r border-[#F3F4F6] pr-2">
-                    <div className="text-[8px] uppercase font-bold text-[#6B7280] tracking-wider">Total Working Days</div>
-                    <div className="text-sm font-bold font-mono text-[#111827] mt-0.5">{previewSlipData.attendance?.totalDays ?? 30}</div>
+                    <div className="text-[8px] uppercase font-bold text-[#6B7280] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Total Working Days</div>
+                    <div className="text-sm font-bold font-mono text-[#111827] mt-0.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>{previewSlipData.attendance?.totalDays ?? 30}</div>
                   </div>
                   <div className="border-r border-[#F3F4F6] pr-2">
-                    <div className="text-[8px] uppercase font-bold text-[#059669] tracking-wider">Days Present</div>
-                    <div className="text-sm font-bold font-mono text-[#047857] mt-0.5">{previewSlipData.attendance?.presentDays ?? 30}</div>
+                    <div className="text-[8px] uppercase font-bold text-[#059669] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Days Present</div>
+                    <div className="text-sm font-bold font-mono text-[#047857] mt-0.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>{previewSlipData.attendance?.presentDays ?? 30}</div>
                   </div>
                   <div className="border-r border-[#F3F4F6] pr-2">
-                    <div className="text-[8px] uppercase font-bold text-[#2563EB] tracking-wider">Approved Leave</div>
-                    <div className="text-sm font-bold font-mono text-[#1D4ED8] mt-0.5">{previewSlipData.attendance?.paidLeave ?? previewSlipData.attendance?.leaveDays ?? 0}</div>
+                    <div className="text-[8px] uppercase font-bold text-[#2563EB] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Approved Leave</div>
+                    <div className="text-sm font-bold font-mono text-[#1D4ED8] mt-0.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>{previewSlipData.attendance?.paidLeave ?? previewSlipData.attendance?.leaveDays ?? 0}</div>
                   </div>
                   <div className="border-r border-[#F3F4F6] pr-2">
-                    <div className="text-[8px] uppercase font-bold text-[#E11D48] tracking-wider">Loss of Pay (LOP)</div>
-                    <div className="text-sm font-bold font-mono text-[#BE123C] mt-0.5">{previewSlipData.attendance?.lopDays ?? 0}</div>
+                    <div className="text-[8px] uppercase font-bold text-[#E11D48] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Loss of Pay (LOP)</div>
+                    <div className="text-sm font-bold font-mono text-[#BE123C] mt-0.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>{previewSlipData.attendance?.lopDays ?? 0}</div>
                   </div>
                   <div>
-                    <div className="text-[8px] uppercase font-bold text-[#D97706] tracking-wider">Overtime Hours</div>
-                    <div className="text-sm font-bold font-mono text-[#B45309] mt-0.5">{previewSlipData.attendance?.otHours ?? 0} hrs</div>
+                    <div className="text-[8px] uppercase font-bold text-[#D97706] tracking-wider" style={{ lineHeight: 1.4, overflow: 'visible' }}>Overtime Hours</div>
+                    <div className="text-sm font-bold font-mono text-[#B45309] mt-0.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>{previewSlipData.attendance?.otHours ?? 0} hrs</div>
                   </div>
                 </div>
 
                 {/* 4. Earnings & Deductions Ledger */}
-                <div className="grid grid-cols-2 gap-4 flex-1 my-1">
+                <div className="grid grid-cols-2 gap-4 flex-1 my-1" style={{ boxSizing: 'border-box' }}>
                   {/* Earnings Table */}
-                  <div className="border border-[#E5E7EB] rounded-xl overflow-hidden bg-[#FFFFFF] flex flex-col justify-between">
+                  <div className="border border-[#E5E7EB] rounded-xl bg-[#FFFFFF] flex flex-col justify-between" style={{ boxSizing: 'border-box' }}>
                     <div>
-                      <div className="bg-[#0F1C35] text-[#D4AF37] px-3.5 py-2 font-bold text-[11px] uppercase tracking-wider flex justify-between items-center">
+                      <div className="bg-[#0F1C35] text-[#D4AF37] px-3.5 py-2 font-bold text-[11px] uppercase tracking-wider flex justify-between items-center rounded-t-xl" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         <span>Earnings Component</span>
                         <span>Amount (₹)</span>
                       </div>
                       <div className="divide-y divide-[#F3F4F6] text-xs">
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Basic Pay</span>
-                          <span className="font-mono font-semibold text-[#111827]">{formatCurrency(previewSlipData.earnings.basic)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Basic Pay</span>
+                          <span className="font-mono font-semibold text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>{formatCurrency(previewSlipData.earnings.basic)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center bg-[#ECFDF5]">
-                          <div>
-                            <div className="text-[#065F46] font-semibold">Project Commissions / Incentives</div>
+                        <div className="flex items-center justify-between bg-[#ECFDF5]" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <div className="flex flex-col justify-center" style={{ overflow: 'visible' }}>
+                            <div className="text-[#065F46] font-semibold" style={{ lineHeight: 1.3, overflow: 'visible' }}>Project Commissions / Incentives</div>
                             {previewSlipData.incentiveSummary?.totalProjects > 0 && (
-                              <div className="text-[9.5px] text-[#059669]">
+                              <div className="text-[9.5px] text-[#059669]" style={{ lineHeight: 1.25, overflow: 'visible' }}>
                                 {previewSlipData.incentiveSummary.totalProjects} Deliverables • {previewSlipData.incentiveSummary.totalKwp} kWp
                               </div>
                             )}
                           </div>
-                          <span className="font-mono font-bold text-[#047857]">+{formatCurrency(previewSlipData.earnings.incentive)}</span>
+                          <span className="font-mono font-bold text-[#047857]" style={{ lineHeight: 1.4, overflow: 'visible' }}>{formatCurrency(previewSlipData.earnings.incentive)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Overtime Allowance</span>
-                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.ot || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Overtime Allowance</span>
+                          <span className="font-mono text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>{formatCurrency(previewSlipData.earnings.ot || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Other / Special Allowances</span>
-                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.otherAllowance || previewSlipData.earnings.othAllow || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Other / Special Allowances</span>
+                          <span className="font-mono text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>{formatCurrency(previewSlipData.earnings.otherAllowance || previewSlipData.earnings.othAllow || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Performance Bonus</span>
-                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.bonus || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Performance Bonus</span>
+                          <span className="font-mono text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>{formatCurrency(previewSlipData.earnings.bonus || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Travel & Official Reimbursements</span>
-                          <span className="font-mono text-[#111827]">{formatCurrency(previewSlipData.earnings.reimbursement || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Travel & Official Reimbursements</span>
+                          <span className="font-mono text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>{formatCurrency(previewSlipData.earnings.reimbursement || 0)}</span>
                         </div>
                       </div>
                     </div>
-                    <div className="bg-[#FAF8F5] border-t-2 border-[#D1D5DB] px-3.5 py-2.5 flex justify-between items-center">
-                      <span className="font-bold text-xs uppercase text-[#111827]">Total Gross Earnings</span>
-                      <span className="font-mono font-extrabold text-sm text-[#111827]">{formatCurrency(previewSlipData.gross)}</span>
+                    <div className="bg-[#FAF8F5] border-t-2 border-[#D1D5DB] flex items-center justify-between rounded-b-xl" style={{ padding: '8px 12px', minHeight: '36px', lineHeight: 1.4, overflow: 'visible' }}>
+                      <span className="font-bold text-xs uppercase text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>Total Gross Earnings</span>
+                      <span className="font-mono font-extrabold text-sm text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>{formatCurrency(previewSlipData.gross)}</span>
                     </div>
                   </div>
 
                   {/* Deductions Table */}
-                  <div className="border border-[#E5E7EB] rounded-xl overflow-hidden bg-[#FFFFFF] flex flex-col justify-between">
+                  <div className="border border-[#E5E7EB] rounded-xl bg-[#FFFFFF] flex flex-col justify-between" style={{ boxSizing: 'border-box' }}>
                     <div>
-                      <div className="bg-[#0F1C35] text-[#FFFFFF] px-3.5 py-2 font-bold text-[11px] uppercase tracking-wider flex justify-between items-center">
+                      <div className="bg-[#0F1C35] text-[#FFFFFF] px-3.5 py-2 font-bold text-[11px] uppercase tracking-wider flex justify-between items-center rounded-t-xl" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         <span>Deductions Component</span>
                         <span>Amount (₹)</span>
                       </div>
                       <div className="divide-y divide-[#F3F4F6] text-xs">
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Professional Tax (PT)</span>
-                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.pt || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Professional Tax (PT)</span>
+                          <span className="font-mono text-[#BE123C]" style={{ lineHeight: 1.4, overflow: 'visible' }}>-{formatCurrency(previewSlipData.deductions?.pt || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Provident Fund (PF)</span>
-                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.pf || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Provident Fund (PF)</span>
+                          <span className="font-mono text-[#BE123C]" style={{ lineHeight: 1.4, overflow: 'visible' }}>-{formatCurrency(previewSlipData.deductions?.pf || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">ESIC Contribution</span>
-                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.esic || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>ESIC Contribution</span>
+                          <span className="font-mono text-[#BE123C]" style={{ lineHeight: 1.4, overflow: 'visible' }}>-{formatCurrency(previewSlipData.deductions?.esic || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">TDS (Income Tax)</span>
-                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.tds || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>TDS (Income Tax)</span>
+                          <span className="font-mono text-[#BE123C]" style={{ lineHeight: 1.4, overflow: 'visible' }}>-{formatCurrency(previewSlipData.deductions?.tds || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Salary Advance Recovery</span>
-                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.advance || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Salary Advance Recovery</span>
+                          <span className="font-mono text-[#BE123C]" style={{ lineHeight: 1.4, overflow: 'visible' }}>-{formatCurrency(previewSlipData.deductions?.advance || 0)}</span>
                         </div>
-                        <div className="px-3.5 py-2 flex justify-between items-center">
-                          <span className="text-[#374151] font-medium">Other Deductions / Penalties</span>
-                          <span className="font-mono text-[#BE123C]">-{formatCurrency(previewSlipData.deductions?.other || 0)}</span>
+                        <div className="flex items-center justify-between" style={{ padding: '6px 12px', minHeight: '28px', lineHeight: 1.4, overflow: 'visible' }}>
+                          <span className="text-[#374151] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>Other Deductions / Penalties</span>
+                          <span className="font-mono text-[#BE123C]" style={{ lineHeight: 1.4, overflow: 'visible' }}>-{formatCurrency(previewSlipData.deductions?.other || 0)}</span>
                         </div>
                       </div>
                     </div>
-                    <div className="bg-[#FAF8F5] border-t-2 border-[#D1D5DB] px-3.5 py-2.5 flex justify-between items-center">
-                      <span className="font-bold text-xs uppercase text-[#111827]">Total Deductions</span>
-                      <span className="font-mono font-extrabold text-sm text-[#BE123C]">-{formatCurrency(previewSlipData.totalDed)}</span>
+                    <div className="bg-[#FAF8F5] border-t-2 border-[#D1D5DB] flex items-center justify-between rounded-b-xl" style={{ padding: '8px 12px', minHeight: '36px', lineHeight: 1.4, overflow: 'visible' }}>
+                      <span className="font-bold text-xs uppercase text-[#111827]" style={{ lineHeight: 1.4, overflow: 'visible' }}>Total Deductions</span>
+                      <span className="font-mono font-extrabold text-sm text-[#BE123C]" style={{ lineHeight: 1.4, overflow: 'visible' }}>-{formatCurrency(previewSlipData.totalDed)}</span>
                     </div>
                   </div>
                 </div>
 
                 {/* 5. Net Payable Block & Disbursement Row */}
-                <div className="shrink-0 space-y-1.5">
+                <div className="shrink-0 space-y-1.5" style={{ boxSizing: 'border-box' }}>
                   <div
-                    style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 60%, #1B2A4A 100%)' }}
+                    style={{ background: 'linear-gradient(135deg, #0F1C35 0%, #152238 60%, #1B2A4A 100%)', boxSizing: 'border-box' }}
                     className="border-2 border-[#D4AF37] text-[#FFFFFF] rounded-xl px-5 py-3 flex items-center justify-between shadow-sm"
                   >
-                    <div>
-                      <div className="text-[10px] font-black uppercase tracking-wider text-[#D4AF37]">
+                    <div style={{ overflow: 'visible' }}>
+                      <div className="text-[10px] font-black uppercase tracking-wider text-[#D4AF37]" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         NET SALARY PAYABLE
                       </div>
-                      <div className="text-xs text-[#E5E7EB] italic mt-0.5 font-serif">
+                      <div className="text-xs text-[#E5E7EB] italic mt-0.5" style={{ lineHeight: 1.45, overflow: 'visible' }}>
                         {numberToWordsINR(previewSlipData.net)}
                       </div>
                     </div>
-                    <div className="text-2xl font-black font-mono text-[#D4AF37]">
+                    <div className="text-2xl font-black font-mono text-[#D4AF37]" style={{ lineHeight: 1.3, overflow: 'visible' }}>
                       {formatCurrency(previewSlipData.net)}
                     </div>
                   </div>
 
                   {/* Disbursement Row */}
-                  <div className="bg-[#FAF8F5] border border-[#E2D9C4] rounded-lg px-4 py-2 grid grid-cols-3 gap-2 text-xs">
-                    <div>
-                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Payment Mode: </span>
+                  <div
+                    className="bg-[#FAF8F5] border border-[#E2D9C4] rounded-lg px-4 py-2.5 grid grid-cols-3 gap-3 text-xs"
+                    style={{ boxSizing: 'border-box', minHeight: '34px', alignItems: 'center' }}
+                  >
+                    <div className="flex items-center justify-start gap-1.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>
+                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Payment Mode:</span>
                       <span className="font-semibold text-[#111827]">{previewSlipData.paymentMode || 'Bank Transfer'}</span>
                     </div>
-                    <div className="text-center border-x border-[#E5E7EB]">
-                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Txn / Ref ID: </span>
+                    <div className="flex items-center justify-center gap-1.5 border-x border-[#E5E7EB] px-2" style={{ lineHeight: 1.4, overflow: 'visible' }}>
+                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Txn / Ref ID:</span>
                       <span className="font-mono font-semibold text-[#111827]">{previewSlipData.transactionId || 'TXN-SETTLED'}</span>
                     </div>
-                    <div className="text-right">
-                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Disbursement Date: </span>
+                    <div className="flex items-center justify-end gap-1.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>
+                      <span className="text-[9px] uppercase font-bold text-[#6B7280]">Disbursement Date:</span>
                       <span className="font-semibold text-[#111827]">{previewSlipData.paymentDate || previewSlipData.payDate || 'Settled'}</span>
                     </div>
                   </div>
                 </div>
 
                 {/* 6. Authorized Signatory Block (Company Signatory Only) */}
-                <div className="shrink-0 pt-3 border-t border-[#E5E7EB] flex justify-end items-end text-xs">
-                  <div className="w-64 text-center flex flex-col items-center justify-end">
+                <div
+                  className="shrink-0 flex justify-end items-end text-xs"
+                  style={{
+                    boxSizing: 'border-box',
+                    marginBottom: '16px',
+                    paddingBottom: '8px'
+                  }}
+                >
+                  <div className="w-64 text-center flex flex-col items-center justify-end" style={{ overflow: 'visible' }}>
                     {previewSlipData.companySnapshot.sig ? (
                       <img
                         src={previewSlipData.companySnapshot.sig}
@@ -2716,28 +2767,41 @@ export default function SalaryStudio({
                         className="max-h-12 max-w-28 object-contain mb-1"
                       />
                     ) : (
-                      <div className="h-10 flex items-center justify-center text-[10px] font-serif italic text-[#9CA3AF]">
+                      <div className="h-10 flex items-center justify-center text-[10px] italic text-[#9CA3AF]" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         Digitally Verified
                       </div>
                     )}
-                    <div className="border-t border-[#9CA3AF] pt-1 w-full">
-                      <div className="font-bold text-[#111827] text-[11px] truncate">
+                    <div className="border-t border-[#9CA3AF] pt-1.5 w-full" style={{ overflow: 'visible' }}>
+                      <div className="font-bold text-[#111827] text-[11px]" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         {previewSlipData.companySnapshot.signName || companySettings?.signatoryName || 'Authorized Signatory'}
                       </div>
-                      <div className="text-[9px] text-[#6B7280] font-medium truncate">
+                      <div className="text-[9px] text-[#6B7280] font-medium" style={{ lineHeight: 1.4, overflow: 'visible' }}>
                         {companySettings?.signatoryDesignation || 'Managing Director / Partner'}
                       </div>
-                      <div className="text-[8px] text-[#9CA3AF] font-semibold uppercase tracking-wider mt-0.5">
-                        {previewSlipData.companySnapshot.name || 'Solarithm Consultancy'}
+                      <div className="text-[8.5px] text-[#9CA3AF] font-bold uppercase tracking-wider mt-0.5" style={{ lineHeight: 1.4, overflow: 'visible' }}>
+                        {previewSlipData.companySnapshot.name || 'SOLARITHM DESIGN AND ENGINEERING'}
                       </div>
                     </div>
                   </div>
                 </div>
 
                 {/* 7. Footer / Legal Notice */}
-                <div className="shrink-0 pt-1.5 border-t border-[#E5E7EB] text-[8px] text-[#6B7280] flex items-center justify-between">
-                  <span>This is a computer-generated salary slip and does not require a physical signature if digitally verified.</span>
-                  <span className="font-mono">Solarithm Insight • {previewSlipData.companySnapshot.web || 'www.solarithm.com'}</span>
+                <div
+                  className="shrink-0 pt-2 border-t border-[#E5E7EB] text-[8.5px] text-[#6B7280] flex items-center justify-between"
+                  style={{ lineHeight: 1.4, overflow: 'visible' }}
+                >
+                  <span style={{ overflow: 'visible' }}>
+                    This is a computer-generated salary slip and does not require a physical signature if digitally verified.
+                  </span>
+                  <a
+                    href="https://solarithmdesign.com"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="font-mono text-[#D4AF37] hover:underline"
+                    style={{ overflow: 'visible' }}
+                  >
+                    https://solarithmdesign.com
+                  </a>
                 </div>
               </div>
             </div>

@@ -540,7 +540,7 @@ export function renderHeaderBand(
     ? `<img class="pv-logo" src="${company.logo || settings.logo}" alt="Company logo">`
     : logoFallbackSVG();
 
-  const companyName = (company.companyName || settings.companyName || 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY').trim();
+  const companyName = (company.companyName || settings.companyName || 'Solarithm Design And Engineering').replace(/solarithhm/gi, 'Solarithm').trim();
   const tagline = (company.tagline || settings.tagline || '').trim();
   const gstinStr = safeStringIdentifier(company.gstin || settings.gstin).toUpperCase().trim();
   const panStr = safeStringIdentifier((company as any).pan || (company as any).panNumber || (settings as any).pan).toUpperCase().trim();
@@ -636,9 +636,9 @@ export function renderContinuedNote(): string {
 }
 
 export function renderFooter(pageNum: number, totalPages: number, companyName?: string): string {
-  const cleanComp = (companyName || '').trim();
-  const brandName = cleanComp ? escapeHtml(cleanComp.toUpperCase()) : 'SOLARITHM';
-  const displayComp = cleanComp ? escapeHtml(cleanComp) : 'Solarithm';
+  const cleanComp = (companyName || '').replace(/solarithhm/gi, 'Solarithm').trim();
+  const brandName = cleanComp ? escapeHtml(cleanComp.toUpperCase()) : 'SOLARITHM DESIGN AND ENGINEERING';
+  const displayComp = cleanComp ? escapeHtml(cleanComp) : 'Solarithm Design And Engineering';
   return `<div class="pv-footer">
     <div class="pv-footer-text">Thank you for your trust in ${displayComp}.</div>
     <div class="pv-footer-page">Page ${pageNum} of ${totalPages}</div>
@@ -679,7 +679,7 @@ export function renderBottomSection(
     branch: (compBank.branch || dataBank.branch || settings.bank?.branch || '').trim()
   };
 
-  const companyName = (company.companyName || settings.companyName || 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY').trim();
+  const companyName = (company.companyName || settings.companyName || 'Solarithm Design And Engineering').replace(/solarithhm/gi, 'Solarithm').trim();
   const subtotal = roundCurrency(t.subtotal || 0);
   const sgstAmt = roundCurrency(t.sgstAmount ?? ((subtotal * (t.sgst || 0)) / 100));
   const cgstAmt = roundCurrency(t.cgstAmount ?? ((subtotal * (t.cgst || 0)) / 100));

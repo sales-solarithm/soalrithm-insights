@@ -42,12 +42,12 @@ export interface CompanySettings {
 
 export function defaultCompanySettings(): CompanySettings {
   return {
-    companyName: 'SOLARITHM DESIGN & ENGINEERING CONSULTANCY',
+    companyName: 'Solarithm Design And Engineering',
     tagline: 'Smart Design, Sustainable Power',
     gstin: '24AAECS1234F1Z5',
     cin: 'U74999GJ2024PTC123456',
     pan: 'AAECS1234F',
-    website: 'https://solarithm.com',
+    website: 'https://solarithmdesign.com',
     phone: '+91 94295 00746 / 63',
     email: 'info.solarithm@gmail.com',
     address: 'Surat, Gujarat, India',
@@ -86,8 +86,8 @@ export function normalizeCompanySettings(raw: any): CompanySettings {
   return {
     ...defaults,
     ...raw,
-    companyName: String(raw.companyName ?? defaults.companyName).trim(),
-    tagline: String(raw.tagline ?? defaults.tagline).trim(),
+    companyName: String(raw.companyName ?? defaults.companyName).replace(/solarithhm/gi, 'Solarithm').trim(),
+    tagline: String(raw.tagline ?? defaults.tagline).replace(/solarithhm/gi, 'Solarithm').trim(),
     // Enforce string integrity & uppercase on statutory fields
     gstin: rawGstin,
     cin: rawCin,
@@ -107,7 +107,7 @@ export function normalizeCompanySettings(raw: any): CompanySettings {
       name: String(raw.bank?.name ?? defaults.bank.name).trim(),
       // Enforce string integrity on banking numbers
       acc: safeStringIdentifier(raw.bank?.acc ?? defaults.bank.acc).trim(),
-      accName: raw.bank?.accName ? String(raw.bank.accName).trim() : (defaults.bank.accName || '').trim(),
+      accName: raw.bank?.accName ? String(raw.bank.accName).replace(/solarithhm/gi, 'Solarithm').trim() : (defaults.bank.accName || '').trim(),
       ifsc: rawIfsc,
       upi: raw.bank?.upi ? String(raw.bank.upi).trim() : (defaults.bank.upi || '').trim(),
       branch: raw.bank?.branch ? String(raw.bank.branch).trim() : (defaults.bank.branch || '').trim(),

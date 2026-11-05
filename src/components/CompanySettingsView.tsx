@@ -214,6 +214,7 @@ export default function CompanySettingsView({ onNavigateToBilling }: CompanySett
                 <input
                   type="text"
                   value={form.companyName || ''}
+                  placeholder="e.g. Solarithm Design And Engineering"
                   onChange={(e) => handleFieldChange('companyName', e.target.value)}
                   className="w-full bg-gray-50 dark:bg-[#1A1A1A] border border-gray-300 dark:border-[#333333] rounded-lg px-3 py-2 text-gray-900 dark:text-white"
                 />
